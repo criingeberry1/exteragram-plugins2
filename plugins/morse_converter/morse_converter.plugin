@@ -7,7 +7,7 @@ from typing import Any
 
 # --- метаданные ---
 __id__ = "morse_converter"
-__name__ = "Морзянка"
+__name__ = "Морзяночка"
 __description__ = """
 Конвертирует сообщения в Азбуку Морзе и обратно.
    .mon / .moff - вкл/выкл отправку

@@ -16,11 +16,9 @@ __description__ = """
    .dlang ru / .dlang en - язык
 """
 __author__ = "@insonniiia"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __icon__ = "hsrgustinex/21"
 __min_version__ = "11.12.0"
-
-
 
 
 # --- словари ---
@@ -34,7 +32,7 @@ MORSE_RU = {
     '1': '.----', '2': '..---', '3': '...--', '4': '....-', '5': '.....',
     '6': '-....', '7': '--...', '8': '---..', '9': '----.', '0': '-----',
     '.': '.-.-.-', ',': '--..--', '?': '..--..', '!': '-.-.--', 
-    '-': '-....-', ':': '---...', '(': '-.--.', ')': '-.--.-!'
+    '-': '-....-', ':': '---...', '(': '-.--.', ')': '-.--.-'
 }
 
 MORSE_EN = {
@@ -213,4 +211,3 @@ class MorsePlugin(BasePlugin):
             return HookResult(strategy=HookStrategy.MODIFY, params=params)
             
         return HookResult()
-

@@ -12,12 +12,11 @@ __description__ = """
     .f <текст> — разовая отправка сообщения с измененным шрифтом. удобно, если вы не хотите включать плагин на постоянной основе, а нужно украсить лишь одну фразу.
 """
 __author__ = "@insonniiia"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __icon__ = "hsrgustinex/25"
 __min_version__ = "11.12.0"
 
 
-# --- словарь ---
 FONT_MAP = {
     'а': 'а', 'б': 'δ', 'в': 'ϐ', 'г': 'г', 'д': '∂', 'е': 'е', 'ё': 'ё', 
     'ж': 'ж', 'з': 'ვ', 'и': 'u', 'й': 'й', 'к': 'к', 'л': 'л', 'м': 'м', 
@@ -33,27 +32,40 @@ FONT_MAP = {
 
 class FancyFontPlugin(BasePlugin):
     def on_plugin_load(self):
-        # Регистрируем перехватчик отправки сообщений при загрузке плагина
+        # Флаг состояния: True — включено для всех сообщений, False — выключено
+        self.global_enabled = False
         self.add_on_send_message_hook()
 
+    def _convert(self, text: str) -> str:
+        """Вспомогательная функция для конвертации текста"""
+        return "".join(FONT_MAP.get(char, char) for char in text)
+
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
-        # Проверяем, что сообщение существует и является текстом
         if not isinstance(params.message, str):
             return HookResult()
             
-        # Проверяем, начинается ли сообщение с нашей команды ".f "
-        if params.message.startswith(".f "):
-            # Убираем первые 3 символа (".f ")
-            text_to_convert = params.message[3:]
-            
-            # Меняем каждую букву на новую из словаря (если буквы там нет, оставляем оригинальную)
-            converted_text = "".join(FONT_MAP.get(char, char) for char in text_to_convert)
-            
-            # Подменяем исходный текст на измененный
-            params.message = converted_text
-            
-            # Сообщаем клиенту, что параметры сообщения были модифицированы
+        msg = params.message.strip()
+
+        # 1. Команда включения
+        if msg == ".fon":
+            self.global_enabled = True
+            # HookStrategy.CANCEL отменяет отправку текущего сообщения (команды)
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # 2. Команда выключения
+        if msg == ".foff":
+            self.global_enabled = False
+            return HookResult(strategy=HookStrategy.CANCEL)
+
+        # 3. Разовая команда .f (работает всегда)
+        if msg.startswith(".f "):
+            text_to_convert = msg[3:]
+            params.message = self._convert(text_to_convert)
+            return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+        # 4. Если включен глобальный режим — конвертируем всё подряд
+        if self.global_enabled:
+            params.message = self._convert(msg)
             return HookResult(strategy=HookStrategy.MODIFY, params=params)
             
-        # Если команды нет, ничего не делаем и отправляем сообщение как есть
         return HookResult()

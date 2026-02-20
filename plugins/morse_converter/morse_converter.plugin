@@ -17,8 +17,9 @@ __description__ = """
 """
 __author__ = "@insonniiia"
 __version__ = "1.0.0"
-__icon__ = "hsrgustinex/25"
+__icon__ = "hsrgustinex/24"
 __min_version__ = "11.12.0"
+
 
 
 

@@ -1,13 +1,7 @@
-import re
-from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
-from android_utils import run_on_ui_thread, log
-from hook_utils import find_class, set_private_field
-from ui.bulletin import BulletinHelper
-from typing import Any
 
 # --- метаданные ---
 __id__ = "morse_converter"
-__name__ = "Морзянка"
+__name__ = "морзяночка"
 __description__ = """
 Конвертирует сообщения в Азбуку Морзе и обратно.
    .mon / .moff - вкл/выкл отправку
@@ -19,6 +13,20 @@ __author__ = "@insonniiia"
 __version__ = "1.0.0"
 __icon__ = "hsrgustinex/25"
 __min_version__ = "11.12.0"
+
+import re
+from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
+from android_utils import run_on_ui_thread, log
+from hook_utils import find_class, set_private_field
+from ui.bulletin import BulletinHelper
+from typing import Any
+
+Конвертирует сообщения в Азбуку Морзе и обратно.
+   .mon / .moff - вкл/выкл отправку
+   .m <текст> - разовый перевод
+   .dmon / .dmoff - локальный перевод входящих
+   .dlang ru / .dlang en - язык
+"""
 
 
 # --- словари ---

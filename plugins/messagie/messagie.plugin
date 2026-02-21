@@ -1,0 +1,78 @@
+
+# --- метаданные ---
+__id__ = "messagie"
+__name__ = "Messagie"
+__description__ = "Копирование ебучей переписки в ебучем формате👍 Сделала по фану, скачивать не советую"
+__author__ = "@insonniiia"
+__version__ = "1.0.0"
+__icon__ = "hsrgustinex/34"
+__min_version__ = "11.12.0"
+
+# --- main plugin class ---
+class RPCopyPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.default_aliases = {
+            "инсошня": "я"
+        }
+        
+        self.settings = self.get_settings_dict()
+        if "secret_names" not in self.settings:
+            self.settings["secret_names"] = {}
+            self.save_settings()
+
+        AndroidUtilitiesClass = find_class("org.telegram.messenger.AndroidUtilities")
+        if AndroidUtilitiesClass:
+            method = AndroidUtilitiesClass.getDeclaredMethod("addToClipboard", find_class("java.lang.CharSequence"))
+            self.clipboard_hook = AddToClipboardHook(self)
+            self.hook_method(method, self.clipboard_hook)
+            
+        ProfileActivityClass = find_class("org.telegram.ui.ProfileActivity")
+        if ProfileActivityClass:
+            method = ProfileActivityClass.getDeclaredMethod("createView", find_class("android.content.Context"))
+            self.profile_hook = ProfileCreateViewHook(self)
+            self.hook_method(method, self.profile_hook)
+            
+    def get_settings_dict(self):
+        try:
+            return json.loads(self.get_setting("data_store", "{}"))
+        except:
+            return {"secret_names": {}}
+
+    def save_settings(self):
+        self.set_setting("data_store", json.dumps(self.settings))
+
+    def get_secret_name_raw(self, original_name):
+        return self.settings.get("secret_names", {}).get(original_name, "")
+
+    def get_secret_name(self, original_name):
+        secret = self.get_secret_name_raw(original_name)
+        if secret: 
+            return secret
+            
+        orig_lower = original_name.lower()
+        for k, v in self.default_aliases.items():
+            if k.lower() == orig_lower:
+                return v
+        return original_name
+
+    def save_secret_name(self, original_name, secret_name):
+        if "secret_names" not in self.settings:
+            self.settings["secret_names"] = {}
+        self.settings["secret_names"][original_name] = secret_name
+        self.save_settings()
+
+    def delete_secret_name(self, original_name):
+        if "secret_names" in self.settings and original_name in self.settings["secret_names"]:
+            del self.settings["secret_names"][original_name]
+            self.save_settings()
+
+    def create_settings(self):
+        return [
+            Section("настройки rp-копирования"),
+            Switch(
+                key="enable_rp_copy",
+                title="включить rp-форматирование",
+                summary="автоматически переформатирует несколько выделенных сообщений при копировании",
+                default_value=True
+            )
+        ]

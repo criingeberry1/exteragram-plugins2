@@ -1,18 +1,19 @@
 import json
 import re
-from plugin import Plugin
-from hooking import MethodHook, find_class
+from plugin_class import Plugin
+from xposed_hooking import MethodHook
+from hook_utils import find_class
 from jnius import PythonJavaClass, java_method
-from alert import AlertDialogBuilder
-from ui.bulletin import BulletinHelper
-from ui.settings import Switch, Section
+from alert_dialog_builder import AlertDialogBuilder
+from bulletin_helper import BulletinHelper
+from plugin_settings import Switch, Section
 
 # --- метаданные ---
 __id__ = "messagie"
 __name__ = "Messagie"
 __description__ = "Копирование ебучей переписки в ебучем формате👍 Сделала по фану, скачивать не советую"
 __author__ = "@insonniiia"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __icon__ = "hsrgustinex/34"
 __min_version__ = "11.12.0"
 

@@ -1,34 +1,33 @@
 import json
 import re
-from plugin_class import Plugin
-from xposed_hooking import MethodHook
-from hook_utils import find_class
-from jnius import PythonJavaClass, java_method
-from alert_dialog_builder import AlertDialogBuilder
-from bulletin_helper import BulletinHelper
-from plugin_settings import Switch, Section
+from exteragram.plugin import Plugin
+from exteragram.hooking import MethodHook
+from exteragram.utils import find_class
+from exteragram.ui import AlertDialogBuilder, BulletinHelper
+from exteragram.settings import Switch, Section
+from java import dynamic_proxy, jclass, Override
 
 # --- метаданные ---
 __id__ = "messagie"
 __name__ = "Messagie"
 __description__ = "Копирование ебучей переписки в ебучем формате👍 Сделала по фану, скачивать не советую"
 __author__ = "@insonniiia"
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 __icon__ = "hsrgustinex/34"
 __min_version__ = "11.12.0"
 
 
 # --- action bar long click listener ---
-class ActionBarLongClickListener(PythonJavaClass):
-    __javainterfaces__ = ['android/view/View$OnLongClickListener']
-    
+ViewOnLongClickListener = jclass('android.view.View$OnLongClickListener')
+
+class ActionBarLongClickListener(dynamic_proxy(ViewOnLongClickListener)):
     def __init__(self, plugin, activity, action_bar):
         super().__init__()
         self.plugin = plugin
         self.activity = activity
         self.action_bar = action_bar
 
-    @java_method('(Landroid/view/View;)Z')
+    @Override(jclass('boolean'), [jclass('android.view.View')])
     def onLongClick(self, view):
         title = self.action_bar.getTitle()
         if not title:

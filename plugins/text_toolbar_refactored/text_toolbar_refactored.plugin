@@ -32,7 +32,7 @@ __description__ = """
 ★ | Based on original code by @PESSDES_Plugins. 
 Adds a customizable text toolbar to the message input field, providing quick access to formatting, text management, and message control tools.
 """
-__author__ = "@PESSDES_Plugins"
+__author__ = "@PESSDES_Plugins | @insonniiia"
 __version__ = "1.0.0"
 __icon__ = "VoiceToText7/14"
 __min_version__ = "11.12.0"

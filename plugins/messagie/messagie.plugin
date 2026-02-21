@@ -1,15 +1,131 @@
+import json
+import re
+from plugin import Plugin
+from hooking import MethodHook, find_class
+from jnius import PythonJavaClass, java_method
+from alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Switch, Section
 
 # --- метаданные ---
 __id__ = "messagie"
 __name__ = "Messagie"
 __description__ = "Копирование ебучей переписки в ебучем формате👍 Сделала по фану, скачивать не советую"
 __author__ = "@insonniiia"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __icon__ = "hsrgustinex/34"
 __min_version__ = "11.12.0"
 
+
+# --- action bar long click listener ---
+class ActionBarLongClickListener(PythonJavaClass):
+    __javainterfaces__ = ['android/view/View$OnLongClickListener']
+    
+    def __init__(self, plugin, activity, action_bar):
+        super().__init__()
+        self.plugin = plugin
+        self.activity = activity
+        self.action_bar = action_bar
+
+    @java_method('(Landroid/view/View;)Z')
+    def onLongClick(self, view):
+        title = self.action_bar.getTitle()
+        if not title:
+            return False
+            
+        name_str = str(title)
+        context = view.getContext()
+        
+        dialog = AlertDialogBuilder(self.activity)
+        dialog.set_title(f"Секретное имя: {name_str}")
+        
+        EditTextClass = find_class("android.widget.EditText")
+        input_field = EditTextClass(context)
+        input_field.setHint("Введите имя (пусто для сброса)")
+        
+        current = self.plugin.get_secret_name_raw(name_str)
+        if current:
+            input_field.setText(current)
+            
+        dialog.set_view(input_field)
+        
+        def on_save():
+            new_secret = str(input_field.getText()).strip()
+            if new_secret:
+                self.plugin.save_secret_name(name_str, new_secret)
+                BulletinHelper.show_success(f"Имя {new_secret} сохранено!", self.activity)
+            else:
+                self.plugin.delete_secret_name(name_str)
+                BulletinHelper.show_info("Секретное имя сброшено", self.activity)
+                
+        dialog.set_positive_button("Сохранить", on_save)
+        dialog.set_negative_button("Отмена", lambda: None)
+        dialog.show()
+        
+        return True
+
+# --- profile hook ---
+class ProfileCreateViewHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+        super().__init__()
+
+    def after_hooked_method(self, param):
+        activity = param.thisObject
+        if not activity: 
+            return
+        
+        try:
+            action_bar = getattr(activity, "actionBar", None)
+            if action_bar:
+                listener = ActionBarLongClickListener(self.plugin, activity, action_bar)
+                action_bar.setOnLongClickListener(listener)
+        except Exception:
+            pass
+
+# --- clipboard hook ---
+class AddToClipboardHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+        super().__init__()
+
+    def before_hooked_method(self, param):
+        if not self.plugin.get_setting("enable_rp_copy", True):
+            return
+
+        text = str(param.args[0] or "")
+        parts = re.split(r"(?m)^(.+?), \[(\d{2}\.\d{2}\.\d{2,4} \d{2}:\d{2})\]\n", text)
+        
+        if len(parts) > 1:
+            result_lines = ["```переписка"]
+            current_date = None
+            
+            for i in range(1, len(parts), 3):
+                name = parts[i]
+                date_str = parts[i+1]
+                msg_text = parts[i+2].rstrip()
+                
+                d, m, y = date_str.split(" ")[0].split(".")
+                if len(y) == 2:
+                    y = "20" + y
+                msg_date = f"{y}-{m}-{d}"
+                
+                if msg_date != current_date:
+                    result_lines.append(f"=== {msg_date} ===")
+                    current_date = msg_date
+                    
+                secret_name = self.plugin.get_secret_name(name)
+                
+                result_lines.append(f"\t{secret_name}:")
+                result_lines.append(msg_text)
+                
+            result_lines.append("```")
+            
+            StringClass = find_class("java.lang.String")
+            param.args[0] = StringClass("\n".join(result_lines))
+
 # --- main plugin class ---
-class RPCopyPlugin(BasePlugin):
+class RPCopyPlugin(Plugin):
     def on_plugin_load(self):
         self.default_aliases = {
             "инсошня": "я"

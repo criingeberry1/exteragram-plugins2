@@ -32,7 +32,7 @@ __description__ = """
 Adds a customizable text toolbar to the message input field, providing quick access to formatting, text management, and message control tools.
 """
 __author__ = "@PESSDES_Plugins | @insonniiia"
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __icon__ = "VoiceToText7/14"
 __min_version__ = "11.12.0"
 
@@ -152,9 +152,13 @@ class EnterViewHook(MethodHook):
 
             tfc = get_private_field(param.thisObject, "textFieldContainer")
 
-            lp = messageEditText.getLayoutParams()
-            lp.topMargin += AndroidUtilities.dp(36)
-            messageEditText.setLayoutParams(lp)
+            pb = messageEditText.getPaddingBottom()
+            messageEditText.setPadding(
+                messageEditText.getPaddingLeft(),
+                messageEditText.getPaddingTop(),
+                messageEditText.getPaddingRight(),
+                pb + AndroidUtilities.dp(40)
+            )
 
             EnterViewHook.items_layout = self.items_layout = items_layout = LinearLayout(param.args[0])
             items_layout.setTag(101010)
@@ -163,7 +167,7 @@ class EnterViewHook(MethodHook):
             items_layout_wrap = HorizontalScrollView(param.args[0])
             items_layout_wrap.addView(items_layout)
             
-            tfc.addView(items_layout_wrap, LayoutHelper.createFrame(-1, 36, Gravity.TOP, 4, 0, 4, 0))
+            tfc.addView(items_layout_wrap, LayoutHelper.createFrame(-1, 36, Gravity.BOTTOM, 0, 0, 0, 2))
             self.ly = items_layout_wrap
 
             self._add_new_item(30, "pip_video_expand")

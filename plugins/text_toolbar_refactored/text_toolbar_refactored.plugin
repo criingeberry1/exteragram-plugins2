@@ -32,7 +32,7 @@ __description__ = """
 Adds a customizable text toolbar to the message input field, providing quick access to formatting, text management, and message control tools.
 """
 __author__ = "@PESSDES_Plugins | @insonniiia"
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 __icon__ = "VoiceToText7/14"
 __min_version__ = "11.12.0"
 
@@ -153,10 +153,14 @@ class EnterViewHook(MethodHook):
             tfc = get_private_field(param.thisObject, "textFieldContainer")
 
             pb = messageEditText.getPaddingBottom()
+            pl = messageEditText.getPaddingLeft()
+            pr = messageEditText.getPaddingRight()
+
+            # Добавляем отступ тексту снизу, чтобы он не залезал под нашу панель
             messageEditText.setPadding(
-                messageEditText.getPaddingLeft(),
+                pl,
                 messageEditText.getPaddingTop(),
-                messageEditText.getPaddingRight(),
+                pr,
                 pb + AndroidUtilities.dp(40)
             )
 
@@ -165,9 +169,17 @@ class EnterViewHook(MethodHook):
             items_layout.setOrientation(LinearLayout.HORIZONTAL)
 
             items_layout_wrap = HorizontalScrollView(param.args[0])
+            items_layout_wrap.setHorizontalScrollBarEnabled(False) # Убираем визуальный скроллбар
             items_layout_wrap.addView(items_layout)
             
-            tfc.addView(items_layout_wrap, LayoutHelper.createFrame(-1, 36, Gravity.BOTTOM, 0, 0, 0, 2))
+            # Динамически задаем маргины, равные системным отступам поля ввода.
+            # Теперь панель зажата строго между системными кнопками и не перекрывает их.
+            lp = LayoutHelper.createFrame(-1, 36, Gravity.BOTTOM)
+            lp.leftMargin = pl if pl > 0 else AndroidUtilities.dp(52)
+            lp.rightMargin = pr if pr > 0 else AndroidUtilities.dp(96)
+            lp.bottomMargin = AndroidUtilities.dp(2)
+            
+            tfc.addView(items_layout_wrap, lp)
             self.ly = items_layout_wrap
 
             self._add_new_item(30, "pip_video_expand")

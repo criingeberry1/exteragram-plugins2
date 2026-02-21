@@ -23,7 +23,6 @@ from org.telegram.ui import ChatActivity
 from org.telegram.ui.Stories.recorder import CaptionContainerView
 from ui.bulletin import BulletinHelper
 from ui.settings import Selector
-from java import jfloat, dynamic_proxy
 
 # --- метаданные ---
 __id__ = "text_toolbar_refactored"
@@ -33,7 +32,7 @@ __description__ = """
 Adds a customizable text toolbar to the message input field, providing quick access to formatting, text management, and message control tools.
 """
 __author__ = "@PESSDES_Plugins | @insonniiia"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __icon__ = "VoiceToText7/14"
 __min_version__ = "11.12.0"
 
@@ -87,8 +86,6 @@ class Plugin(BasePlugin):
             if m.getName() == "sendMessageInternal":
                 self.hook_method(m, OnSend())
 
-        self.hook_method(ChatActivity.getClass().getDeclaredMethod("updatePagedownButtonsPosition"), OnTranslationCalculation(self))
-        self.hook_method(ChatActivityEnterView.getClass().getDeclaredMethod("createRecordCircle"), CreateRecordCircleHook())
         self.hook_method(PeerStoriesView.getClass().getDeclaredMethod("createEnterView"), EnterViewInStoriesHook())
     
     _collapse_states: Dict[int, bool] = {}
@@ -121,37 +118,6 @@ class EnterViewInStoriesHook(MethodHook):
     def after_hooked_method(self, param):
         EnterViewInStoriesHook.calling = False
 
-class CreateRecordCircleHook(MethodHook):
-    def before_hooked_method(self, param):
-        self.cancel = param.thisObject.getRecordCircle() is not None
-        
-    def after_hooked_method(self, param):
-        if self.cancel:
-            return
-        record_circle =param.thisObject.getRecordCircle()
-        if record_circle and EnterViewHook.items_layout:
-            record_circle.setTranslationY(record_circle.getTranslationY() - EnterViewHook.items_layout.getMeasuredHeight())
-
-class OnTranslationCalculation(MethodHook):
-    def __init__(self, plugin: Plugin):
-        OnTranslationCalculation.plugin = plugin
-        
-    def before_hooked_method(self, param):
-        OnTranslationCalculation.hook = self.plugin.hook_method(View.getClass().getDeclaredMethod("getTranslationY"), OnChatActivityEnterViewTranslationCalculation())
-    
-    def after_hooked_method(self, param):
-        self.plugin.unhook_method(self.hook)
-        
-class OnChatActivityEnterViewTranslationCalculation(MethodHook):
-    def after_hooked_method(self, param):
-        try:
-            if not EnterViewHook.items_layout:
-                return
-            param.setResult(jfloat(int(param.getResult()) - int(EnterViewHook.items_layout.getMeasuredHeight())))
-            OnTranslationCalculation.plugin.unhook_method(OnTranslationCalculation.hook)
-        except Exception as e:
-            log(e)
-
 class OnSend(MethodHook):
     def before_hooked_method(self, param):
         try:
@@ -182,17 +148,16 @@ class EnterViewHook(MethodHook):
             self.input_expanded = False
             self.chat_activity_enter_view: ChatActivityEnterView = param.thisObject
 
-            if not get_private_field(param.thisObject, "messageEditText").isEnabled():
+            messageEditText = get_private_field(param.thisObject, "messageEditText")
+            if not messageEditText.isEnabled():
                 return
 
-            self.ly = ly = LinearLayout(param.args[0])
-            ly.setOrientation(LinearLayout.VERTICAL)
-
             tfc = get_private_field(param.thisObject, "textFieldContainer")
-            tfc.getParent().removeView(tfc)
-            tfc_wrap = FrameLayout(param.args[0])
-            tfc_wrap.addView(tfc)
-            ly.addView(tfc_wrap)
+
+            # --- add bottom margin to messageedittext to make room for toolbar ---
+            lp = messageEditText.getLayoutParams()
+            lp.bottomMargin += AndroidUtilities.dp(36)
+            messageEditText.setLayoutParams(lp)
 
             EnterViewHook.items_layout = self.items_layout = items_layout = LinearLayout(param.args[0])
             items_layout.setTag(101010)
@@ -200,10 +165,10 @@ class EnterViewHook(MethodHook):
 
             items_layout_wrap = HorizontalScrollView(param.args[0])
             items_layout_wrap.addView(items_layout)
-            ly.addView(items_layout_wrap, LayoutHelper.createLinear(-1, 36, Gravity.BOTTOM, 8, 0, 8, 0))
-            EnterViewHook.items_layout = items_layout
             
-            param.thisObject.addView(ly, LayoutHelper.createFrame(-1, -2, Gravity.BOTTOM))
+            # --- add toolbar to textfieldcontainer directly ---
+            tfc.addView(items_layout_wrap, LayoutHelper.createFrame(-1, 36, Gravity.BOTTOM, 8, 0, 8, 0))
+            self.ly = items_layout_wrap
 
             self._add_new_item(30, "pip_video_expand")
             self._add_new_item(0, "mentionbutton")

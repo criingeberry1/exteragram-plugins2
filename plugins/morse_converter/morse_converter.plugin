@@ -23,7 +23,8 @@ v1.4.0: настройки в ui, поддержка премиум-эмодзи
 [ входящие ]
   .dmon / .dmoff — локальная расшифровка сообщений
   .dlang ru / en — выбор языка декодера
-——————————————————————————————
+
+
 ★ converts messages to morse code and back ★ 
 ——————————————————————————————
 v1.4.0: ui settings, premium emoji support, and decoding bug fixes

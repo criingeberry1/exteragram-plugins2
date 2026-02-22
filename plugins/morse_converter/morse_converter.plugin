@@ -1,4 +1,4 @@
-# фикс ебучих премиум эмодзи в .dmon (теперь в переводе эмодзи не будет вообще)
+# фикс .dmon: теперь при переводе не пропадает последняя буква, прилипшая к прем. эмодзи
 
 import re
 from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
@@ -18,7 +18,7 @@ __description__ = """
    .dlang ru / .dlang en - язык
 """
 __author__ = "@insonniiia"
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 __icon__ = "hsrgustinex/21"
 __min_version__ = "11.12.0"
 
@@ -84,12 +84,10 @@ class IncomingMorseHook(MethodHook):
 
             text_str = str(text_obj)
 
-            # --- защита от повторного добавления перевода при скролле ---
             if "\n(" in text_str and text_str.endswith(")"):
                 return
 
             if self.plugin._is_morse(text_str):
-                # --- strict=true чтобы отрезать эмодзи и мусор из перевода ---
                 decoded = self.plugin._from_morse(text_str, strict=True)
                 
                 if not decoded.strip():
@@ -120,7 +118,6 @@ class IncomingMorseHook(MethodHook):
 # --- основной класс плагина ---
 class MorsePlugin(BasePlugin):
     
-    # --- инициализация ---
     def on_plugin_load(self):
         self.global_enabled = False
         self.decode_enabled = False
@@ -141,7 +138,6 @@ class MorsePlugin(BasePlugin):
         except Exception as e:
             log(f"[Морзянка] Ошибка установки хука: {e}")
 
-    # --- логика перевода ---
     def _to_morse(self, text: str) -> str:
         leading_spaces = len(text) - len(text.lstrip(' '))
         trailing_spaces = len(text) - len(text.rstrip(' '))
@@ -162,6 +158,10 @@ class MorsePlugin(BasePlugin):
         return (" " * leading_spaces) + result + (" " * trailing_spaces)
 
     def _from_morse(self, text: str, strict: bool = False) -> str:
+        if strict:
+            # --- очистка от прилипших эмодзи и спецсимволов ---
+            text = re.sub(r'[^.\- /]', ' ', text)
+
         text = text.replace(' / ', '   ')
         words = text.split('   ')
         decoded_words = []
@@ -190,7 +190,6 @@ class MorsePlugin(BasePlugin):
         
         return has_morse and not has_letters_or_digits
 
-    # --- обработка текста с сохранением entities ---
     def _process_message_with_entities(self, text: str, entities: Any) -> tuple[str, Any]:
         if not entities or getattr(entities, 'isEmpty', lambda: True)():
             return self._to_morse(text), entities
@@ -245,7 +244,6 @@ class MorsePlugin(BasePlugin):
             
         return new_text_bytes.decode('utf-16-le'), entities
 
-    # --- хук для исходящих сообщений ---
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
         if not isinstance(params.message, str):
             return HookResult()

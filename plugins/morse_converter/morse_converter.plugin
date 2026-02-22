@@ -12,11 +12,29 @@ from typing import Any
 __id__ = "morse_converter"
 __name__ = "Морзянка | Morse Code"
 __description__ = """
-★ конвертирует сообщения в азбуку морзе и обратно ★ 
-   .mon / .moff - вкл/выкл отправку 
-   .m текст - разовый перевод 
-   .dmon / .dmoff - локальный перевод входящих 
-   .dlang ru / .dlang en - язык
+★ конвертирует сообщения в азбуку морзе и обратно ★
+-----------------------------------------
+v1.4.0: настройки в ui, поддержка премиум-эмодзи и фикс багов с расшифровкой
+
+[ исходящие ]
+  .mon / .moff — автоперевод текста при отправке
+  .m текст — перевести конкретное сообщение
+
+[ входящие ]
+  .dmon / .dmoff — локальная расшифровка сообщений
+  .dlang ru / en — выбор языка декодера
+-----------------------------------------
+★ converts messages to morse code and back ★ 
+-----------------------------------------
+v1.4.0: ui settings, premium emoji support, and decoding bug fixes
+
+[ outgoing ]
+  .mon / .moff — auto-encode outgoing messages
+  .m text — one-time translation
+
+[ incoming ]
+  .dmon / .dmoff — local decoding of incoming morse
+  .dlang ru / en — select decoder language
 """
 __author__ = "@insonniiia"
 __version__ = "1.4.0"

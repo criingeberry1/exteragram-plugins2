@@ -1,4 +1,4 @@
-# пробный фикс премиум эмодзи в .mon/.m
+# фикс ебучих премиум эмодзи в .dmon (теперь в переводе эмодзи не будет вообще)
 
 import re
 from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
@@ -18,7 +18,7 @@ __description__ = """
    .dlang ru / .dlang en - язык
 """
 __author__ = "@insonniiia"
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __icon__ = "hsrgustinex/21"
 __min_version__ = "11.12.0"
 
@@ -84,9 +84,17 @@ class IncomingMorseHook(MethodHook):
 
             text_str = str(text_obj)
 
+            # --- защита от повторного добавления перевода при скролле ---
+            if "\n(" in text_str and text_str.endswith(")"):
+                return
+
             if self.plugin._is_morse(text_str):
-                decoded = self.plugin._from_morse(text_str)
+                # --- strict=true чтобы отрезать эмодзи и мусор из перевода ---
+                decoded = self.plugin._from_morse(text_str, strict=True)
                 
+                if not decoded.strip():
+                    return
+                    
                 builder = SpannableStringBuilder(text_obj)
                 builder.append(f"\n( {decoded} )")
                 
@@ -135,7 +143,6 @@ class MorsePlugin(BasePlugin):
 
     # --- логика перевода ---
     def _to_morse(self, text: str) -> str:
-        # --- сохраняем пробелы по краям для корректной склейки с эмодзи ---
         leading_spaces = len(text) - len(text.lstrip(' '))
         trailing_spaces = len(text) - len(text.rstrip(' '))
         
@@ -154,7 +161,7 @@ class MorsePlugin(BasePlugin):
         result = " / ".join(encoded_words)
         return (" " * leading_spaces) + result + (" " * trailing_spaces)
 
-    def _from_morse(self, text: str) -> str:
+    def _from_morse(self, text: str, strict: bool = False) -> str:
         text = text.replace(' / ', '   ')
         words = text.split('   ')
         decoded_words = []
@@ -163,8 +170,16 @@ class MorsePlugin(BasePlugin):
         
         for word in words:
             chars = word.split()
-            decoded_chars = [active_dict.get(char, char) for char in chars]
-            decoded_words.append("".join(decoded_chars))
+            decoded_chars = []
+            for char in chars:
+                if char in active_dict:
+                    decoded_chars.append(active_dict[char])
+                elif not strict:
+                    decoded_chars.append(char)
+            
+            if decoded_chars:
+                decoded_words.append("".join(decoded_chars))
+                
         return " ".join(decoded_words)
 
     def _is_morse(self, text: str) -> bool:
@@ -180,7 +195,6 @@ class MorsePlugin(BasePlugin):
         if not entities or getattr(entities, 'isEmpty', lambda: True)():
             return self._to_morse(text), entities
 
-        # --- конвертируем в utf-16 так как java offset считается по нему ---
         text_bytes = text.encode('utf-16-le')
         new_text_bytes = bytearray()
         
@@ -203,7 +217,6 @@ class MorsePlugin(BasePlugin):
             offset = ent_data['offset']
             length = ent_data['length']
             
-            # --- текст до эмодзи ---
             if offset > current_orig_offset:
                 chunk_bytes = text_bytes[current_orig_offset*2 : offset*2]
                 chunk_str = chunk_bytes.decode('utf-16-le')
@@ -213,7 +226,6 @@ class MorsePlugin(BasePlugin):
                 new_text_bytes.extend(morsed_bytes)
                 current_new_offset += len(morsed_bytes) // 2
                 
-            # --- сам эмодзи ---
             chunk_bytes = text_bytes[offset*2 : (offset+length)*2]
             
             ent.offset = current_new_offset
@@ -224,7 +236,6 @@ class MorsePlugin(BasePlugin):
             
             current_orig_offset = offset + length
             
-        # --- оставшийся текст ---
         if current_orig_offset * 2 < len(text_bytes):
             chunk_bytes = text_bytes[current_orig_offset*2 : ]
             chunk_str = chunk_bytes.decode('utf-16-le')
@@ -260,7 +271,7 @@ class MorsePlugin(BasePlugin):
             return HookResult(strategy=HookStrategy.CANCEL)
         if msg == ".dmon":
             self.decode_enabled = True
-            run_on_ui_thread(lambda: BulletinHelper.show_success("перевод входящей морзянки включен!! (˶ˆᗜˆ˵)"))
+            run_on_ui_thread(lambda: BulletinHelper.show_success("перевод входящей морзянки включен!!"))
             return HookResult(strategy=HookStrategy.CANCEL)
         if msg == ".dmoff":
             self.decode_enabled = False
@@ -270,7 +281,6 @@ class MorsePlugin(BasePlugin):
         if msg.startswith(".m "):
             original_text = msg[3:]
             
-            # --- корректируем смещение entities, так как мы обрезали .m (3 символа) ---
             if hasattr(params, 'entities') and params.entities:
                 for i in range(params.entities.size()):
                     ent = params.entities.get(i)

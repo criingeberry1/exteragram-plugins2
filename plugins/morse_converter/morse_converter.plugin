@@ -1,3 +1,5 @@
+# пробный фикс премиум эмодзи в .mon/.m
+
 import re
 from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
 from android_utils import run_on_ui_thread, log
@@ -16,10 +18,9 @@ __description__ = """
    .dlang ru / .dlang en - язык
 """
 __author__ = "@insonniiia"
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 __icon__ = "hsrgustinex/21"
 __min_version__ = "11.12.0"
-
 
 
 # --- словари ---
@@ -134,16 +135,24 @@ class MorsePlugin(BasePlugin):
 
     # --- логика перевода ---
     def _to_morse(self, text: str) -> str:
-        words = text.lower().split()
-        encoded_words = []
+        # --- сохраняем пробелы по краям для корректной склейки с эмодзи ---
+        leading_spaces = len(text) - len(text.lstrip(' '))
+        trailing_spaces = len(text) - len(text.rstrip(' '))
         
+        words = text.lower().split()
+        if not words:
+            return text
+            
+        encoded_words = []
         for word in words:
             encoded_chars = []
             for char in word:
                 morse_char = MORSE_RU.get(char) or MORSE_EN.get(char) or char
                 encoded_chars.append(morse_char)
             encoded_words.append(" ".join(encoded_chars))
-        return " / ".join(encoded_words)
+            
+        result = " / ".join(encoded_words)
+        return (" " * leading_spaces) + result + (" " * trailing_spaces)
 
     def _from_morse(self, text: str) -> str:
         text = text.replace(' / ', '   ')
@@ -165,6 +174,65 @@ class MorsePlugin(BasePlugin):
         has_letters_or_digits = bool(re.search(r'[a-zA-Zа-яА-Я0-9]', text))
         
         return has_morse and not has_letters_or_digits
+
+    # --- обработка текста с сохранением entities ---
+    def _process_message_with_entities(self, text: str, entities: Any) -> tuple[str, Any]:
+        if not entities or getattr(entities, 'isEmpty', lambda: True)():
+            return self._to_morse(text), entities
+
+        # --- конвертируем в utf-16 так как java offset считается по нему ---
+        text_bytes = text.encode('utf-16-le')
+        new_text_bytes = bytearray()
+        
+        entity_list = []
+        for i in range(entities.size()):
+            ent = entities.get(i)
+            entity_list.append({
+                'obj': ent,
+                'offset': ent.offset,
+                'length': ent.length
+            })
+            
+        entity_list.sort(key=lambda x: x['offset'])
+        
+        current_orig_offset = 0
+        current_new_offset = 0
+        
+        for ent_data in entity_list:
+            ent = ent_data['obj']
+            offset = ent_data['offset']
+            length = ent_data['length']
+            
+            # --- текст до эмодзи ---
+            if offset > current_orig_offset:
+                chunk_bytes = text_bytes[current_orig_offset*2 : offset*2]
+                chunk_str = chunk_bytes.decode('utf-16-le')
+                morsed_chunk = self._to_morse(chunk_str)
+                morsed_bytes = morsed_chunk.encode('utf-16-le')
+                
+                new_text_bytes.extend(morsed_bytes)
+                current_new_offset += len(morsed_bytes) // 2
+                
+            # --- сам эмодзи ---
+            chunk_bytes = text_bytes[offset*2 : (offset+length)*2]
+            
+            ent.offset = current_new_offset
+            ent.length = len(chunk_bytes) // 2
+            
+            new_text_bytes.extend(chunk_bytes)
+            current_new_offset += ent.length
+            
+            current_orig_offset = offset + length
+            
+        # --- оставшийся текст ---
+        if current_orig_offset * 2 < len(text_bytes):
+            chunk_bytes = text_bytes[current_orig_offset*2 : ]
+            chunk_str = chunk_bytes.decode('utf-16-le')
+            morsed_chunk = self._to_morse(chunk_str)
+            morsed_bytes = morsed_chunk.encode('utf-16-le')
+            new_text_bytes.extend(morsed_bytes)
+            
+        return new_text_bytes.decode('utf-16-le'), entities
 
     # --- хук для исходящих сообщений ---
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
@@ -200,15 +268,23 @@ class MorsePlugin(BasePlugin):
             return HookResult(strategy=HookStrategy.CANCEL)
 
         if msg.startswith(".m "):
-            params.message = self._to_morse(msg[3:])
-            if hasattr(params, 'entities'):
-                params.entities = None
+            original_text = msg[3:]
+            
+            # --- корректируем смещение entities, так как мы обрезали .m (3 символа) ---
+            if hasattr(params, 'entities') and params.entities:
+                for i in range(params.entities.size()):
+                    ent = params.entities.get(i)
+                    ent.offset = max(0, ent.offset - 3)
+                    
+            new_text, new_entities = self._process_message_with_entities(original_text, getattr(params, 'entities', None))
+            params.message = new_text
+            params.entities = new_entities
             return HookResult(strategy=HookStrategy.MODIFY, params=params)
 
         if self.global_enabled and not msg.startswith("."):
-            params.message = self._to_morse(msg)
-            if hasattr(params, 'entities'):
-                params.entities = None
+            new_text, new_entities = self._process_message_with_entities(params.message, getattr(params, 'entities', None))
+            params.message = new_text
+            params.entities = new_entities
             return HookResult(strategy=HookStrategy.MODIFY, params=params)
             
         return HookResult()

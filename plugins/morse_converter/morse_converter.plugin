@@ -1,4 +1,4 @@
-# попытка сделать ui настроек блять
+# сделала перевод интерфейса для пендосов
 
 import re
 from base_plugin import BasePlugin, HookResult, HookStrategy, MethodHook
@@ -19,7 +19,7 @@ __description__ = """
    .dlang ru / .dlang en - язык
 """
 __author__ = "@insonniiia"
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 __icon__ = "hsrgustinex/21"
 __min_version__ = "11.12.0"
 
@@ -63,7 +63,6 @@ class IncomingMorseHook(MethodHook):
         self.plugin = plugin
 
     def before_hooked_method(self, param: Any):
-        # --- берем значение из настроек ---
         if not self.plugin.get_setting("decode_enabled", False):
             return
 
@@ -120,6 +119,62 @@ class IncomingMorseHook(MethodHook):
 # --- основной класс плагина ---
 class MorsePlugin(BasePlugin):
     
+    # --- словари переводов ---
+    _translations = {
+        "ru": {
+            "settings_main": "Основные настройки",
+            "encode_auto": "Переводить исходящие (автоматически)",
+            "decode_local": "Локальный перевод входящих",
+            "lang_header": "Язык расшифровки и интерфейса",
+            "lang_select": "Выберите язык",
+            "lang_ru": "Русский (RU)",
+            "lang_en": "English (EN)",
+            "msg_lang_ru": "язык плагина: русик",
+            "msg_lang_en": "язык плагина: англисик",
+            "msg_enc_on": "морзянка включена!! (˶ˆᗜˆ˵)",
+            "msg_enc_off": "морзянка выключена!!",
+            "msg_dec_on": "перевод входящей морзянки включен!!",
+            "msg_dec_off": "перевод входящей морзянки выключен!!"
+        },
+        "en": {
+            "settings_main": "Main settings",
+            "encode_auto": "Encode outgoing (auto)",
+            "decode_local": "Decode incoming locally",
+            "lang_header": "Decoding & UI Language",
+            "lang_select": "Select language",
+            "lang_ru": "Русский (RU)",
+            "lang_en": "English (EN)",
+            "msg_lang_ru": "plugin language: russian",
+            "msg_lang_en": "plugin language: english",
+            "msg_enc_on": "morse code enabled!! (˶ˆᗜˆ˵)",
+            "msg_enc_off": "morse code disabled!!",
+            "msg_dec_on": "incoming morse translation enabled!!",
+            "msg_dec_off": "incoming morse translation disabled!!"
+        }
+    }
+
+    # --- утилиты перевода ---
+    def _t(self, key: str) -> str:
+        lang_idx = self.get_setting("decode_lang_index", 0)
+        lang = "en" if lang_idx == 1 else "ru"
+        return self._translations.get(lang, self._translations["ru"]).get(key, key)
+
+    def _reload_plugin_settings(self):
+        try:
+            PC = find_class("com.exteragram.messenger.plugins.PluginsController")
+            inst = PC.getInstance()
+            try:
+                inst.loadPluginSettings(self.id)
+            except Exception:
+                inst.loadPluginSettings()
+        except Exception:
+            pass
+
+    def _on_lang_changed(self, index: int):
+        self.set_setting("decode_lang_index", index)
+        self._reload_plugin_settings()
+
+    # --- инициализация ---
     def on_plugin_load(self):
         self.add_on_send_message_hook()
         self._install_hooks()
@@ -136,33 +191,35 @@ class MorsePlugin(BasePlugin):
         except Exception as e:
             log(f"[Морзянка] Ошибка установки хука: {e}")
 
-    # --- создание меню настроек ---
+    # --- меню настроек ---
     def create_settings(self):
         return [
-            Header(text="Основные настройки"),
+            Header(text=self._t("settings_main")),
             Switch(
                 key="encode_enabled", 
-                text="Переводить исходящие (автоматически)", 
+                text=self._t("encode_auto"), 
                 default=False, 
                 icon="msg_edit"
             ),
             Switch(
                 key="decode_enabled", 
-                text="Локальный перевод входящих", 
+                text=self._t("decode_local"), 
                 default=False, 
                 icon="msg_message"
             ),
             Divider(),
-            Header(text="Язык расшифровки"),
+            Header(text=self._t("lang_header")),
             Selector(
                 key="decode_lang_index", 
-                text="Выберите язык", 
+                text=self._t("lang_select"), 
                 default=0, 
-                items=["Русский (RU)", "English (EN)"], 
-                icon="msg_language"
+                items=[self._t("lang_ru"), self._t("lang_en")], 
+                icon="msg_language",
+                on_change=lambda val: self._on_lang_changed(val)
             )
         ]
 
+    # --- логика перевода морзе ---
     def _to_morse(self, text: str) -> str:
         leading_spaces = len(text) - len(text.lstrip(' '))
         trailing_spaces = len(text) - len(text.rstrip(' '))
@@ -190,7 +247,6 @@ class MorsePlugin(BasePlugin):
         words = text.split('   ')
         decoded_words = []
         
-        # --- берем язык из настроек (0 = ru, 1 = en) ---
         lang_idx = self.get_setting("decode_lang_index", 0)
         active_dict = REVERSE_RU if lang_idx == 0 else REVERSE_EN
         
@@ -214,6 +270,7 @@ class MorsePlugin(BasePlugin):
         has_letters_or_digits = bool(re.search(r'[a-zA-Zа-яА-Я0-9]', text))
         return has_morse and not has_letters_or_digits
 
+    # --- обработка текста с сохранением entities ---
     def _process_message_with_entities(self, text: str, entities: Any) -> tuple[str, Any]:
         if not entities or getattr(entities, 'isEmpty', lambda: True)():
             return self._to_morse(text), entities
@@ -268,37 +325,37 @@ class MorsePlugin(BasePlugin):
             
         return new_text_bytes.decode('utf-16-le'), entities
 
+    # --- хук для исходящих сообщений ---
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
         if not isinstance(params.message, str):
             return HookResult()
 
         msg = params.message.strip()
 
-        # --- команды теперь перезаписывают настройки ---
         if msg == ".dlang ru":
             self.set_setting("decode_lang_index", 0)
-            run_on_ui_thread(lambda: BulletinHelper.show_success("язык декодера морзянки: русик"))
+            run_on_ui_thread(lambda: BulletinHelper.show_success(self._t("msg_lang_ru")))
             return HookResult(strategy=HookStrategy.CANCEL)
         if msg == ".dlang en":
             self.set_setting("decode_lang_index", 1)
-            run_on_ui_thread(lambda: BulletinHelper.show_success("язык декодера морзянки: англисик"))
+            run_on_ui_thread(lambda: BulletinHelper.show_success(self._t("msg_lang_en")))
             return HookResult(strategy=HookStrategy.CANCEL)
 
         if msg == ".mon":
             self.set_setting("encode_enabled", True)
-            run_on_ui_thread(lambda: BulletinHelper.show_success("морзянка включена!!"))
+            run_on_ui_thread(lambda: BulletinHelper.show_success(self._t("msg_enc_on")))
             return HookResult(strategy=HookStrategy.CANCEL)
         if msg == ".moff":
             self.set_setting("encode_enabled", False)
-            run_on_ui_thread(lambda: BulletinHelper.show_success("морзянка выключена!!"))
+            run_on_ui_thread(lambda: BulletinHelper.show_success(self._t("msg_enc_off")))
             return HookResult(strategy=HookStrategy.CANCEL)
         if msg == ".dmon":
             self.set_setting("decode_enabled", True)
-            run_on_ui_thread(lambda: BulletinHelper.show_success("перевод входящей морзянки включен!!"))
+            run_on_ui_thread(lambda: BulletinHelper.show_success(self._t("msg_dec_on")))
             return HookResult(strategy=HookStrategy.CANCEL)
         if msg == ".dmoff":
             self.set_setting("decode_enabled", False)
-            run_on_ui_thread(lambda: BulletinHelper.show_success("перевод входящей морзянки выключен!!"))
+            run_on_ui_thread(lambda: BulletinHelper.show_success(self._t("msg_dec_off")))
             return HookResult(strategy=HookStrategy.CANCEL)
 
         if msg.startswith(".m "):
@@ -314,7 +371,6 @@ class MorsePlugin(BasePlugin):
             params.entities = new_entities
             return HookResult(strategy=HookStrategy.MODIFY, params=params)
 
-        # --- проверяем настройку перед отправкой ---
         if self.get_setting("encode_enabled", False) and not msg.startswith("."):
             new_text, new_entities = self._process_message_with_entities(params.message, getattr(params, 'entities', None))
             params.message = new_text

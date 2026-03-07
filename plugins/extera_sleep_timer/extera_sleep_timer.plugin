@@ -1,11 +1,11 @@
 import threading
 import time
-from typing import List, Any, Optional
+from typing import Dict, Any, List, Optional
 
-from base_plugin import BasePlugin
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
 from android_utils import log, run_on_ui_thread
 from hook_utils import find_class
-from ui.settings import Header, Divider, Switch, Selector, Input, Text
+from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
 
 # --- метаданные ---
@@ -13,22 +13,22 @@ __id__ = "extera_sleep_timer"
 __name__ = "Таймер Сна"
 __description__ = "таймер сна хули. версия бета"
 __author__ = "@insonniiia"
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __icon__ = "hsrgustinex/67"
 __min_version__ = "11.12.0"
 
 
 # --- конфигурация ---
-DEFAULT_MINUTES: int = 30
-TIMER_OPTIONS: List[str] = ["15 минут", "30 минут", "45 минут", "60 минут", "Свой вариант"]
+FADE_DURATION_SEC: float = 5.0
+FADE_STEPS: int = 20
+FADE_INTERVAL: float = FADE_DURATION_SEC / FADE_STEPS
 
-class SleepTimerPlugin(BasePlugin):
+class MusicSleepPlugin(BasePlugin):
     def __init__(self) -> None:
         super().__init__()
-        self._timer_thread: Optional[threading.Thread] = None
-        self._stop_event: threading.Event = threading.Event()
+        self._active_timer: Optional[threading.Timer] = None
 
-    # --- служебные методы ---
+    # --- работа с медиа-контроллером ---
 
     def _get_media_controller(self) -> Any:
         try:
@@ -37,113 +37,93 @@ class SleepTimerPlugin(BasePlugin):
                 return controller_class.getInstance()
             return None
         except Exception as e:
-            log(f"SleepTimer: error finding MediaController: {e}")
+            log(f"MusicSleep: controller error: {e}")
             return None
 
-    def _stop_music_logic(self) -> None:
+    def _apply_fade_out(self) -> None:
+        def _fade_task():
+            try:
+                controller = self._get_media_controller()
+                if not controller:
+                    return
+
+                for i in range(FADE_STEPS, -1, -1):
+                    volume = i / FADE_STEPS
+                    run_on_ui_thread(lambda v=volume: controller.setPlaybackVolume(v))
+                    time.sleep(FADE_INTERVAL)
+
+                run_on_ui_thread(self._final_stop)
+            except Exception as e:
+                log(f"MusicSleep: fade error: {e}")
+
+        threading.Thread(target=_fade_task, daemon=True).start()
+
+    def _final_stop(self) -> None:
         try:
             controller = self._get_media_controller()
             if not controller:
                 return
-
+            
             playing_message = controller.getPlayingMessageObject()
             if playing_message:
                 controller.pauseMessage(playing_message)
-                run_on_ui_thread(lambda: BulletinHelper.show_info("Таймер сна: Музыка остановлена"))
             
-            self.set_setting("timer_active", False, reload_settings=True)
+            controller.setPlaybackVolume(1.0)
+            BulletinHelper.show_info("Музыка остановлена таймером")
         except Exception as e:
-            log(f"SleepTimer: error stopping music: {e}")
+            log(f"MusicSleep: stop error: {e}")
 
-    def _timer_worker(self, seconds: int) -> None:
-        try:
-            if self._stop_event.wait(timeout=seconds):
-                return
-            
-            run_on_ui_thread(self._stop_music_logic)
-        except Exception as e:
-            log(f"SleepTimer: worker error: {e}")
-
-    def _start_timer(self) -> None:
-        try:
-            self._stop_event.clear()
-            
-            mode_index = self.get_setting("timer_mode", 1)
-            if mode_index == 4:
-                try:
-                    minutes = int(self.get_setting("custom_minutes", str(DEFAULT_MINUTES)))
-                except ValueError:
-                    minutes = DEFAULT_MINUTES
-            else:
-                minutes = int(TIMER_OPTIONS[mode_index].split()[0])
-
-            seconds = minutes * 60
-            self._timer_thread = threading.Thread(target=self._timer_worker, args=(seconds,))
-            self._timer_thread.start()
-            
-            BulletinHelper.show_success(f"Таймер запущен на {minutes} мин.")
-        except Exception as e:
-            log(f"SleepTimer: error starting timer: {e}")
-
-    def _cancel_timer(self) -> None:
-        try:
-            self._stop_event.set()
-            if self._timer_thread:
-                self._timer_thread = None
-            BulletinHelper.show_info("Таймер отменен")
-        except Exception as e:
-            log(f"SleepTimer: error cancelling timer: {e}")
-
-    # --- методы плагина ---
+    # --- обработка меню ---
 
     def on_plugin_load(self) -> None:
         try:
-            self.set_setting("timer_active", False)
-            log("SleepTimer: loaded")
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                    text="Таймер сна",
+                    on_click=self._show_timer_dialog,
+                    icon="msg_schedule",
+                    condition="message.isMusic()" 
+                )
+            )
         except Exception as e:
-            log(f"SleepTimer: load error: {e}")
+            log(f"MusicSleep: load error: {e}")
+
+    def _show_timer_dialog(self, context: Dict[str, Any]) -> None:
+        try:
+            fragment = context.get("fragment")
+            if not fragment:
+                return
+            
+            activity = fragment.getParentActivity()
+            if not activity:
+                return
+
+            options = [1, 5, 15, 30, 60]
+            labels = [f"{m} мин." for m in options]
+
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Через сколько выключить?")
+            builder.set_items(labels, lambda b, which: self._start_countdown(options[which]))
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            builder.show()
+        except Exception as e:
+            log(f"MusicSleep: dialog error: {e}")
+
+    def _start_countdown(self, minutes: int) -> None:
+        try:
+            if self._active_timer:
+                self._active_timer.cancel()
+
+            seconds = minutes * 60
+            self._active_timer = threading.Timer(seconds, self._apply_fade_out)
+            self._active_timer.start()
+
+            BulletinHelper.show_success(f"Таймер запущен на {minutes} мин.")
+            log(f"MusicSleep: timer started for {seconds}s")
+        except Exception as e:
+            log(f"MusicSleep: countdown error: {e}")
 
     def on_plugin_unload(self) -> None:
-        try:
-            self._cancel_timer()
-        except Exception as e:
-            log(f"SleepTimer: unload error: {e}")
-
-    def _on_status_change(self, active: bool) -> None:
-        if active:
-            self._start_timer()
-        else:
-            self._cancel_timer()
-
-    def create_settings(self) -> List[Any]:
-        return [
-            Header(text="Таймер сна"),
-            Switch(
-                key="timer_active",
-                text="Включить таймер",
-                default=False,
-                subtext="Музыка остановится автоматически",
-                icon="msg_schedule",
-                on_change=self._on_status_change
-            ),
-            Divider(),
-            Selector(
-                key="timer_mode",
-                text="Интервал",
-                default=1,
-                items=TIMER_OPTIONS,
-                icon="msg_timer"
-            ),
-            Input(
-                key="custom_minutes",
-                text="Свой вариант (минуты)",
-                default=str(DEFAULT_MINUTES),
-                subtext="Используется, если выбран 'Свой вариант'",
-                icon="msg_edit"
-            ),
-            Divider(text="Информация"),
-            Text(
-                text="Плагин остановит плеер Telegram по истечении времени.",
-                icon="msg_info"
-            )
-        ]
+        if self._active_timer:
+            self._active_timer.cancel()

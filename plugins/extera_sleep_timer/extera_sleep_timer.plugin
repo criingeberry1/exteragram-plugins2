@@ -16,7 +16,7 @@ __id__ = "extera_sleep_timer"
 __name__ = "Таймер Сна"
 __description__ = "таймер сна хули. версия бета"
 __author__ = "@insonniiia"
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 __icon__ = "hsrgustinex/67"
 __min_version__ = "11.12.0"
 
@@ -26,6 +26,7 @@ COMMAND_SLEEP: str = ".sleep"
 FADE_CURVE_EXP: int = 2
 EXTEND_TIME_SEC: int = 300
 NOTICE_THRESHOLD_SEC: int = 60
+ICON_NAME: str = "msg_schedule"
 
 class MusicSleepMaster(BasePlugin):
     def __init__(self) -> None:
@@ -86,7 +87,6 @@ class MusicSleepMaster(BasePlugin):
         fade_trigger = float(self.get_setting("fade_sec", "10"))
         
         while self._is_running and self._remaining_seconds > fade_trigger:
-            # показываем интерактивное уведомление за минуту до конца
             if self._remaining_seconds == NOTICE_THRESHOLD_SEC:
                 run_on_ui_thread(lambda: BulletinHelper.show_with_button(
                     text="Таймер: осталась 1 минута",
@@ -95,7 +95,6 @@ class MusicSleepMaster(BasePlugin):
                     on_click=self._extend_timer
                 ))
             
-            # обычное уведомление раз в 5 минут для контроля
             elif self._remaining_seconds > 60 and self._remaining_seconds % 300 == 0:
                 mins = self._remaining_seconds // 60
                 run_on_ui_thread(lambda m=mins: BulletinHelper.show_info(f"Таймер: осталось {m} мин."))
@@ -126,18 +125,19 @@ class MusicSleepMaster(BasePlugin):
         try:
             self.add_on_send_message_hook()
             
+            # добавляем иконку ICON_NAME для визуального единообразия
             self.add_menu_item(MenuItemData(
                 menu_type=MenuItemType.CHAT_ACTION_MENU,
                 text="Таймер сна",
                 on_click=self._ui_select_time,
-                icon="msg_schedule"
+                icon=ICON_NAME
             ))
 
             self.add_menu_item(MenuItemData(
                 menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
                 text="Таймер сна",
                 on_click=self._ui_select_time,
-                icon="msg_schedule",
+                icon=ICON_NAME,
                 condition="message.isMusic()"
             ))
         except Exception as e:

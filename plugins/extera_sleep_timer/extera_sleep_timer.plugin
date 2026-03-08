@@ -16,7 +16,7 @@ __id__ = "extera_sleep_timer"
 __name__ = "Таймер Сна"
 __description__ = "таймер сна хули. версия бета"
 __author__ = "@insonniiia"
-__version__ = "2.5.3"
+__version__ = "2.5.4"
 __icon__ = "hsrgustinex/67"
 __min_version__ = "11.12.0"
 
@@ -41,7 +41,7 @@ class MusicSleepPro(BasePlugin):
             m, s = divmod(total_seconds, 60)
             h, m = divmod(m, 60)
             if h > 0:
-                return f"{h} ч. {m} мин." if m > 0 else f"{h} ч."
+                return f"{h} ч. {m} мин." if m > 0 else f"{h} мин."
             return f"{m} мин."
         except Exception as e:
             log(f"format_error: {e}")
@@ -183,7 +183,6 @@ class MusicSleepPro(BasePlugin):
 
             builder = AlertDialogBuilder(activity)
             
-            # умный диалог: меняется в зависимости от статуса таймера
             if self._active:
                 current_time = self._format_time(self._remaining)
                 builder.set_title(f"Таймер работает ({current_time})")
@@ -222,9 +221,12 @@ class MusicSleepPro(BasePlugin):
     def _create_help_page(self) -> List[Any]:
         return [
             Header(text="Как использовать таймер?"),
-            Text(text="1. Через меню", icon="msg_menu", subtext="Нажмите на 3 точки в чате или зажмите сообщение с музыкой."),
-            Text(text="2. Командами", icon="msg_command", subtext="Отправьте .sleep 45 в любой чат для запуска таймера на 45 минут."),
-            Text(text="Умный контроль", icon="msg_info", subtext="За 1 минуту до конца появится кнопка быстрого продления.")
+            Text(text="1. Через меню", icon="msg_menu"),
+            Divider(text="Нажмите на 3 точки в чате или зажмите сообщение с музыкой."),
+            Text(text="2. Командами", icon="msg_command"),
+            Divider(text="Отправьте .sleep 45 в любой чат для запуска таймера на 45 минут."),
+            Text(text="Умный контроль", icon="msg_info"),
+            Divider(text="За 1 минуту до конца появится кнопка быстрого продления.")
         ]
 
     def create_settings(self) -> List[Any]:

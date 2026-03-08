@@ -14,7 +14,7 @@ from org.telegram.messenger import R as R_tg
 # --- метаданные ---
 __id__ = "extera_sleep_timer"
 __name__ = "Таймер Сна"
-__description__ = "таймер сна хули. версия бета"
+__description__ = "☆ полу-вайбкод плагин с таймером сна ☆"
 __author__ = "@insonniiia"
 __version__ = "2.5.4"
 __icon__ = "hsrgustinex/67"

@@ -16,7 +16,7 @@ __id__ = "extera_sleep_timer"
 __name__ = "Таймер Сна"
 __description__ = "таймер сна хули. версия бета"
 __author__ = "@insonniiia"
-__version__ = "2.5.2"
+__version__ = "2.5.3"
 __icon__ = "hsrgustinex/67"
 __min_version__ = "11.12.0"
 
@@ -33,6 +33,19 @@ class MusicSleepPro(BasePlugin):
         self._thread: Optional[threading.Thread] = None
         self._active: bool = False
         self._remaining: int = 0
+
+    # --- служебная логика ---
+
+    def _format_time(self, total_seconds: int) -> str:
+        try:
+            m, s = divmod(total_seconds, 60)
+            h, m = divmod(m, 60)
+            if h > 0:
+                return f"{h} ч. {m} мин." if m > 0 else f"{h} ч."
+            return f"{m} мин."
+        except Exception as e:
+            log(f"format_error: {e}")
+            return f"{total_seconds} сек."
 
     # --- медиа контроллер ---
 
@@ -80,10 +93,11 @@ class MusicSleepPro(BasePlugin):
 
     # --- фоновый процесс ---
 
-    def _add_time(self) -> None:
+    def _add_time(self, seconds_to_add: int = 300) -> None:
         try:
-            self._remaining += 300
-            BulletinHelper.show_success("Добавлено 5 минут")
+            self._remaining += seconds_to_add
+            added_text = self._format_time(seconds_to_add)
+            run_on_ui_thread(lambda: BulletinHelper.show_success(f"Добавлено: {added_text}"))
         except Exception as e:
             log(f"add_time_error: {e}")
 
@@ -97,11 +111,11 @@ class MusicSleepPro(BasePlugin):
                         text="Осталась 1 минута",
                         icon_res_id=R_tg.raw.info,
                         button_text="Продлить",
-                        on_click=self._add_time
+                        on_click=lambda: self._add_time(300)
                     ))
                 elif self._remaining % UPDATE_INTERVAL == 0:
-                    mins = self._remaining // 60
-                    run_on_ui_thread(lambda m=mins: BulletinHelper.show_info(f"Таймер: осталось {m} мин"))
+                    run_on_ui_thread(lambda t=self._format_time(self._remaining): 
+                                     BulletinHelper.show_info(f"Таймер: {t}"))
                 
                 time.sleep(1)
                 self._remaining -= 1
@@ -121,7 +135,8 @@ class MusicSleepPro(BasePlugin):
             self._thread = threading.Thread(target=self._countdown_loop, daemon=True)
             self._thread.start()
             
-            run_on_ui_thread(lambda: BulletinHelper.show_success(f"Запущен таймер на {minutes} мин"))
+            time_str = self._format_time(self._remaining)
+            run_on_ui_thread(lambda: BulletinHelper.show_success(f"Таймер запущен ({time_str})"))
         except Exception as e:
             log(f"timer_init_error: {e}")
 
@@ -131,20 +146,14 @@ class MusicSleepPro(BasePlugin):
         try:
             self.add_on_send_message_hook()
             
-            self.add_menu_item(MenuItemData(
-                menu_type=MenuItemType.CHAT_ACTION_MENU,
-                text="Таймер сна",
-                icon=MENU_ICON,
-                on_click=self._show_time_picker
-            ))
-
-            self.add_menu_item(MenuItemData(
-                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
-                text="Таймер сна",
-                icon=MENU_ICON,
-                on_click=self._show_time_picker,
-                condition="message.isMusic()"
-            ))
+            for m_type in [MenuItemType.CHAT_ACTION_MENU, MenuItemType.MESSAGE_CONTEXT_MENU]:
+                self.add_menu_item(MenuItemData(
+                    menu_type=m_type,
+                    text="Таймер сна",
+                    icon=MENU_ICON,
+                    on_click=self._show_smart_picker,
+                    condition="message.isMusic()" if m_type == MenuItemType.MESSAGE_CONTEXT_MENU else ""
+                ))
         except Exception as e:
             log(f"plugin_load_error: {e}")
 
@@ -155,7 +164,7 @@ class MusicSleepPro(BasePlugin):
                 args = text.split()
                 if len(args) > 1 and args[1] == "stop":
                     self._active = False
-                    run_on_ui_thread(lambda: BulletinHelper.show_info("Таймер сброшен"))
+                    run_on_ui_thread(lambda: BulletinHelper.show_info("Таймер отменен"))
                 else:
                     target_mins = int(args[1]) if len(args) > 1 and args[1].isdigit() else 30
                     self._initialize_timer(target_mins)
@@ -164,7 +173,7 @@ class MusicSleepPro(BasePlugin):
             log(f"message_hook_error: {e}")
         return HookResult()
 
-    def _show_time_picker(self, context: Dict[str, Any]) -> None:
+    def _show_smart_picker(self, context: Dict[str, Any]) -> None:
         try:
             fragment = context.get("fragment")
             if not fragment: return
@@ -172,16 +181,51 @@ class MusicSleepPro(BasePlugin):
             activity = fragment.getParentActivity()
             if not activity: return
 
-            options = [5, 15, 30, 45, 60, 90]
-            display_items = [f"{o} минут" for o in options]
-
             builder = AlertDialogBuilder(activity)
-            builder.set_title("Установить время")
-            builder.set_items(display_items, lambda b, i: (self._initialize_timer(options[i]), b.dismiss()))
-            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+            
+            # умный диалог: меняется в зависимости от статуса таймера
+            if self._active:
+                current_time = self._format_time(self._remaining)
+                builder.set_title(f"Таймер работает ({current_time})")
+                
+                actions = ["Отменить таймер", "Продлить на 10 мин.", "Остановить музыку сейчас"]
+                def _handle_active(bld: AlertDialogBuilder, idx: int):
+                    if idx == 0:
+                        self._active = False
+                        BulletinHelper.show_info("Таймер отменен")
+                    elif idx == 1:
+                        self._add_time(600)
+                    elif idx == 2:
+                        self._active = False
+                        self._commit_stop()
+                    bld.dismiss()
+                    
+                builder.set_items(actions, _handle_active)
+            else:
+                builder.set_title("Установить время")
+                options = [5, 15, 30, 45, 60, 90]
+                display_items = [self._format_time(o * 60) for o in options]
+                
+                def _handle_inactive(bld: AlertDialogBuilder, idx: int):
+                    self._initialize_timer(options[idx])
+                    bld.dismiss()
+                    
+                builder.set_items(display_items, _handle_inactive)
+
+            builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
             builder.show()
         except Exception as e:
             log(f"time_picker_error: {e}")
+
+    # --- раздел справки ---
+
+    def _create_help_page(self) -> List[Any]:
+        return [
+            Header(text="Как использовать таймер?"),
+            Text(text="1. Через меню", icon="msg_menu", subtext="Нажмите на 3 точки в чате или зажмите сообщение с музыкой."),
+            Text(text="2. Командами", icon="msg_command", subtext="Отправьте .sleep 45 в любой чат для запуска таймера на 45 минут."),
+            Text(text="Умный контроль", icon="msg_info", subtext="За 1 минуту до конца появится кнопка быстрого продления.")
+        ]
 
     def create_settings(self) -> List[Any]:
         return [
@@ -190,11 +234,15 @@ class MusicSleepPro(BasePlugin):
                 key="fade_duration",
                 text="Затухание звука (сек)",
                 default="15",
-                subtext="Плавное снижение громкости перед остановкой"
+                subtext="Плавное снижение громкости перед остановкой",
+                icon="msg_settings"
             ),
-            Divider(text="Команды"),
-            Text(text=".sleep [минуты] — запуск таймера", icon="msg_info"),
-            Text(text=".sleep stop — отмена таймера", red=True)
+            Divider(),
+            Text(
+                text="Инструкция и команды",
+                icon="msg_help",
+                create_sub_fragment=self._create_help_page
+            )
         ]
 
     def on_plugin_unload(self) -> None:

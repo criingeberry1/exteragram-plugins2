@@ -16,7 +16,7 @@ __id__ = "extera_sleep_timer"
 __name__ = "Таймер Сна"
 __description__ = "таймер сна хули. версия бета"
 __author__ = "@insonniiia"
-__version__ = "2.5.1"
+__version__ = "2.5.2"
 __icon__ = "hsrgustinex/67"
 __min_version__ = "11.12.0"
 
@@ -25,7 +25,7 @@ __min_version__ = "11.12.0"
 COMMAND_TRIGGER: str = ".sleep"
 FADE_CURVE_POWER: int = 2
 UPDATE_INTERVAL: int = 60
-MENU_ICON: str = "msg_clock"
+MENU_ICON: str = "msg_autodelete"
 
 class MusicSleepPro(BasePlugin):
     def __init__(self) -> None:

@@ -1,12 +1,9 @@
-from typing import Any, List
-from base_plugin import BasePlugin, MethodHook
-from hook_utils import find_class
-from ui.settings import Header, EditText, Divider
+from typing import Any, List, Optional
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.settings import Header, Input, Divider, Text
 from ui.bulletin import BulletinHelper
-from client_utils import get_user_config
-from java.util import ArrayList
-from java.lang import Long
-from org.telegram.messenger import MediaController
+from android_utils import log as android_log
+from org.telegram.messenger import MediaController, MessagesController, UserConfig
 
 # --- метаданные ---
 __id__ = "like_music"
@@ -23,147 +20,177 @@ v1.0.0: перехват отправки в избранное, настрой�
   target chat id — укажи id диалога, канала или группы (с минусом)
 """
 __author__ = "@insonniiia"
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __icon__ = "hsrgustinex/54"
 __min_version__ = "11.12.0"
 
 
-class ForwardInterceptorHook(MethodHook):
-    def __init__(self, plugin: BasePlugin) -> None:
-        self.plugin = plugin
+# --- constants for dialog id arithmetic ---
+BASIC_GROUP_MAX_ABS_ID: int = 999_999_999
+BOT_API_CHANNEL_NUMERIC_PREFIX_LEN: int = 3
+CHANNEL_BASE_OFFSET: int = 1_000_000_000
 
-    def before_hooked_method(self, param: Any) -> None:
-        try:
-            # --- extract target chat id ---
-            target_id_str: str = self.plugin.get_setting("music_target_chat_id", "")
-            if not target_id_str:
-                return
+def _bot_api_id_to_native_dialog_id(bot_api_id: int) -> int:
+    # --- convert bot api chat id format to native android dialog id ---
+    # users and basic groups share the same representation in both formats
+    if bot_api_id > 0:
+        return bot_api_id
+    abs_id: int = abs(bot_api_id)
+    if abs_id <= BASIC_GROUP_MAX_ABS_ID:
+        return bot_api_id
+    # --- channels and supergroups: strip leading "100" prefix then apply offset ---
+    # example: bot_api=-1001234567890 -> str="1001234567890" -> [3:]="1234567890"
+    # native = -(1234567890 + 1_000_000_000) = -2234567890
+    channel_id: int = int(str(abs_id)[BOT_API_CHANNEL_NUMERIC_PREFIX_LEN:])
+    return -(channel_id + CHANNEL_BASE_OFFSET)
 
-            target_chat_id: int = int(target_id_str)
+def _input_peer_to_native_dialog_id(input_peer: Any) -> Optional[int]:
+    # --- extract native android dialog id from a tlrpc inputpeer instance ---
+    try:
+        class_name: str = str(input_peer.getClass().getSimpleName())
+        if class_name == "TL_inputPeerUser":
+            return int(input_peer.user_id)
+        if class_name == "TL_inputPeerChat":
+            return -int(input_peer.chat_id)
+        if class_name in ("TL_inputPeerChannel", "TL_inputPeerChannelFromMessage"):
+            return -(int(input_peer.channel_id) + CHANNEL_BASE_OFFSET)
+        if class_name == "TL_inputPeerSelf":
+            # --- cannot resolve without account context; caller handles this case ---
+            return None
+    except Exception as conversion_error:
+        android_log(f"input peer to dialog id conversion error: {str(conversion_error)}")
+    return None
 
-            # --- extract method arguments ---
-            args: list = param.args
-            if not args:
-                return
+def _safe_parse_int(raw_value: str) -> Optional[int]:
+    # --- safely parse a string as an integer, returning none on failure ---
+    try:
+        return int(raw_value)
+    except (ValueError, TypeError):
+        return None
 
-            # --- initialize search variables ---
-            messages_list: Any = None
-            dialog_id_idx: int = -1
-            
-            # --- iterate arguments dynamically ---
-            for i in range(len(args)):
-                arg: Any = args[i]
-                if arg is None:
-                    continue
-                
-                class_name: str = str(arg.getClass().getSimpleName())
-                
-                # --- check builder pattern ---
-                if class_name == "SendMessageParams":
-                    self._process_builder(arg, target_chat_id)
-                    return
-                    
-                # --- check legacy list ---
-                if class_name == "ArrayList" and not arg.isEmpty():
-                    first_elem: Any = arg.get(0)
-                    if first_elem is not None and str(first_elem.getClass().getSimpleName()) == "MessageObject":
-                        messages_list = arg
-                        
-                # --- locate peer id ---
-                if isinstance(arg, int) and dialog_id_idx == -1:
-                    dialog_id_idx = i
+def _java_list_contains_int(java_list: Any, target_id: int) -> bool:
+    # --- scan a java arraylist<integer> for a specific integer value ---
+    try:
+        list_size: int = java_list.size()
+        for i in range(list_size):
+            if int(java_list.get(i)) == target_id:
+                return True
+    except Exception as scan_error:
+        android_log(f"java list scan error: {str(scan_error)}")
+    return False
 
-            if messages_list is not None and dialog_id_idx != -1:
-                self._process_legacy(param, messages_list, dialog_id_idx, target_chat_id)
+class MusicForwardRedirectPlugin(BasePlugin):
 
-        except Exception as e:
-            self.plugin.log(f"forward interceptor hook error: {str(e)}")
-
-    def _process_builder(self, msg_params: Any, target_chat_id: int) -> None:
-        try:
-            # --- validate saved messages destination ---
-            user_id: int = get_user_config().getClientUserId()
-            if getattr(msg_params, 'dialog_id', 0) != user_id:
-                return
-                
-            # --- extract inner messages collection ---
-            messages_list: Any = None
-            for field in msg_params.getClass().getDeclaredFields():
-                field.setAccessible(True)
-                val: Any = field.get(msg_params)
-                if isinstance(val, ArrayList) and not val.isEmpty():
-                    first_elem: Any = val.get(0)
-                    if first_elem is not None and str(first_elem.getClass().getSimpleName()) == "MessageObject":
-                        messages_list = val
-                        break
-                        
-            if messages_list is not None:
-                # --- bypass original execution destination ---
-                setattr(msg_params, 'dialog_id', target_chat_id)
-                self._check_and_notify(messages_list)
-        except Exception as e:
-            self.plugin.log(f"process builder error: {str(e)}")
-
-    def _process_legacy(self, param: Any, messages_list: Any, dialog_id_idx: int, target_chat_id: int) -> None:
-        try:
-            # --- validate saved messages destination ---
-            user_id: int = get_user_config().getClientUserId()
-            if param.args[dialog_id_idx] != user_id:
-                return
-                
-            # --- bypass original execution destination ---
-            param.args[dialog_id_idx] = Long(target_chat_id)
-            self._check_and_notify(messages_list)
-        except Exception as e:
-            self.plugin.log(f"process legacy error: {str(e)}")
-
-    def _check_and_notify(self, messages_list: Any) -> None:
-        try:
-            # --- fetch active audio track ---
-            playing_msg: Any = MediaController.getInstance().getPlayingMessageObject()
-            if playing_msg is None:
-                return
-                
-            # --- search for track in queue ---
-            is_playing_track: bool = False
-            for i in range(messages_list.size()):
-                fwd_msg: Any = messages_list.get(i)
-                if fwd_msg.getId() == playing_msg.getId() and fwd_msg.getDialogId() == playing_msg.getDialogId():
-                    is_playing_track = True
-                    break
-                    
-            if is_playing_track:
-                # --- execute notify ---
-                BulletinHelper.show_success("Музыкальный трек перенаправлен")
-        except Exception as e:
-            self.plugin.log(f"check and notify error: {str(e)}")
-
-class AudioPlayerForwardPlugin(BasePlugin):
     def on_plugin_load(self) -> None:
+        # --- register hook for the telegram forward messages api request ---
         try:
-            # --- register core hooks ---
-            target_class: Any = find_class("org.telegram.messenger.SendMessagesHelper")
-            if target_class:
-                self.hook_all_methods(target_class, "sendMessage", ForwardInterceptorHook(self))
-            else:
-                BulletinHelper.show_error("Класс SendMessagesHelper не найден")
-        except Exception as e:
-            # --- handle hook initialization error ---
-            self.log(f"plugin load error: {str(e)}")
-            BulletinHelper.show_error("Ошибка инициализации перехватчика медиа")
+            self.add_hook("TL_messages_forwardMessages")
+            self.log("hook registered successfully: TL_messages_forwardMessages")
+        except Exception as load_error:
+            self.log(f"plugin load error: {str(load_error)}")
+            BulletinHelper.show_error("Ошибка инициализации плагина перенаправления треков")
+
+    def on_plugin_unload(self) -> None:
+        # --- no manual cleanup needed; hooks are removed automatically ---
+        self.log("plugin unloaded")
+
+    def pre_request_hook(self, request_name: str, account: int, request: Any) -> HookResult:
+        # --- filter: only process forward message requests ---
+        if request_name != "TL_messages_forwardMessages":
+            return HookResult(strategy=HookStrategy.DEFAULT)
+        try:
+            return self._intercept_forward(account, request)
+        except Exception as hook_error:
+            self.log(f"pre_request_hook unhandled error: {str(hook_error)}")
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+    def _intercept_forward(self, account: int, request: Any) -> HookResult:
+        # --- step 1: validate that a target chat id is configured ---
+        target_id_raw: str = self.get_setting("target_chat_id", "").strip()
+        if not target_id_raw:
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        target_bot_api_id: Optional[int] = _safe_parse_int(target_id_raw)
+        if target_bot_api_id is None:
+            BulletinHelper.show_error("Неверный формат ID в настройках. Ожидается число")
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        target_native_dialog_id: int = _bot_api_id_to_native_dialog_id(target_bot_api_id)
+
+        # --- step 2: verify destination is saved messages (own account) ---
+        to_peer: Any = request.to_peer
+        to_peer_class: str = str(to_peer.getClass().getSimpleName())
+
+        user_config: Any = UserConfig.getInstance(account)
+        my_user_id: int = int(user_config.getClientUserId())
+
+        is_to_saved_messages: bool = (
+            to_peer_class == "TL_inputPeerSelf"
+            or (to_peer_class == "TL_inputPeerUser" and int(to_peer.user_id) == my_user_id)
+        )
+
+        if not is_to_saved_messages:
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        # --- step 3: ensure there is an actively playing track ---
+        playing_msg_object: Any = MediaController.getInstance().getPlayingMessageObject()
+        if playing_msg_object is None:
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        playing_msg_id: int = int(playing_msg_object.getId())
+        playing_dialog_id: int = int(playing_msg_object.getDialogId())
+
+        # --- step 4: verify the forward source matches the playing track's origin chat ---
+        from_peer: Any = request.from_peer
+        source_native_dialog_id: Optional[int] = _input_peer_to_native_dialog_id(from_peer)
+
+        if source_native_dialog_id is None or source_native_dialog_id != playing_dialog_id:
+            # --- source chat does not match playing track; do not redirect ---
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        # --- step 5: confirm the playing track's message id is among forwarded ids ---
+        forwarded_message_ids: Any = request.id
+        is_forwarding_the_playing_track: bool = _java_list_contains_int(
+            forwarded_message_ids, playing_msg_id
+        )
+
+        if not is_forwarding_the_playing_track:
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        # --- step 6: resolve a valid inputpeer for the target chat via messages controller ---
+        messages_controller: Any = MessagesController.getInstance(account)
+        resolved_target_peer: Any = messages_controller.getInputPeer(target_native_dialog_id)
+
+        if resolved_target_peer is None:
+            BulletinHelper.show_error("Целевой чат не найден. Сначала откройте его в приложении")
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        resolved_peer_class: str = str(resolved_target_peer.getClass().getSimpleName())
+        if resolved_peer_class == "TL_inputPeerEmpty":
+            BulletinHelper.show_error("Целевой чат недоступен. Откройте его хотя бы раз")
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        # --- step 7: apply redirect by replacing destination peer ---
+        request.to_peer = resolved_target_peer
+        BulletinHelper.show_success("Трек перенаправлен в целевой чат")
+
+        return HookResult(strategy=HookStrategy.MODIFY, request=request)
 
     def create_settings(self) -> List[Any]:
-        try:
-            # --- render plugin configuration ---
-            return [
-                Header(text="Настройки пересылки"),
-                EditText(
-                    key="music_target_chat_id",
-                    hint="ID целевого чата",
-                    default=""
-                ),
-                Divider(text="Укажите ID со знаком минуса для групп или каналов")
-            ]
-        except Exception as e:
-            self.log(f"create settings error: {str(e)}")
-            return []
+        # --- build settings screen ---
+        return [
+            Header(text="Перенаправление треков"),
+            Input(
+                key="target_chat_id",
+                text="ID целевого чата",
+                default="",
+                subtext="Трек уйдёт в этот чат вместо Избранного",
+                icon="msg_forward"
+            ),
+            Divider(text="Для каналов и супергрупп ID начинается с -100"),
+            Text(
+                text="Как узнать ID: перешлите сообщение из нужного чата боту @userinfobot",
+                icon="msg_info"
+            ),
+            Divider(text="Важно: откройте целевой чат в Telegram хотя бы один раз перед использованием"),
+        ]

@@ -1,0 +1,243 @@
+from typing import Any, List, Optional
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from ui.settings import Header, Input, Divider, Switch, Text
+from ui.bulletin import BulletinHelper
+from android_utils import log as android_log
+from org.telegram.messenger import MediaController, MessagesController, UserConfig
+
+# --- метаданные ---
+__id__ = "likemusic"
+__name__ = "Лайк"
+__description__ = "хз не придумала"
+__author__ = "@insonniiia"
+__version__ = "1.0.0"
+__icon__ = "hsrgustinex/54"
+__min_version__ = "11.12.0"
+
+
+# --- bot api channel prefix used to distinguish channels from basic groups ---
+_CHANNEL_BOT_API_PREFIX: str = "-100"
+_CHANNEL_PREFIX_LEN: int = len(_CHANNEL_BOT_API_PREFIX)
+
+def _bot_api_to_dialog_id(raw: str) -> Optional[int]:
+    # --- convert user-supplied bot api id to native android dialog id ---
+    # --- users: identical in both systems (positive number) ---
+    # --- basic groups: identical in both systems (negative, no "-100") ---
+    # --- channels/supergroups: strip "-100" prefix, negate the remainder ---
+    s: str = raw.strip()
+    if not s:
+        return None
+    try:
+        val: int = int(s)
+    except ValueError:
+        return None
+    if val > 0:
+        return val
+    if s.startswith(_CHANNEL_BOT_API_PREFIX):
+        digits: str = s[_CHANNEL_PREFIX_LEN:]
+        if not digits.isdigit():
+            return None
+        return -int(digits)
+    return val
+
+def _classify_to_peer(to_peer: Any, account: int) -> str:
+    # --- return a human-readable description of the destination peer ---
+    # --- used in debug mode to show exact peer type to the user ---
+    try:
+        cls: str = str(to_peer.getClass().getSimpleName())
+        if cls == "TL_inputPeerSelf":
+            return "TL_inputPeerSelf (избранное)"
+        if cls == "TL_inputPeerUser":
+            own_id: int = int(UserConfig.getInstance(account).getClientUserId())
+            peer_user_id: int = int(to_peer.user_id)
+            is_self: bool = peer_user_id == own_id
+            label: str = " (избранное — свой id)" if is_self else f" (user {peer_user_id})"
+            return cls + label
+        if cls == "TL_inputPeerChannel":
+            return f"TL_inputPeerChannel (channel_id={to_peer.channel_id})"
+        if cls == "TL_inputPeerChat":
+            return f"TL_inputPeerChat (chat_id={to_peer.chat_id})"
+        return cls
+    except Exception as e:
+        return f"ошибка чтения to_peer: {str(e)}"
+
+def _is_destination_saved_messages(to_peer: Any, account: int) -> bool:
+    # --- return true only if forward destination is the user's own saved messages ---
+    try:
+        cls: str = str(to_peer.getClass().getSimpleName())
+        if cls == "TL_inputPeerSelf":
+            return True
+        if cls == "TL_inputPeerUser":
+            own_id: int = int(UserConfig.getInstance(account).getClientUserId())
+            return int(to_peer.user_id) == own_id
+    except Exception as e:
+        android_log(f"[MusicRedirect] is_saved_messages error: {str(e)}")
+    return False
+
+def _resolve_input_peer(account: int, dialog_id: int) -> Optional[Any]:
+    # --- ask messages controller to resolve a live input peer from local cache ---
+    # --- returns none if channel is not in local database (never opened) ---
+    try:
+        mc: Any = MessagesController.getInstance(account)
+        peer: Any = mc.getInputPeer(dialog_id)
+        if peer is None:
+            return None
+        cls: str = str(peer.getClass().getSimpleName())
+        if "Empty" in cls:
+            return None
+        return peer
+    except Exception as e:
+        android_log(f"[MusicRedirect] resolve_input_peer error: {str(e)}")
+    return None
+
+def _get_audio_label(playing_msg: Any) -> str:
+    # --- extract artist and title from tl_documentattributeaudio if available ---
+    try:
+        attrs: Any = playing_msg.messageOwner.media.document.attributes
+        for i in range(attrs.size()):
+            attr: Any = attrs.get(i)
+            if "Audio" in str(attr.getClass().getSimpleName()):
+                title: str = str(attr.title) if attr.title else ""
+                performer: str = str(attr.performer) if attr.performer else ""
+                if performer and title:
+                    return f"{performer} – {title}"
+                if title:
+                    return title
+                if performer:
+                    return performer
+                return "трек без названия"
+    except Exception:
+        pass
+    return "трек"
+
+class MusicPlaylistRedirectPlugin(BasePlugin):
+
+    def on_plugin_load(self) -> None:
+        # --- register hook with substring match to catch all forward variants ---
+        try:
+            self.add_hook("forwardMessages", match_substring=True)
+            self.log("hook registered: forwardMessages (substring match)")
+        except Exception as e:
+            self.log(f"on_plugin_load error: {str(e)}")
+            BulletinHelper.show_error("Плагин: не удалось зарегистрировать хук")
+
+    def on_plugin_unload(self) -> None:
+        # --- engine removes hooks automatically ---
+        self.log("plugin unloaded")
+
+    def pre_request_hook(
+        self, request_name: str, account: int, request: Any
+    ) -> HookResult:
+        # --- fast exit: ignore non-forward requests ---
+        if "forward" not in request_name.lower():
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        is_debug: bool = self.get_setting("debug_mode", False)
+
+        if is_debug:
+            # --- in debug mode: show raw info, do not modify anything ---
+            self._show_debug_bulletin(request_name, account, request)
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        try:
+            return self._redirect_if_applicable(account, request)
+        except Exception as e:
+            self.log(f"pre_request_hook unhandled: {str(e)}")
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+    # ----------------------------------------------------------------------- #
+
+    def _show_debug_bulletin(
+        self, request_name: str, account: int, request: Any
+    ) -> None:
+        # --- collect and display diagnostic data as a bulletin ---
+        try:
+            peer_description: str = _classify_to_peer(request.to_peer, account)
+            playing: Any = MediaController.getInstance().getPlayingMessageObject()
+            playing_label: str = _get_audio_label(playing) if playing else "ничего не играет"
+            BulletinHelper.show_info(
+                f"[debug] {request_name}\n"
+                f"to_peer → {peer_description}\n"
+                f"трек → {playing_label}"
+            )
+        except Exception as e:
+            BulletinHelper.show_error(f"[debug] ошибка сбора данных: {str(e)}")
+
+    def _redirect_if_applicable(self, account: int, request: Any) -> HookResult:
+        # --- gate 1: plugin must be enabled ---
+        if not self.get_setting("enabled", True):
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        # --- gate 2: target channel id must be configured ---
+        target_raw: str = self.get_setting("target_channel_id", "").strip()
+        if not target_raw:
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        # --- gate 3: forward destination must be saved messages ---
+        if not _is_destination_saved_messages(request.to_peer, account):
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        # --- gate 4: a track must be playing right now ---
+        playing: Any = MediaController.getInstance().getPlayingMessageObject()
+        if playing is None:
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        # --- parse the user-supplied bot api id into a native dialog id ---
+        dialog_id: Optional[int] = _bot_api_to_dialog_id(target_raw)
+        if dialog_id is None:
+            BulletinHelper.show_error(
+                "Неверный ID канала в настройках. Ожидается число вида -100XXXXXXXXX"
+            )
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        # --- resolve a live input peer from the local messages controller cache ---
+        resolved_peer: Optional[Any] = _resolve_input_peer(account, dialog_id)
+        if resolved_peer is None:
+            BulletinHelper.show_error(
+                "Канал не найден в кэше. Откройте его в Telegram и попробуйте снова"
+            )
+            return HookResult(strategy=HookStrategy.DEFAULT)
+
+        # --- all gates passed: redirect by replacing the destination peer ---
+        request.to_peer = resolved_peer
+        track_label: str = _get_audio_label(playing)
+        BulletinHelper.show_success(f"{track_label} → плейлист")
+
+        return HookResult(strategy=HookStrategy.MODIFY, request=request)
+
+    # ----------------------------------------------------------------------- #
+
+    def create_settings(self) -> List[Any]:
+        # --- build the settings screen ---
+        return [
+            Header(text="Плейлист-канал"),
+            Switch(
+                key="enabled",
+                text="Включить перенаправление",
+                default=True,
+                subtext="Лайк на трек → ваш канал вместо Избранного",
+                icon="msg_forward"
+            ),
+            Input(
+                key="target_channel_id",
+                text="ID вашего канала",
+                default="",
+                subtext="Вставьте ID в формате -100XXXXXXXXX",
+                icon="msg_channel"
+            ),
+            Divider(
+                text="Чтобы узнать ID: откройте ваш канал → перешлите любое его сообщение боту @userinfobot → скопируйте строку «Forwarded from ID»"
+            ),
+            Header(text="Отладка"),
+            Switch(
+                key="debug_mode",
+                text="Режим диагностики",
+                default=False,
+                subtext="Включите → нажмите лайк на любой трек → прочитайте уведомление → выключите",
+                icon="msg_info"
+            ),
+            Text(
+                text="Диагностика покажет точный тип запроса и что сейчас играет — без изменения поведения",
+                icon="msg_warning"
+            ),
+        ]

@@ -1,0 +1,169 @@
+from typing import Any, List
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
+from ui.settings import Header, EditText, Divider
+from ui.bulletin import BulletinHelper
+from client_utils import get_user_config
+from java.util import ArrayList
+from java.lang import Long
+from org.telegram.messenger import MediaController
+
+# --- метаданные ---
+__id__ = "like_music"
+__name__ = "Я имя еще не придумала"
+__description__ = """
+​★ умный редирект играющей музыки ★
+—————————————————————————————————————————
+v1.0.0: перехват отправки в избранное, настройка id и уведомления
+​[ как работает ]
+  пересылаешь трек в избранное — он автоматически улетает в заданный чат
+  работает только с тем треком, который сейчас играет
+  показывает уведомление при успешном перенаправлении
+​[ настройки ]
+  target chat id — укажи id диалога, канала или группы (с минусом)
+"""
+__author__ = "@insonniiia"
+__version__ = "1.0.0"
+__icon__ = "hsrgustinex/54"
+__min_version__ = "11.12.0"
+
+
+class ForwardInterceptorHook(MethodHook):
+    def __init__(self, plugin: BasePlugin) -> None:
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        try:
+            # --- extract target chat id ---
+            target_id_str: str = self.plugin.get_setting("music_target_chat_id", "")
+            if not target_id_str:
+                return
+
+            target_chat_id: int = int(target_id_str)
+
+            # --- extract method arguments ---
+            args: list = param.args
+            if not args:
+                return
+
+            # --- initialize search variables ---
+            messages_list: Any = None
+            dialog_id_idx: int = -1
+            
+            # --- iterate arguments dynamically ---
+            for i in range(len(args)):
+                arg: Any = args[i]
+                if arg is None:
+                    continue
+                
+                class_name: str = str(arg.getClass().getSimpleName())
+                
+                # --- check builder pattern ---
+                if class_name == "SendMessageParams":
+                    self._process_builder(arg, target_chat_id)
+                    return
+                    
+                # --- check legacy list ---
+                if class_name == "ArrayList" and not arg.isEmpty():
+                    first_elem: Any = arg.get(0)
+                    if first_elem is not None and str(first_elem.getClass().getSimpleName()) == "MessageObject":
+                        messages_list = arg
+                        
+                # --- locate peer id ---
+                if isinstance(arg, int) and dialog_id_idx == -1:
+                    dialog_id_idx = i
+
+            if messages_list is not None and dialog_id_idx != -1:
+                self._process_legacy(param, messages_list, dialog_id_idx, target_chat_id)
+
+        except Exception as e:
+            self.plugin.log(f"forward interceptor hook error: {str(e)}")
+
+    def _process_builder(self, msg_params: Any, target_chat_id: int) -> None:
+        try:
+            # --- validate saved messages destination ---
+            user_id: int = get_user_config().getClientUserId()
+            if getattr(msg_params, 'dialog_id', 0) != user_id:
+                return
+                
+            # --- extract inner messages collection ---
+            messages_list: Any = None
+            for field in msg_params.getClass().getDeclaredFields():
+                field.setAccessible(True)
+                val: Any = field.get(msg_params)
+                if isinstance(val, ArrayList) and not val.isEmpty():
+                    first_elem: Any = val.get(0)
+                    if first_elem is not None and str(first_elem.getClass().getSimpleName()) == "MessageObject":
+                        messages_list = val
+                        break
+                        
+            if messages_list is not None:
+                # --- bypass original execution destination ---
+                setattr(msg_params, 'dialog_id', target_chat_id)
+                self._check_and_notify(messages_list)
+        except Exception as e:
+            self.plugin.log(f"process builder error: {str(e)}")
+
+    def _process_legacy(self, param: Any, messages_list: Any, dialog_id_idx: int, target_chat_id: int) -> None:
+        try:
+            # --- validate saved messages destination ---
+            user_id: int = get_user_config().getClientUserId()
+            if param.args[dialog_id_idx] != user_id:
+                return
+                
+            # --- bypass original execution destination ---
+            param.args[dialog_id_idx] = Long(target_chat_id)
+            self._check_and_notify(messages_list)
+        except Exception as e:
+            self.plugin.log(f"process legacy error: {str(e)}")
+
+    def _check_and_notify(self, messages_list: Any) -> None:
+        try:
+            # --- fetch active audio track ---
+            playing_msg: Any = MediaController.getInstance().getPlayingMessageObject()
+            if playing_msg is None:
+                return
+                
+            # --- search for track in queue ---
+            is_playing_track: bool = False
+            for i in range(messages_list.size()):
+                fwd_msg: Any = messages_list.get(i)
+                if fwd_msg.getId() == playing_msg.getId() and fwd_msg.getDialogId() == playing_msg.getDialogId():
+                    is_playing_track = True
+                    break
+                    
+            if is_playing_track:
+                # --- execute notify ---
+                BulletinHelper.show_success("Музыкальный трек перенаправлен")
+        except Exception as e:
+            self.plugin.log(f"check and notify error: {str(e)}")
+
+class AudioPlayerForwardPlugin(BasePlugin):
+    def on_plugin_load(self) -> None:
+        try:
+            # --- register core hooks ---
+            target_class: Any = find_class("org.telegram.messenger.SendMessagesHelper")
+            if target_class:
+                self.hook_all_methods(target_class, "sendMessage", ForwardInterceptorHook(self))
+            else:
+                BulletinHelper.show_error("Класс SendMessagesHelper не найден")
+        except Exception as e:
+            # --- handle hook initialization error ---
+            self.log(f"plugin load error: {str(e)}")
+            BulletinHelper.show_error("Ошибка инициализации перехватчика медиа")
+
+    def create_settings(self) -> List[Any]:
+        try:
+            # --- render plugin configuration ---
+            return [
+                Header(text="Настройки пересылки"),
+                EditText(
+                    key="music_target_chat_id",
+                    hint="ID целевого чата",
+                    default=""
+                ),
+                Divider(text="Укажите ID со знаком минуса для групп или каналов")
+            ]
+        except Exception as e:
+            self.log(f"create settings error: {str(e)}")
+            return []

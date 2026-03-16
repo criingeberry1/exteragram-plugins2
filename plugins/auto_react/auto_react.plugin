@@ -1,0 +1,762 @@
+import json
+import os
+import random
+import time
+import threading
+from typing import Any, Dict, List, Optional, Set
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, HookStrategy, MenuItemData, MenuItemType
+from client_utils import run_on_queue, get_last_fragment
+from file_utils import get_plugins_dir, read_file, write_file
+from hook_utils import get_private_field
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Text, Divider
+
+# --- метаданные ---
+__id__ = "auto_react"
+__name__ = "React"
+__description__ = "мне оч лень делать описание. короче, эта хуйня автоматически ставит ебучие реакции в ебучие канальчики"
+__author__ = "@insonniiia"
+__version__ = "1.0.0"
+__icon__ = "hsrgustinex/10"
+__min_version__ = "11.12.0"
+
+
+# --- config file stored alongside plugins ---
+_CFG_FILE: str = "autoreact_channels.json"
+# --- max cached message keys to prevent memory leak ---
+_CACHE_LIMIT: int = 10000
+# --- human-like random delay range in seconds ---
+_DELAY_MIN: float = 1.0
+_DELAY_MAX: float = 5.0
+
+class AutoReactPlugin(BasePlugin):
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._cfg: Dict[str, Any] = {"channels": {}}
+        self._lock: threading.Lock = threading.Lock()
+        self._processed: Set[str] = set()
+        self._pending_old: Dict[str, int] = {}
+
+    # --- deserialize channel config from json ---
+    def _cfg_path(self) -> str:
+        return os.path.join(get_plugins_dir(), _CFG_FILE)
+
+    # --- load config from disk ---
+    def _load(self) -> None:
+        try:
+            raw: Optional[str] = read_file(self._cfg_path())
+            if raw:
+                data: Dict = json.loads(raw)
+                self._cfg = data if "channels" in data else {"channels": {}}
+            else:
+                self._cfg = {"channels": {}}
+        except Exception as e:
+            self._dbg(f"config load error: {e}")
+            self._cfg = {"channels": {}}
+
+    # --- persist config to disk ---
+    def _save(self) -> None:
+        try:
+            write_file(
+                self._cfg_path(),
+                json.dumps(self._cfg, indent=2, ensure_ascii=False),
+            )
+        except Exception as e:
+            self._dbg(f"config save error: {e}")
+
+    # --- conditional debug logger ---
+    def _dbg(self, msg: str) -> None:
+        if self.get_setting("debug", False):
+            self.log(f"[AutoReact] {msg}")
+
+    # --- deduplicate processed messages, returns true if new ---
+    def _mark(self, ch_id: str, msg_id: int) -> bool:
+        key: str = f"{ch_id}_{msg_id}"
+        if key in self._processed:
+            return False
+        if len(self._processed) > _CACHE_LIMIT:
+            self._processed.clear()
+        self._processed.add(key)
+        return True
+
+    # --- parse "👍, 🔥, custom:123456" into typed list ---
+    def _parse_rxn(self, raw: str) -> List[Dict[str, str]]:
+        result: List[Dict[str, str]] = []
+        for part in (p.strip() for p in raw.split(",") if p.strip()):
+            if part.startswith("custom:"):
+                doc_id: str = part[7:].strip()
+                if doc_id.isdigit():
+                    result.append({"type": "custom", "value": doc_id})
+            elif part:
+                result.append({"type": "emoji", "value": part})
+        return result
+
+    # --- format typed reaction list back to display string ---
+    def _fmt_rxn(self, reactions: List[Dict[str, str]]) -> str:
+        return ", ".join(
+            f"custom:{r['value']}" if r["type"] == "custom" else r["value"]
+            for r in reactions
+        )
+
+    # --- plugin load: init config, hooks, menu item ---
+    def on_plugin_load(self) -> None:
+        self._load()
+
+        # --- hook message history loading for old-post batch processing ---
+        self.add_hook("TL_messages_getHistory")
+
+        # --- context menu item visible in channel chats ---
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                text="⚡ Auto-Reactions",
+                on_click=self._on_menu_click,
+                icon="msg_reactions",
+            )
+        )
+
+    # --- plugin unload: release runtime caches ---
+    def on_plugin_unload(self) -> None:
+        self._processed.clear()
+        self._pending_old.clear()
+
+    # --- intercept new channel messages and queue reactions ---
+    def on_update_hook(
+        self, update_name: str, account: int, update: Any
+    ) -> HookResult:
+        if not self.get_setting("enabled", True):
+            return HookResult()
+        if update_name != "TL_updateNewChannelMessage":
+            return HookResult()
+        try:
+            msg: Any = update.message
+            ch_id: str = str(msg.peer_id.channel_id)
+            msg_id: int = msg.id
+
+            channels: Dict = self._cfg.get("channels", {})
+            if ch_id not in channels:
+                return HookResult()
+
+            ch: Dict = channels[ch_id]
+            if not ch.get("react_new", True):
+                return HookResult()
+
+            rxns: List[Dict] = ch.get("reactions", [])
+            if not rxns:
+                return HookResult()
+
+            if not self._mark(ch_id, msg_id):
+                return HookResult()
+
+            self._dbg(f"new msg {ch_id}/{msg_id} — queuing {len(rxns)} reactions")
+
+            # --- dispatch to background queue with captured variables ---
+            run_on_queue(
+                lambda a=account, c=int(ch_id), m=msg_id, r=list(rxns): self._send_reactions(
+                    a, c, m, r
+                )
+            )
+        except Exception as e:
+            self._dbg(f"update hook error: {e}")
+
+        return HookResult()
+
+    # --- intercept loaded message history for pending old-post batch ---
+    def post_request_hook(
+        self, request_name: str, account: int, response: Any, error: Any
+    ) -> HookResult:
+        if request_name != "TL_messages_getHistory" or error:
+            return HookResult()
+        if not self._pending_old:
+            return HookResult()
+        try:
+            msgs: Any = response.messages
+            if not msgs:
+                return HookResult()
+            sz: int = msgs.size() if hasattr(msgs, "size") else len(msgs)
+            if sz == 0:
+                return HookResult()
+
+            first: Any = msgs.get(0) if hasattr(msgs, "get") else msgs[0]
+            ch_id: str = str(first.peer_id.channel_id)
+
+            if ch_id not in self._pending_old:
+                return HookResult()
+
+            count: int = self._pending_old.pop(ch_id)
+            ch: Dict = self._cfg.get("channels", {}).get(ch_id, {})
+            rxns: List[Dict] = ch.get("reactions", [])
+            if not rxns:
+                return HookResult()
+
+            actual: int = min(count, sz) if count > 0 else sz
+            self._dbg(f"old-post batch: {actual} msgs for channel {ch_id}")
+            BulletinHelper.show_info(f"Processing {actual} old posts...")
+
+            # --- process batch on background queue ---
+            def _batch() -> None:
+                done: int = 0
+                for i in range(actual):
+                    try:
+                        m: Any = msgs.get(i) if hasattr(msgs, "get") else msgs[i]
+                        if self._mark(ch_id, m.id):
+                            self._send_reactions(account, int(ch_id), m.id, rxns)
+                            done += 1
+                    except Exception as ex:
+                        self._dbg(f"old post #{i} error: {ex}")
+                final_done: int = done
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_success(
+                        f"Reacted to {final_done} old posts"
+                    )
+                )
+
+            run_on_queue(_batch)
+        except Exception as e:
+            self._dbg(f"post_request_hook error: {e}")
+
+        return HookResult()
+
+    # --- construct and send tl_messages_sendreaction via connectionsmanager ---
+    def _send_reactions(
+        self,
+        account: int,
+        channel_id: int,
+        msg_id: int,
+        reactions: List[Dict[str, str]],
+    ) -> None:
+        try:
+            # --- random human-like delay ---
+            delay: float = random.uniform(_DELAY_MIN, _DELAY_MAX)
+            self._dbg(f"sleeping {delay:.1f}s before {channel_id}/{msg_id}")
+            time.sleep(delay)
+
+            from org.telegram.tgnet import TLRPC, ConnectionsManager
+            from org.telegram.messenger import MessagesController
+            from java.util import ArrayList as JList
+
+            req: Any = TLRPC.TL_messages_sendReaction()
+
+            # --- resolve input peer from negative dialog id ---
+            dialog_id: int = -channel_id
+            req.peer = MessagesController.getInstance(account).getInputPeer(dialog_id)
+            req.msg_id = msg_id
+            req.big = False
+            req.add_to_recent = True
+            req.reaction = JList()
+
+            for r in reactions:
+                if r["type"] == "emoji":
+                    emoji_obj: Any = TLRPC.TL_reactionEmoji()
+                    emoji_obj.emoticon = r["value"]
+                    req.reaction.add(emoji_obj)
+                elif r["type"] == "custom":
+                    custom_obj: Any = TLRPC.TL_reactionCustomEmoji()
+                    custom_obj.document_id = int(r["value"])
+                    req.reaction.add(custom_obj)
+
+            # --- fire-and-forget: null callback is safe in connectionsmanager ---
+            ConnectionsManager.getInstance(account).sendRequest(req, None)
+            self._dbg(f"sent {len(reactions)} reactions to {channel_id}/{msg_id}")
+
+        except Exception as e:
+            err_msg: str = str(e)[:60]
+            self._dbg(f"send_reactions failed: {e}")
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_error(f"Reaction error: {err_msg}")
+            )
+
+    # --- handle click on channel action menu item ---
+    def _on_menu_click(self, ctx: Dict[str, Any]) -> None:
+        chat: Any = ctx.get("chat")
+        if not chat or not getattr(chat, "broadcast", False):
+            BulletinHelper.show_error("Available only in channels")
+            return
+        frag: Any = ctx.get("fragment")
+        if not frag:
+            return
+        act: Any = frag.getParentActivity()
+        if not act:
+            return
+
+        ch_id: str = str(chat.id)
+        ch_name: str = getattr(chat, "title", f"Channel {ch_id}")
+        configured: bool = ch_id in self._cfg.get("channels", {})
+
+        if configured:
+            items: List[str] = [
+                "✏️ Edit Reactions",
+                "📜 React to Old Posts",
+                "🗑 Remove Channel",
+                "Cancel",
+            ]
+        else:
+            items = ["➕ Add Auto-Reactions", "Cancel"]
+
+        # --- menu item selection handler ---
+        def _pick(bld: AlertDialogBuilder, idx: int) -> None:
+            bld.dismiss()
+            if not configured:
+                if idx == 0:
+                    self._rxn_dialog(act, ch_id, ch_name, "")
+            else:
+                if idx == 0:
+                    cur: str = self._fmt_rxn(
+                        self._cfg["channels"][ch_id].get("reactions", [])
+                    )
+                    self._rxn_dialog(act, ch_id, ch_name, cur)
+                elif idx == 1:
+                    self._old_posts_menu(act, ch_id, ch_name, ctx)
+                elif idx == 2:
+                    self._rm_channel(ch_id, ch_name)
+
+        bld: AlertDialogBuilder = AlertDialogBuilder(act)
+        bld.set_title(f"⚡ {ch_name}")
+        bld.set_items(items, _pick)
+        bld.show()
+
+    # --- dialog for entering or editing reactions ---
+    def _rxn_dialog(
+        self, act: Any, ch_id: str, ch_name: str, current: str
+    ) -> None:
+        from android.widget import EditText as AET
+        from android.widget import LinearLayout as ALL
+        from android.widget import TextView as ATV
+        from org.telegram.messenger import AndroidUtilities
+
+        layout: Any = ALL(act)
+        layout.setOrientation(ALL.VERTICAL)
+        pad: int = AndroidUtilities.dp(24)
+        pad_sm: int = AndroidUtilities.dp(8)
+        pad_lg: int = AndroidUtilities.dp(16)
+
+        # --- instruction label ---
+        info: Any = ATV(act)
+        info.setText(
+            "Enter reactions separated by commas.\n\n"
+            "Standard emoji:  👍, 🔥, ❤️\n"
+            "Premium emoji:  custom:DOCUMENT_ID\n\n"
+            "Example:  👍, 🔥, custom:5368324170671202286"
+        )
+        info.setPadding(pad, pad_lg, pad, pad_sm)
+        layout.addView(info)
+
+        # --- reaction input field ---
+        inp: Any = AET(act)
+        inp.setHint("👍, 🔥, custom:123456")
+        if current:
+            inp.setText(current)
+        inp.setPadding(pad, 0, pad, pad_lg)
+        layout.addView(inp)
+
+        bld: AlertDialogBuilder = AlertDialogBuilder(act)
+        bld.set_title("Configure Reactions")
+        bld.set_view(layout)
+
+        # --- save handler ---
+        def _save(b: AlertDialogBuilder, w: int) -> None:
+            raw: str = inp.getText().toString().strip()
+            if not raw:
+                BulletinHelper.show_error("No reactions entered")
+                b.dismiss()
+                return
+
+            rxns: List[Dict[str, str]] = self._parse_rxn(raw)
+            if not rxns:
+                BulletinHelper.show_error("Invalid reaction format")
+                b.dismiss()
+                return
+
+            with self._lock:
+                chs: Dict = self._cfg.setdefault("channels", {})
+                if ch_id in chs:
+                    chs[ch_id]["reactions"] = rxns
+                    chs[ch_id]["name"] = ch_name
+                else:
+                    chs[ch_id] = {
+                        "name": ch_name,
+                        "reactions": rxns,
+                        "react_new": True,
+                        "old_count": 0,
+                    }
+                self._save()
+
+            BulletinHelper.show_success(
+                f"Saved {len(rxns)} reactions for {ch_name}"
+            )
+            b.dismiss()
+            # --- force settings page rebuild ---
+            self.set_setting("_ts", str(time.time()), reload_settings=True)
+
+        bld.set_positive_button("Save", _save)
+        bld.set_negative_button("Cancel", lambda b, w: b.dismiss())
+        bld.show()
+
+    # --- old posts count selector from channel menu ---
+    def _old_posts_menu(
+        self,
+        act: Any,
+        ch_id: str,
+        ch_name: str,
+        ctx: Dict[str, Any],
+    ) -> None:
+        items: List[str] = [
+            "Last 10",
+            "Last 25",
+            "Last 50",
+            "Last 100",
+            "All loaded",
+            "Cancel",
+        ]
+        counts: List[int] = [10, 25, 50, 100, -1]
+
+        # --- count selection handler ---
+        def _pick(bld: AlertDialogBuilder, idx: int) -> None:
+            bld.dismiss()
+            if idx >= len(counts):
+                return
+            self._react_old_from_chat(ctx, ch_id, counts[idx])
+
+        bld: AlertDialogBuilder = AlertDialogBuilder(act)
+        bld.set_title(f"React to Old Posts — {ch_name}")
+        bld.set_items(items, _pick)
+        bld.show()
+
+    # --- react to old posts using chatactivity reflection or pending flag ---
+    def _react_old_from_chat(
+        self, ctx: Dict[str, Any], ch_id: str, count: int
+    ) -> None:
+        frag: Any = ctx.get("fragment")
+        account: int = ctx.get("account", 0)
+        ch: Dict = self._cfg.get("channels", {}).get(ch_id, {})
+        rxns: List[Dict] = ch.get("reactions", [])
+
+        if not rxns:
+            BulletinHelper.show_error("Configure reactions first")
+            return
+
+        # --- attempt to get loaded messages from chatactivity ---
+        msgs: Any = get_private_field(frag, "messages") if frag else None
+        if not msgs:
+            # --- fallback: register pending flag for post_request_hook ---
+            self._pending_old[ch_id] = count if count > 0 else 100
+            BulletinHelper.show_info(
+                "Scroll through the channel to trigger reaction processing"
+            )
+            return
+
+        sz: int = msgs.size() if hasattr(msgs, "size") else len(msgs)
+        actual: int = min(count, sz) if count > 0 else sz
+        BulletinHelper.show_info(f"Processing {actual} posts...")
+
+        # --- background batch processor ---
+        def _work() -> None:
+            done: int = 0
+            for i in range(actual):
+                try:
+                    m: Any = (
+                        msgs.get(i) if hasattr(msgs, "get") else msgs[i]
+                    )
+                    mid: int = m.getId()
+                    if self._mark(ch_id, mid):
+                        self._send_reactions(account, int(ch_id), mid, rxns)
+                        done += 1
+                except Exception as e:
+                    self._dbg(f"old post #{i}: {e}")
+            final_done: int = done
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_success(
+                    f"Reacted to {final_done} posts"
+                )
+            )
+
+        run_on_queue(_work)
+
+    # --- remove channel from config and notify user ---
+    def _rm_channel(self, ch_id: str, name: str) -> None:
+        with self._lock:
+            self._cfg.get("channels", {}).pop(ch_id, None)
+            self._save()
+        BulletinHelper.show_success(f"Removed {name}")
+
+    # --- manual channel add dialog from settings page ---
+    def _on_manual_add(self, view: Any) -> None:
+        frag: Any = get_last_fragment()
+        if not frag:
+            BulletinHelper.show_error("Cannot access UI context")
+            return
+        act: Any = frag.getParentActivity()
+        if not act:
+            BulletinHelper.show_error("Cannot access UI context")
+            return
+
+        from android.widget import EditText as AET
+        from android.widget import LinearLayout as ALL
+        from android.widget import TextView as ATV
+        from org.telegram.messenger import AndroidUtilities
+
+        layout: Any = ALL(act)
+        layout.setOrientation(ALL.VERTICAL)
+        pad: int = AndroidUtilities.dp(24)
+        pad_sm: int = AndroidUtilities.dp(4)
+        pad_md: int = AndroidUtilities.dp(12)
+        pad_lg: int = AndroidUtilities.dp(16)
+
+        # --- channel id label and input ---
+        id_label: Any = ATV(act)
+        id_label.setText("Numeric channel ID:")
+        id_label.setPadding(pad, pad_lg, pad, pad_sm)
+        layout.addView(id_label)
+
+        id_inp: Any = AET(act)
+        id_inp.setHint("e.g. 1234567890")
+        id_inp.setPadding(pad, 0, pad, pad_md)
+        layout.addView(id_inp)
+
+        # --- reactions label and input ---
+        rxn_label: Any = ATV(act)
+        rxn_label.setText("Reactions (comma-separated):")
+        rxn_label.setPadding(pad, 0, pad, pad_sm)
+        layout.addView(rxn_label)
+
+        rxn_inp: Any = AET(act)
+        rxn_inp.setHint("👍, 🔥, custom:DOC_ID")
+        rxn_inp.setPadding(pad, 0, pad, pad_lg)
+        layout.addView(rxn_inp)
+
+        bld: AlertDialogBuilder = AlertDialogBuilder(act)
+        bld.set_title("Add Channel Manually")
+        bld.set_view(layout)
+
+        # --- save handler ---
+        def _save(b: AlertDialogBuilder, w: int) -> None:
+            raw_id: str = id_inp.getText().toString().strip()
+            raw_rxn: str = rxn_inp.getText().toString().strip()
+
+            if not raw_id or not raw_id.isdigit():
+                BulletinHelper.show_error("Enter a valid numeric channel ID")
+                return
+            rxns: List[Dict[str, str]] = self._parse_rxn(raw_rxn)
+            if not rxns:
+                BulletinHelper.show_error("Enter at least one valid reaction")
+                return
+
+            # --- resolve channel name from local cache if possible ---
+            ch_name: str = f"Channel {raw_id}"
+            try:
+                from org.telegram.messenger import MessagesController, UserConfig
+
+                mc: Any = MessagesController.getInstance(
+                    UserConfig.selectedAccount
+                )
+                chat_obj: Any = mc.getChat(int(raw_id))
+                if chat_obj and hasattr(chat_obj, "title") and chat_obj.title:
+                    ch_name = chat_obj.title
+            except Exception:
+                pass
+
+            with self._lock:
+                self._cfg.setdefault("channels", {})[raw_id] = {
+                    "name": ch_name,
+                    "reactions": rxns,
+                    "react_new": True,
+                    "old_count": 0,
+                }
+                self._save()
+
+            BulletinHelper.show_success(
+                f"Added {ch_name} with {len(rxns)} reactions"
+            )
+            b.dismiss()
+            self.set_setting("_ts", str(time.time()), reload_settings=True)
+
+        bld.set_positive_button("Save", _save)
+        bld.set_negative_button("Cancel", lambda b, w: b.dismiss())
+        bld.show()
+
+    # --- build main settings page ---
+    def create_settings(self) -> list:
+        items: list = [
+            Header(text="General"),
+            Switch(
+                key="enabled",
+                text="Enable Auto-Reactions",
+                default=True,
+                icon="msg_reactions",
+                subtext="Master switch for all channels",
+            ),
+            Switch(
+                key="debug",
+                text="Debug Mode",
+                default=False,
+                icon="msg_log",
+                subtext="Verbose logging to logcat (adb logcat)",
+            ),
+            Divider(),
+            Header(text="Configured Channels"),
+        ]
+
+        chs: Dict = self._cfg.get("channels", {})
+        if not chs:
+            items.append(
+                Text(text="No channels added yet", icon="msg_info")
+            )
+        else:
+            for cid, cfg in chs.items():
+                name: str = cfg.get("name", f"Channel {cid}")
+                n_rxn: int = len(cfg.get("reactions", []))
+                new_flag: str = "🟢" if cfg.get("react_new", True) else "🔴"
+                items.append(
+                    Text(
+                        text=f"{name}  •  {n_rxn} rxn  •  {new_flag}",
+                        icon="msg_channel",
+                        create_sub_fragment=lambda c=cid: self._ch_page(c),
+                    )
+                )
+
+        items.extend(
+            [
+                Divider(),
+                Header(text="Add Channel"),
+                Text(
+                    text="Add channel by ID",
+                    icon="msg_add",
+                    accent=True,
+                    on_click=self._on_manual_add,
+                ),
+                Divider(
+                    text="Tip: use the ⚡ button in a channel's action menu for quick setup"
+                ),
+            ]
+        )
+        return items
+
+    # --- build per-channel settings sub-page ---
+    def _ch_page(self, ch_id: str) -> list:
+        cfg: Dict = self._cfg.get("channels", {}).get(ch_id, {})
+        name: str = cfg.get("name", f"Channel {ch_id}")
+        rxns: List[Dict] = cfg.get("reactions", [])
+        new_on: bool = cfg.get("react_new", True)
+        old_c: int = cfg.get("old_count", 0)
+
+        # --- human-readable old-count label ---
+        if old_c == 0:
+            old_lbl: str = "disabled"
+        elif old_c < 0:
+            old_lbl = "all loaded"
+        else:
+            old_lbl = str(old_c)
+
+        return [
+            Header(text=name),
+            Text(
+                text=f"Reactions: {self._fmt_rxn(rxns)}",
+                icon="msg_reactions",
+                on_click=lambda v, c=ch_id, n=name: self._edit_rxn_settings(
+                    c, n
+                ),
+            ),
+            Text(
+                text=f"React to New Posts: {'ON ✅' if new_on else 'OFF ❌'}",
+                icon="msg_notifications",
+                on_click=lambda v, c=ch_id: self._toggle_new(c),
+            ),
+            Divider(),
+            Text(
+                text=f"Old Posts Batch Size: {old_lbl}",
+                icon="msg_calendar",
+                on_click=lambda v, c=ch_id: self._pick_old_count(c),
+            ),
+            Text(
+                text="Run: React to Old Posts Now",
+                icon="msg_retry",
+                accent=True,
+                on_click=lambda v, c=ch_id: self._trigger_old_settings(c),
+            ),
+            Divider(),
+            Text(
+                text="Remove This Channel",
+                icon="msg_delete",
+                red=True,
+                on_click=lambda v, c=ch_id, n=name: self._rm_reload(c, n),
+            ),
+        ]
+
+    # --- toggle react_new flag for a channel ---
+    def _toggle_new(self, ch_id: str) -> None:
+        with self._lock:
+            ch: Dict = self._cfg.get("channels", {}).get(ch_id, {})
+            ch["react_new"] = not ch.get("react_new", True)
+            self._save()
+        val: bool = ch.get("react_new", True)
+        BulletinHelper.show_success(f"React to new: {'ON' if val else 'OFF'}")
+        self.set_setting("_ts", str(time.time()), reload_settings=True)
+
+    # --- show picker for old posts batch count ---
+    def _pick_old_count(self, ch_id: str) -> None:
+        frag: Any = get_last_fragment()
+        if not frag:
+            return
+        act: Any = frag.getParentActivity()
+        if not act:
+            return
+
+        labels: List[str] = [
+            "Disabled",
+            "10 posts",
+            "25 posts",
+            "50 posts",
+            "100 posts",
+            "All loaded",
+        ]
+        vals: List[int] = [0, 10, 25, 50, 100, -1]
+
+        # --- count picker handler ---
+        def _pick(bld: AlertDialogBuilder, idx: int) -> None:
+            bld.dismiss()
+            with self._lock:
+                ch_data: Dict = self._cfg.get("channels", {}).get(ch_id, {})
+                ch_data["old_count"] = vals[idx]
+                self._save()
+            BulletinHelper.show_success(f"Old posts: {labels[idx]}")
+            self.set_setting("_ts", str(time.time()), reload_settings=True)
+
+        bld: AlertDialogBuilder = AlertDialogBuilder(act)
+        bld.set_title("Old Posts Batch Size")
+        bld.set_items(labels, _pick)
+        bld.show()
+
+    # --- open reaction editor from settings sub-page ---
+    def _edit_rxn_settings(self, ch_id: str, ch_name: str) -> None:
+        frag: Any = get_last_fragment()
+        if not frag:
+            return
+        act: Any = frag.getParentActivity()
+        if not act:
+            return
+        cur: str = self._fmt_rxn(
+            self._cfg.get("channels", {}).get(ch_id, {}).get("reactions", [])
+        )
+        self._rxn_dialog(act, ch_id, ch_name, cur)
+
+    # --- trigger old post reactions from settings via pending flag ---
+    def _trigger_old_settings(self, ch_id: str) -> None:
+        ch: Dict = self._cfg.get("channels", {}).get(ch_id, {})
+        count: int = ch.get("old_count", 0)
+        if count == 0:
+            BulletinHelper.show_error("Set batch size first (currently disabled)")
+            return
+        actual: int = count if count > 0 else 100
+        self._pending_old[ch_id] = actual
+        BulletinHelper.show_info(
+            f"Open the channel — {actual} posts will be processed automatically"
+        )
+
+    # --- remove channel and force settings page refresh ---
+    def _rm_reload(self, ch_id: str, name: str) -> None:
+        self._rm_channel(ch_id, name)
+        self.set_setting("_ts", str(time.time()), reload_settings=True)

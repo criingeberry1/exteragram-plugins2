@@ -9,14 +9,13 @@ from file_utils import get_plugins_dir, ensure_dir_exists, read_file, write_file
 from hook_utils import find_class
 from ui.bulletin import BulletinHelper
 from ui.settings import Switch, Header
-from org.telegram.messenger import R as R_tg
 
 # --- метаданные ---
 __id__ = "auto_subscribes"
 __name__ = "AutoSub"
 __description__ = "мне лень писать"
 __author__ = "@insonniiia"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __icon__ = "hsrgustinex/39"
 __min_version__ = "11.12.0"
 
@@ -38,6 +37,7 @@ class AutoCheckBypassPlugin(BasePlugin):
         # --- register mtproto hooks and context menu ---
         self.add_hook("TL_channels_joinChannel")
         self.add_hook("TL_messages_importChatInvite")
+        self.add_hook("TL_messages_startBot")
 
         self.add_menu_item(
             MenuItemData(
@@ -61,16 +61,16 @@ class AutoCheckBypassPlugin(BasePlugin):
             Header(text="Bypass Settings"),
             Switch(
                 key="auto_archive",
-                text="Auto-archive joined channels",
+                text="Auto-archive joined channels/bots",
                 default=True,
-                subtext="Instantly moves newly joined channels to the Archive folder.",
+                subtext="Instantly moves newly joined channels or bots to the Archive folder.",
                 icon="msg_archive"
             ),
             Switch(
                 key="auto_leave",
-                text="Leave after 2 days",
+                text="Leave channels after 2 days",
                 default=True,
-                subtext="Automatically unsubscribes from these channels after 48 hours.",
+                subtext="Automatically leaves channels after 48 hours. Bots stay in archive.",
                 icon="msg_leave"
             )
         ]
@@ -81,18 +81,29 @@ class AutoCheckBypassPlugin(BasePlugin):
             return HookResult()
 
         try:
+            dialog_id = None
+            is_bot = False
+
             if request_name in ["TL_channels_joinChannel", "TL_messages_importChatInvite"]:
                 if hasattr(response, "chats") and response.chats.size() > 0:
                     chat = response.chats.get(0)
                     dialog_id = -chat.id
+            elif request_name == "TL_messages_startBot":
+                if hasattr(response, "users") and response.users.size() > 0:
+                    user = response.users.get(0)
+                    dialog_id = user.id
+                    is_bot = True
 
-                    if self.get_setting("auto_archive", True):
-                        self._archive_dialog(dialog_id, account)
+            if dialog_id:
+                if self.get_setting("auto_archive", True):
+                    # --- delay archiving so dialog is fully created in db ---
+                    run_on_ui_thread(lambda: self._archive_dialog(dialog_id, account), 2000)
 
-                    if self.get_setting("auto_leave", True):
-                        self._schedule_leave(dialog_id, account)
+                if self.get_setting("auto_leave", True) and not is_bot:
+                    self._schedule_leave(dialog_id, account)
 
-                    run_on_ui_thread(lambda: BulletinHelper.show_success("Channel archived and scheduled for leave!"))
+                action_msg = "Bot archived!" if is_bot else "Channel archived & queued for exit!"
+                run_on_ui_thread(lambda: BulletinHelper.show_success(action_msg))
         except Exception as e:
             log(f"AutoCheckBypass error in post_request_hook: {e}")
 
@@ -139,12 +150,31 @@ class AutoCheckBypassPlugin(BasePlugin):
             run_on_ui_thread(lambda: BulletinHelper.show_error("Failed to parse links."))
 
     def _archive_dialog(self, dialog_id: int, account: int):
-        # --- interact with messagescontroller to move dialog ---
+        # --- interact with messagescontroller to move dialog safely via arraylist ---
+        from java.util import ArrayList
+        from java.lang import Long
+
         try:
             MessagesController = find_class("org.telegram.messenger.MessagesController")
-            if MessagesController:
-                mc_instance = MessagesController.getInstance(account)
-                mc_instance.addDialogToFolder(dialog_id, ARCHIVE_FOLDER_ID)
+            if not MessagesController:
+                return
+
+            mc_instance = MessagesController.getInstance(account)
+            dialogs = ArrayList()
+            dialogs.add(Long(dialog_id))
+
+            method_invoked = False
+            for method in mc_instance.getClass().getMethods():
+                if method.getName() == "addDialogToFolder":
+                    params = method.getParameterTypes()
+                    # --- most modern sig: adddialogtofolder(arraylist, int, int, arraylist, int) ---
+                    if len(params) == 5:
+                        method.invoke(mc_instance, dialogs, ARCHIVE_FOLDER_ID, 0, None, 0)
+                        method_invoked = True
+                        break
+
+            if not method_invoked:
+                log("AutoCheckBypass: addDialogToFolder method not found!")
         except Exception as e:
             log(f"AutoCheckBypass failed to archive dialog {dialog_id}: {e}")
 
@@ -206,4 +236,3 @@ class AutoCheckBypassPlugin(BasePlugin):
             write_file(self.queue_file, json.dumps(queue))
         except Exception as e:
             log(f"AutoCheckBypass error saving queue: {e}")
-

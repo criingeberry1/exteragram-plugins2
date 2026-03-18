@@ -11,7 +11,7 @@ __id__ = "skcjslxilsjf"
 __name__ = "я хз тренд"
 __description__ = "я хз"
 __author__ = "@insonniiia"
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __icon__ = "mlpbystickerslala_by_fStikBot/0"
 __min_version__ = "11.12.0"
 
@@ -35,9 +35,9 @@ class TrendTextReplacerPlugin(BasePlugin):
                 val_clean = value.strip()
                 
                 if key_clean:
-                    # --- convert raw id to premium emoji markdown ---
+                    # --- wrap id in premium emoji markdown with a single emoji base ---
                     if val_clean.isdigit() and len(val_clean) > 10:
-                        val_clean = f"[{key_clean}]({val_clean})"
+                        val_clean = f"[😎]({val_clean})"
                     result_map[key_clean] = val_clean
 
         return result_map
@@ -52,10 +52,8 @@ class TrendTextReplacerPlugin(BasePlugin):
             if not replacements:
                 return HookResult()
 
-            # --- clean input for exact matching ---
             original_text = params.message.strip()
 
-            # --- exact match check ---
             if original_text in replacements:
                 new_text = replacements[original_text]
                 
@@ -63,11 +61,14 @@ class TrendTextReplacerPlugin(BasePlugin):
                 parsed_message = parse_markdown(new_text)
                 params.message = parsed_message.text
                 
-                # --- inject entities for rendering ---
-                entities_list = ArrayList()
+                # --- safely inject entities into java arraylist ---
+                if getattr(params, "entities", None) is None:
+                    params.entities = ArrayList()
+                else:
+                    params.entities.clear()
+                    
                 for raw_entity in parsed_message.entities:
-                    entities_list.add(raw_entity.to_tlrpc_object())
-                params.entities = entities_list
+                    params.entities.add(raw_entity.to_tlrpc_object())
                 
                 return HookResult(strategy=HookStrategy.MODIFY, params=params)
 

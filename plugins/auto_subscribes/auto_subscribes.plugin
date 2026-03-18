@@ -1,0 +1,209 @@
+import json
+import os
+import time
+from typing import Any, Dict, List
+
+from android_utils import log, run_on_ui_thread
+from base_plugin import BasePlugin, HookResult, MenuItemData, MenuItemType, AppEvent
+from file_utils import get_plugins_dir, ensure_dir_exists, read_file, write_file
+from hook_utils import find_class
+from ui.bulletin import BulletinHelper
+from ui.settings import Switch, Header
+from org.telegram.messenger import R as R_tg
+
+# --- метаданные ---
+__id__ = "auto_subscribes"
+__name__ = "AutoSub"
+__description__ = "мне лень писать"
+__author__ = "@insonniiia"
+__version__ = "1.0.0"
+__icon__ = "hsrgustinex/39"
+__min_version__ = "11.12.0"
+
+
+# --- constants for automated logic ---
+QUEUE_FILE_NAME = "leave_queue.json"
+ARCHIVE_FOLDER_ID = 1
+TWO_DAYS_IN_SECONDS = 48 * 60 * 60
+
+class AutoCheckBypassPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        # --- initialize local storage for scheduling ---
+        self.plugin_data_dir = os.path.join(get_plugins_dir(), "auto_bypass_data")
+        ensure_dir_exists(self.plugin_data_dir)
+        self.queue_file = os.path.join(self.plugin_data_dir, QUEUE_FILE_NAME)
+
+    def on_plugin_load(self):
+        # --- register mtproto hooks and context menu ---
+        self.add_hook("TL_channels_joinChannel")
+        self.add_hook("TL_messages_importChatInvite")
+
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="Auto-Process Subscriptions",
+                on_click=self._handle_message_click,
+                icon="msg_link",
+                priority=100
+            )
+        )
+        self._process_leave_queue()
+
+    def on_app_event(self, event_type: AppEvent):
+        # --- verify expiration queue on app start ---
+        if event_type == AppEvent.START:
+            self._process_leave_queue()
+
+    def create_settings(self) -> List[Any]:
+        # --- provide user preferences in plugin settings ---
+        return [
+            Header(text="Bypass Settings"),
+            Switch(
+                key="auto_archive",
+                text="Auto-archive joined channels",
+                default=True,
+                subtext="Instantly moves newly joined channels to the Archive folder.",
+                icon="msg_archive"
+            ),
+            Switch(
+                key="auto_leave",
+                text="Leave after 2 days",
+                default=True,
+                subtext="Automatically unsubscribes from these channels after 48 hours.",
+                icon="msg_leave"
+            )
+        ]
+
+    def post_request_hook(self, request_name: str, account: int, response: Any, error: Any) -> HookResult:
+        # --- intercept join events to execute archive and queue logic ---
+        if error:
+            return HookResult()
+
+        try:
+            if request_name in ["TL_channels_joinChannel", "TL_messages_importChatInvite"]:
+                if hasattr(response, "chats") and response.chats.size() > 0:
+                    chat = response.chats.get(0)
+                    dialog_id = -chat.id
+
+                    if self.get_setting("auto_archive", True):
+                        self._archive_dialog(dialog_id, account)
+
+                    if self.get_setting("auto_leave", True):
+                        self._schedule_leave(dialog_id, account)
+
+                    run_on_ui_thread(lambda: BulletinHelper.show_success("Channel archived and scheduled for leave!"))
+        except Exception as e:
+            log(f"AutoCheckBypass error in post_request_hook: {e}")
+
+        return HookResult()
+
+    def _handle_message_click(self, context: Dict[str, Any]):
+        # --- parse inline keyboard for subscription links ---
+        try:
+            message_obj = context.get("message")
+            if not message_obj:
+                return
+
+            reply_markup = getattr(message_obj.messageOwner, "reply_markup", None)
+            if not reply_markup or not hasattr(reply_markup, "rows"):
+                run_on_ui_thread(lambda: BulletinHelper.show_error("No inline buttons found."))
+                return
+
+            urls = []
+            for i in range(reply_markup.rows.size()):
+                row = reply_markup.rows.get(i)
+                for j in range(row.buttons.size()):
+                    btn = row.buttons.get(j)
+                    if hasattr(btn, "url") and btn.url:
+                        urls.append(btn.url)
+
+            if not urls:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("No subscription links found."))
+                return
+
+            Browser = find_class("org.telegram.messenger.browser.Browser")
+            android_context = context.get("context")
+
+            if not Browser or not android_context:
+                return
+
+            # --- sequentially open discovered urls ---
+            for url in urls:
+                Browser.openUrl(android_context, url)
+
+            run_on_ui_thread(lambda: BulletinHelper.show_info(f"Opening {len(urls)} subscription links..."))
+
+        except Exception as e:
+            log(f"AutoCheckBypass error parsing message: {e}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Failed to parse links."))
+
+    def _archive_dialog(self, dialog_id: int, account: int):
+        # --- interact with messagescontroller to move dialog ---
+        try:
+            MessagesController = find_class("org.telegram.messenger.MessagesController")
+            if MessagesController:
+                mc_instance = MessagesController.getInstance(account)
+                mc_instance.addDialogToFolder(dialog_id, ARCHIVE_FOLDER_ID)
+        except Exception as e:
+            log(f"AutoCheckBypass failed to archive dialog {dialog_id}: {e}")
+
+    def _schedule_leave(self, dialog_id: int, account: int):
+        # --- append channel payload to local tracking file ---
+        try:
+            queue = self._load_queue()
+            queue[str(dialog_id)] = {
+                "time": time.time() + TWO_DAYS_IN_SECONDS,
+                "account": account
+            }
+            self._save_queue(queue)
+        except Exception as e:
+            log(f"AutoCheckBypass failed to schedule leave: {e}")
+
+    def _process_leave_queue(self):
+        # --- evaluate file queue to drop expired subscriptions ---
+        try:
+            queue = self._load_queue()
+            if not queue:
+                return
+
+            now = time.time()
+            updated_queue = {}
+            MessagesController = find_class("org.telegram.messenger.MessagesController")
+
+            if not MessagesController:
+                return
+
+            for d_id_str, data in queue.items():
+                leave_time = data.get("time", 0)
+                account = data.get("account", 0)
+
+                if now >= leave_time:
+                    dialog_id = int(d_id_str)
+                    mc_instance = MessagesController.getInstance(account)
+                    mc_instance.deleteDialog(dialog_id, 0)
+                    log(f"AutoCheckBypass automatically left channel {dialog_id}")
+                else:
+                    updated_queue[d_id_str] = data
+
+            self._save_queue(updated_queue)
+        except Exception as e:
+            log(f"AutoCheckBypass error processing leave queue: {e}")
+
+    def _load_queue(self) -> Dict[str, Any]:
+        # --- safe read of json state tracking ---
+        try:
+            content = read_file(self.queue_file)
+            if content:
+                return json.loads(content)
+        except Exception as e:
+            log(f"AutoCheckBypass error loading queue: {e}")
+        return {}
+
+    def _save_queue(self, queue: Dict[str, Any]):
+        # --- safe write of json state tracking ---
+        try:
+            write_file(self.queue_file, json.dumps(queue))
+        except Exception as e:
+            log(f"AutoCheckBypass error saving queue: {e}")
+

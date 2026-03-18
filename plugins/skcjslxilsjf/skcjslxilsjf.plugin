@@ -1,0 +1,106 @@
+import traceback
+from typing import Any, Dict, List
+
+from android.view import View
+from base_plugin import BasePlugin, HookResult, HookStrategy
+from client_utils import get_last_fragment
+from org.telegram.messenger import R as R_tg
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, EditText, Text
+
+# --- метаданные ---
+__id__ = "skcjslxilsjf"
+__name__ = "я хз тренд"
+__description__ = "я хз"
+__author__ = "@insonniiia"
+__version__ = "1.0.0"
+__icon__ = "mlpbystickerslala_by_fStikBot/0"
+__min_version__ = "11.12.0"
+
+
+class TrendTextReplacerPlugin(BasePlugin):
+    # --- initialization ---
+    def on_plugin_load(self) -> None:
+        self.add_on_send_message_hook()
+
+    # --- parse dictionary from settings ---
+    def _get_replacements_map(self) -> Dict[str, str]:
+        raw_dict = self.get_setting("replacement_dict", "")
+        if not isinstance(raw_dict, str) or not raw_dict.strip():
+            return {}
+
+        result_map: Dict[str, str] = {}
+        for line in raw_dict.split("\n"):
+            if "=" in line:
+                key, value = line.split("=", 1)
+                key_clean = key.strip()
+                if key_clean:
+                    result_map[key_clean] = value.strip()
+
+        return result_map
+
+    # --- intercept outgoing messages ---
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        if not hasattr(params, "message") or not isinstance(params.message, str):
+            return HookResult()
+
+        try:
+            replacements = self._get_replacements_map()
+            if not replacements:
+                return HookResult()
+
+            original_text = params.message
+            modified_text = original_text
+            is_modified = False
+
+            # --- apply replacements ---
+            for target_phrase, new_phrase in replacements.items():
+                if target_phrase in modified_text:
+                    modified_text = modified_text.replace(target_phrase, new_phrase)
+                    is_modified = True
+
+            # --- handle modification result ---
+            if is_modified:
+                params.message = modified_text
+                current_fragment = get_last_fragment()
+                
+                # --- show native visual feedback ---
+                if current_fragment:
+                    BulletinHelper.show_simple(
+                        "фраза успешно подменена",
+                        R_tg.raw.info,
+                        current_fragment
+                    )
+                
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+
+            return HookResult()
+
+        except Exception as e:
+            # --- handle and display errors natively ---
+            self.log(f"text replacer error: {traceback.format_exc()}")
+            current_fragment = get_last_fragment()
+            if current_fragment:
+                BulletinHelper.show_error(
+                    "ошибка при замене текста",
+                    current_fragment
+                )
+            return HookResult()
+
+    # --- format settings ui ---
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="настройки словаря подмены"),
+            EditText(
+                key="replacement_dict",
+                hint="пример: что_написал=что_отправится",
+                default="",
+                multiline=True,
+                max_length=5000
+            ),
+            Text(
+                text="инструкция: пишите фразу, знак равно (=) и фразу для замены. каждая пара с новой строки.",
+                icon="msg_info",
+                accent=True
+            )
+        ]

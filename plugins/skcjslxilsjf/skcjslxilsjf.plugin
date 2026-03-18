@@ -1,19 +1,17 @@
 import traceback
 from typing import Any, Dict, List
 
-from android.view import View
 from base_plugin import BasePlugin, HookResult, HookStrategy
-from client_utils import get_last_fragment
-from org.telegram.messenger import R as R_tg
-from ui.bulletin import BulletinHelper
-from ui.settings import Header, EditText, Text
+from java.util import ArrayList
+from markdown_utils import parse_markdown
+from ui.settings import EditText, Header, Text
 
 # --- метаданные ---
 __id__ = "skcjslxilsjf"
 __name__ = "я хз тренд"
 __description__ = "я хз"
 __author__ = "@insonniiia"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __icon__ = "mlpbystickerslala_by_fStikBot/0"
 __min_version__ = "11.12.0"
 
@@ -34,8 +32,13 @@ class TrendTextReplacerPlugin(BasePlugin):
             if "=" in line:
                 key, value = line.split("=", 1)
                 key_clean = key.strip()
+                val_clean = value.strip()
+                
                 if key_clean:
-                    result_map[key_clean] = value.strip()
+                    # --- auto convert long numbers to custom emoji markdown ---
+                    if val_clean.isdigit() and len(val_clean) > 10:
+                        val_clean = f"[{key_clean}]({val_clean})"
+                    result_map[key_clean] = val_clean
 
         return result_map
 
@@ -61,30 +64,23 @@ class TrendTextReplacerPlugin(BasePlugin):
 
             # --- handle modification result ---
             if is_modified:
-                params.message = modified_text
-                current_fragment = get_last_fragment()
+                # --- parse markdown for custom emojis ---
+                parsed_message = parse_markdown(modified_text)
+                params.message = parsed_message.text
                 
-                # --- show native visual feedback ---
-                if current_fragment:
-                    BulletinHelper.show_simple(
-                        "фраза успешно подменена",
-                        R_tg.raw.info,
-                        current_fragment
-                    )
+                # --- inject tlrpc entities for emoji rendering ---
+                entities_list = ArrayList()
+                for raw_entity in parsed_message.entities:
+                    entities_list.add(raw_entity.to_tlrpc_object())
+                params.entities = entities_list
                 
                 return HookResult(strategy=HookStrategy.MODIFY, params=params)
 
             return HookResult()
 
         except Exception as e:
-            # --- handle and display errors natively ---
+            # --- silently log errors without breaking ui ---
             self.log(f"text replacer error: {traceback.format_exc()}")
-            current_fragment = get_last_fragment()
-            if current_fragment:
-                BulletinHelper.show_error(
-                    "ошибка при замене текста",
-                    current_fragment
-                )
             return HookResult()
 
     # --- format settings ui ---
@@ -99,7 +95,7 @@ class TrendTextReplacerPlugin(BasePlugin):
                 max_length=5000
             ),
             Text(
-                text="инструкция: пишите фразу, знак равно (=) и фразу для замены. каждая пара с новой строки.",
+                text="инструкция: пишите фразу, знак равно (=) и фразу для замены. каждая пара с новой строки. для премиум эмодзи просто вставьте его id вместо фразы для замены.",
                 icon="msg_info",
                 accent=True
             )

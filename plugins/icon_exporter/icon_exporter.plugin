@@ -34,7 +34,7 @@ __id__ = "icon_exporter"
 __name__ = "Export All Telegram Icons"
 __description__ = "эаэвэвэаэаэаэа"
 __author__ = "@insonniiia | CactusPlugins (автор DevSettingIcons) & @mur_live (автор All Telegram Icons)"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __icon__ = "hsrgustinex/63"
 __min_version__ = "11.12.0"
 
@@ -121,6 +121,17 @@ _EASTER_EGGS: List[str] = [
 # --- chance (0.0 - 1.0) that an easter egg bulletin fires on export ---
 _EGG_CHANCE: float = 0.15
 
+# --- cached application context reference ---
+_cached_ctx = None
+
+def _app_ctx():
+    # --- get and cache the global application context ---
+    global _cached_ctx
+    if _cached_ctx is None:
+        from org.telegram.messenger import ApplicationLoader
+        _cached_ctx = ApplicationLoader.applicationContext
+    return _cached_ctx
+
 def _maybe_show_egg():
     # --- roll the dice for an easter egg bulletin ---
     if random.random() < _EGG_CHANCE:
@@ -162,87 +173,199 @@ OnClickListener = gen(View.OnClickListener, "onClick")
 OnDismissListener = gen(DialogInterface.OnDismissListener, "onDismiss")
 
 # ===========================================================================
-#  svg conversion: vectordrawable compiled xml -> svg markup
+#  robust attribute readers for compiled binary xml
+#  (фикс: дефолтные иконки хранят атрибуты как typed values,
+#   а не строки — getAttributeValue() возвращает null для них)
 # ===========================================================================
 
-def _xml_attr(parser, name: str) -> Optional[str]:
-    # --- read attribute value, stripping android dimension suffixes ---
-    val = parser.getAttributeValue(_ANDROID_NS, name)
-    if val is None:
-        return None
-    return str(val).replace("dp", "").replace("sp", "").replace("px", "")
+def _read_string_attr(parser, name: str) -> Optional[str]:
+    # --- read attribute as string, trying multiple strategies for binary xml ---
 
-def _xml_color_attr(parser, name: str) -> Optional[str]:
-    # --- read color attribute as hex string ---
+    # --- strategy 1: direct string value (works for hardcoded "#RRGGBB", pathData, etc.) ---
+    val = parser.getAttributeValue(_ANDROID_NS, name)
+    if val is not None:
+        s: str = str(val)
+        # --- strip dimension suffixes that android adds ---
+        for suffix in ("dp", "dip", "sp", "px", "pt", "in", "mm"):
+            if s.endswith(suffix):
+                s = s[:-len(suffix)]
+                break
+        return s
+
+    # --- strategy 2: try reading as float (viewportWidth, viewportHeight, alpha, etc.) ---
+    try:
+        fval: float = parser.getAttributeFloatValue(_ANDROID_NS, name, float("nan"))
+        if fval == fval:
+            # --- nan != nan, so this checks for a valid float ---
+            if fval == int(fval):
+                return str(int(fval))
+            return str(fval)
+    except Exception:
+        pass
+
+    # --- strategy 3: try reading as int (color ints, dimension ints, etc.) ---
+    try:
+        sentinel: int = -99999999
+        ival: int = parser.getAttributeIntValue(_ANDROID_NS, name, sentinel)
+        if ival != sentinel:
+            return str(ival)
+    except Exception:
+        pass
+
+    return None
+
+def _read_color_attr(parser, name: str) -> Optional[str]:
+    # --- read color attribute, resolving hex strings, color ints, and resource references ---
+
+    # --- strategy 1: direct hex string like "#FF000000" or "#000" ---
     sv = parser.getAttributeValue(_ANDROID_NS, name)
-    if sv is not None and str(sv).startswith("#"):
-        return str(sv)
+    if sv is not None:
+        s: str = str(sv).strip()
+        if s.startswith("#"):
+            return s
+        # --- binary xml sometimes returns the int value as a string ---
+        if s.lstrip("-").isdigit():
+            try:
+                return _color_int_to_hex(int(s))
+            except Exception:
+                pass
+
+    # --- strategy 2: read as raw int (most common for compiled binary xml) ---
     try:
         sentinel: int = 0x01FFFFFF
         iv: int = parser.getAttributeIntValue(_ANDROID_NS, name, sentinel)
         if iv != sentinel:
-            r: int = (iv >> 16) & 0xFF
-            g: int = (iv >> 8) & 0xFF
-            b: int = iv & 0xFF
-            return f"#{r:02x}{g:02x}{b:02x}"
+            return _color_int_to_hex(iv)
+    except Exception:
+        pass
+
+    # --- strategy 3: resource reference — resolve through context ---
+    try:
+        res_sentinel: int = 0
+        res_id: int = parser.getAttributeResourceValue(_ANDROID_NS, name, res_sentinel)
+        if res_id != res_sentinel and res_id != 0:
+            ctx = _app_ctx()
+            if ctx is not None:
+                try:
+                    resolved_color: int = ContextCompat.getColor(ctx, res_id)
+                    return _color_int_to_hex(resolved_color)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    return None
+
+def _color_int_to_hex(c: int) -> str:
+    # --- convert android argb color int to svg hex string ---
+    a: int = (c >> 24) & 0xFF
+    r: int = (c >> 16) & 0xFF
+    g: int = (c >> 8) & 0xFF
+    b: int = c & 0xFF
+
+    # --- fully transparent = none ---
+    if a == 0 and r == 0 and g == 0 and b == 0:
+        return "none"
+
+    hex_color: str = f"#{r:02x}{g:02x}{b:02x}"
+
+    # --- if alpha is not fully opaque, we'll note it but still return the rgb ---
+    # --- (svg opacity is handled separately via fill-opacity/stroke-opacity) ---
+    return hex_color
+
+def _read_alpha_from_color(parser, name: str) -> Optional[str]:
+    # --- extract alpha component from a color int attribute (for svg opacity) ---
+    try:
+        sentinel: int = 0x01FFFFFF
+        iv: int = parser.getAttributeIntValue(_ANDROID_NS, name, sentinel)
+        if iv != sentinel:
+            a: int = (iv >> 24) & 0xFF
+            if a < 255 and a > 0:
+                return f"{a / 255.0:.3f}"
     except Exception:
         pass
     return None
 
+# ===========================================================================
+#  svg conversion: vectordrawable compiled xml -> svg markup
+# ===========================================================================
+
 def _build_path_attrs(parser) -> str:
-    # --- collect all svg-relevant attributes from a vector path element ---
-    pd: str = _xml_attr(parser, "pathData") or ""
-    fc: Optional[str] = _xml_color_attr(parser, "fillColor")
-    sc: Optional[str] = _xml_color_attr(parser, "strokeColor")
-    sw: Optional[str] = _xml_attr(parser, "strokeWidth")
-    fa: Optional[str] = _xml_attr(parser, "fillAlpha")
-    sa: Optional[str] = _xml_attr(parser, "strokeAlpha")
-    ft: Optional[str] = _xml_attr(parser, "fillType")
-    lc: Optional[str] = _xml_attr(parser, "strokeLineCap")
-    lj: Optional[str] = _xml_attr(parser, "strokeLineJoin")
+    # --- collect all svg-relevant attributes from a vector <path> element ---
+    pd: str = _read_string_attr(parser, "pathData") or ""
+    fc: Optional[str] = _read_color_attr(parser, "fillColor")
+    sc: Optional[str] = _read_color_attr(parser, "strokeColor")
+    sw: Optional[str] = _read_string_attr(parser, "strokeWidth")
+    fa: Optional[str] = _read_string_attr(parser, "fillAlpha")
+    sa: Optional[str] = _read_string_attr(parser, "strokeAlpha")
+    ft: Optional[str] = _read_string_attr(parser, "fillType")
+    lc: Optional[str] = _read_string_attr(parser, "strokeLineCap")
+    lj: Optional[str] = _read_string_attr(parser, "strokeLineJoin")
+
+    # --- also check if color int itself carries alpha ---
+    fc_alpha: Optional[str] = _read_alpha_from_color(parser, "fillColor")
+    sc_alpha: Optional[str] = _read_alpha_from_color(parser, "strokeColor")
 
     parts: List[str] = [f'd="{pd}"']
 
+    # --- determine fill ---
     if fc:
         parts.append(f'fill="{fc}"')
     elif sc:
+        # --- stroke-only path, no fill ---
         parts.append('fill="none"')
     else:
+        # --- default android fill is black ---
         parts.append('fill="#000000"')
 
-    if fa and fa != "1":
-        parts.append(f'fill-opacity="{fa}"')
+    # --- fill opacity: explicit fillAlpha takes priority, then alpha from color int ---
+    effective_fa: Optional[str] = fa if fa and fa != "1" and fa != "1.0" else fc_alpha
+    if effective_fa:
+        parts.append(f'fill-opacity="{effective_fa}"')
+
+    # --- stroke ---
     if sc:
         parts.append(f'stroke="{sc}"')
     if sw:
         parts.append(f'stroke-width="{sw}"')
-    if sa and sa != "1":
-        parts.append(f'stroke-opacity="{sa}"')
+
+    # --- stroke opacity ---
+    effective_sa: Optional[str] = sa if sa and sa != "1" and sa != "1.0" else sc_alpha
+    if effective_sa:
+        parts.append(f'stroke-opacity="{effective_sa}"')
+
+    # --- fill rule ---
     if ft and "evenodd" in str(ft).lower():
-        parts.append('fill-rule="evenodd"')
+        parts.append('fill-rule="evenodd" clip-rule="evenodd"')
+
+    # --- stroke line cap and join ---
     if lc:
-        parts.append(f'stroke-linecap="{str(lc).lower()}"')
+        val = str(lc).lower()
+        if val in ("round", "square", "butt"):
+            parts.append(f'stroke-linecap="{val}"')
     if lj:
-        parts.append(f'stroke-linejoin="{str(lj).lower()}"')
+        val = str(lj).lower()
+        if val in ("round", "bevel", "miter"):
+            parts.append(f'stroke-linejoin="{val}"')
 
     return " ".join(parts)
 
 def _build_group_transform(parser) -> str:
-    # --- construct svg transform from android group properties ---
+    # --- construct svg transform from android <group> properties ---
     transforms: List[str] = []
-    tx: Optional[str] = _xml_attr(parser, "translateX")
-    ty: Optional[str] = _xml_attr(parser, "translateY")
-    rot: Optional[str] = _xml_attr(parser, "rotation")
-    px: Optional[str] = _xml_attr(parser, "pivotX")
-    py: Optional[str] = _xml_attr(parser, "pivotY")
-    sx: Optional[str] = _xml_attr(parser, "scaleX")
-    sy: Optional[str] = _xml_attr(parser, "scaleY")
+    tx: Optional[str] = _read_string_attr(parser, "translateX")
+    ty: Optional[str] = _read_string_attr(parser, "translateY")
+    rot: Optional[str] = _read_string_attr(parser, "rotation")
+    px: Optional[str] = _read_string_attr(parser, "pivotX")
+    py: Optional[str] = _read_string_attr(parser, "pivotY")
+    sx: Optional[str] = _read_string_attr(parser, "scaleX")
+    sy: Optional[str] = _read_string_attr(parser, "scaleY")
 
     if tx or ty:
         transforms.append(f"translate({tx or 0},{ty or 0})")
-    if rot:
+    if rot and rot != "0" and rot != "0.0":
         transforms.append(f"rotate({rot},{px or 0},{py or 0})")
-    if sx or sy:
+    if (sx and sx != "1" and sx != "1.0") or (sy and sy != "1" and sy != "1.0"):
         transforms.append(f"scale({sx or 1},{sy or 1})")
 
     if not transforms:
@@ -251,60 +374,116 @@ def _build_group_transform(parser) -> str:
 
 def _vector_xml_to_svg(context, res_id: int) -> Optional[str]:
     # --- parse compiled android vectordrawable xml and emit svg markup ---
+    # --- handles binary xml typed values, resource color refs, theme attrs ---
     from org.xmlpull.v1 import XmlPullParser
 
-    xp = context.getResources().getXml(res_id)
+    xp = None
+    try:
+        xp = context.getResources().getXml(res_id)
+    except Exception as e:
+        logcat(f"getXml() failed for res_id {res_id}: {e}")
+        return None
+
     lines: List[str] = ['<?xml version="1.0" encoding="utf-8"?>']
     depth: int = 0
     is_vector: bool = False
+    has_paths: bool = False
+    clip_counter: int = 0
 
-    ev: int = xp.getEventType()
-    while ev != XmlPullParser.END_DOCUMENT:
-        if ev == XmlPullParser.START_TAG:
-            tag: str = str(xp.getName())
+    try:
+        ev: int = xp.getEventType()
+        while ev != XmlPullParser.END_DOCUMENT:
+            if ev == XmlPullParser.START_TAG:
+                tag: str = str(xp.getName())
 
-            if tag == "vector":
-                vw: str = _xml_attr(xp, "viewportWidth") or "24"
-                vh: str = _xml_attr(xp, "viewportHeight") or "24"
-                lines.append(
-                    f'<svg xmlns="http://www.w3.org/2000/svg" '
-                    f'viewBox="0 0 {vw} {vh}">'
-                )
-                depth = 1
-                is_vector = True
+                if tag == "vector":
+                    vw: str = _read_string_attr(xp, "viewportWidth") or "24"
+                    vh: str = _read_string_attr(xp, "viewportHeight") or "24"
 
-            elif tag == "path" and is_vector:
-                pad: str = "  " * depth
-                attr_str: str = _build_path_attrs(xp)
-                lines.append(f"{pad}<path {attr_str}/>")
+                    # --- also read width/height for the svg root ---
+                    w: Optional[str] = _read_string_attr(xp, "width")
+                    h: Optional[str] = _read_string_attr(xp, "height")
 
-            elif tag == "group" and is_vector:
-                pad = "  " * depth
-                transform: str = _build_group_transform(xp)
-                lines.append(f"{pad}<g{transform}>")
-                depth += 1
+                    size_attrs: str = ""
+                    if w and h:
+                        size_attrs = f' width="{w}" height="{h}"'
 
-            elif tag == "clip-path" and is_vector:
-                cpd: str = _xml_attr(xp, "pathData") or ""
-                pad = "  " * depth
-                clip_id: str = f"clip_{depth}"
-                lines.append(
-                    f'{pad}<defs><clipPath id="{clip_id}">'
-                    f'<path d="{cpd}"/></clipPath></defs>'
-                )
+                    lines.append(
+                        f'<svg xmlns="http://www.w3.org/2000/svg"'
+                        f'{size_attrs}'
+                        f' viewBox="0 0 {vw} {vh}">'
+                    )
+                    depth = 1
+                    is_vector = True
 
-        elif ev == XmlPullParser.END_TAG:
-            tag = str(xp.getName())
-            if tag == "vector" and is_vector:
-                lines.append("</svg>")
-            elif tag == "group" and is_vector:
-                depth = max(1, depth - 1)
-                lines.append(f'{"  " * depth}</g>')
+                elif tag == "path" and is_vector:
+                    try:
+                        pad: str = "  " * depth
+                        attr_str: str = _build_path_attrs(xp)
+                        lines.append(f"{pad}<path {attr_str}/>")
+                        has_paths = True
+                    except Exception as path_err:
+                        logcat(f"Error building path attrs: {path_err}")
 
-        ev = xp.next()
+                elif tag == "group" and is_vector:
+                    try:
+                        pad = "  " * depth
+                        transform: str = _build_group_transform(xp)
 
-    xp.close()
-    return "\n".join(lines) if is_vector else None
+                        # --- also check group alpha ---
+                        ga: Optional[str] = _read_string_attr(xp, "alpha")
+                        opacity_attr: str = ""
+                        if ga and ga != "1" and ga != "1.0":
+                            opacity_attr = f' opacity="{ga}"'
+
+                        lines.append(f"{pad}<g{transform}{opacity_attr}>")
+                        depth += 1
+                    except Exception as group_err:
+                        logcat(f"Error building group: {group_err}")
+                        lines.append(f'{"  " * depth}<g>')
+                        depth += 1
+
+                elif tag == "clip-path" and is_vector:
+                    try:
+                        cpd: str = _read_string_attr(xp, "pathData") or ""
+                        if cpd:
+                            pad = "  " * depth
+                            clip_counter += 1
+                            clip_id: str = f"clip_{clip_counter}"
+                            lines.append(
+                                f'{pad}<defs><clipPath id="{clip_id}">'
+                                f'<path d="{cpd}"/></clipPath></defs>'
+                            )
+                    except Exception as clip_err:
+                        logcat(f"Error building clip-path: {clip_err}")
+
+                # --- animated-vector wraps a <vector> inside <aapt:attr>, skip non-vector roots ---
+                elif tag == "animated-vector":
+                    # --- we can't export animated vectors as static svg ---
+                    xp.close()
+                    return None
+
+            elif ev == XmlPullParser.END_TAG:
+                tag = str(xp.getName())
+                if tag == "vector" and is_vector:
+                    lines.append("</svg>")
+                elif tag == "group" and is_vector and depth > 1:
+                    depth -= 1
+                    lines.append(f'{"  " * depth}</g>')
+
+            ev = xp.next()
+    except Exception as parse_err:
+        logcat(f"XML parse loop error: {parse_err}\n{traceback.format_exc()}")
+    finally:
+        try:
+            xp.close()
+        except Exception:
+            pass
+
+    # --- only return svg if we found a <vector> root and at least one <path> ---
+    if is_vector and has_paths:
+        return "\n".join(lines)
+    return None
 
 # ===========================================================================
 #  png rasterization
@@ -507,7 +686,7 @@ def _do_export_single_icon(
             try:
                 svg_content = _vector_xml_to_svg(activity, res_id)
             except Exception:
-                logcat(f"SVG parse error for {name}: {traceback.format_exc()}")
+                logcat(f"SVG conversion exception for {name}: {traceback.format_exc()}")
 
             if svg_content:
                 path: str = os.path.join(out, f"{name}.svg")
@@ -520,7 +699,7 @@ def _do_export_single_icon(
                 _maybe_show_egg()
                 return
 
-            # --- svg unavailable, fallback to png ---
+            # --- svg unavailable (bitmap drawable or animated-vector), fallback to png ---
             path = os.path.join(out, f"{name}_{png_size}px.png")
             drawable = _get_drawable(activity, res_id)
             if _render_drawable_to_png(drawable, png_size, path):
@@ -818,7 +997,6 @@ class IconsSheet:
 
     # спизжено: fill_items() с setTitle из референса
     def fill_items(self, items, adapter):
-        # --- provide items to universalrecyclerview adapter ---
         try:
             title: str = S["icons"]
             if self.filter:
@@ -842,7 +1020,6 @@ class IconsSheet:
 
     # спизжено: on_click dispatch из референса
     def on_click(self, item, *_):
-        # --- handle list item click ---
         if self.view_type == 1 and item.text:
             name: str = str(item.text)
             rid: int = self.plugin.icons.get(name, 0)
@@ -851,7 +1028,6 @@ class IconsSheet:
 
     # спизжено: show() с BottomSheet.Builder + UniversalRecyclerView из референса
     def show(self):
-        # --- create and present the bottom sheet ---
         self.builder = BottomSheet.Builder(self.activity)
         self.builder.setApplyTopPadding(False)
         self.builder.setApplyBottomPadding(False)
@@ -997,7 +1173,6 @@ class AnimationsSheet:
 
     # спизжено: open_animation() + stopAnimation/playAnimation для всех из референса
     def _open_anim(self, name: str, rid: int):
-        # --- stop all sheet animations, open detail, resume on dismiss ---
         for v in self._anim_views:
             try:
                 v.stopAnimation()
@@ -1014,7 +1189,6 @@ class AnimationsSheet:
         _show_animation_detail(self.activity, name, rid, on_dismiss_cb=_resume)
 
     def fill_items(self, items, adapter):
-        # --- provide items to universalrecyclerview adapter ---
         try:
             title: str = S["animations"]
             if self.filter:
@@ -1034,7 +1208,6 @@ class AnimationsSheet:
             items.add(UItem.asShadow(traceback.format_exc()))
 
     def on_click(self, item, *_):
-        # --- handle list item click ---
         if self.view_type == 1 and item.object2:
             name: str = str(item.object2)
             rid: int = self.plugin.animations.get(name, 0)
@@ -1043,7 +1216,6 @@ class AnimationsSheet:
 
     # спизжено: show() — тот же BottomSheet.Builder паттерн из референса
     def show(self):
-        # --- create and present the bottom sheet ---
         self.builder = BottomSheet.Builder(self.activity)
         self.builder.setApplyTopPadding(False)
         self.builder.setApplyBottomPadding(False)
@@ -1076,7 +1248,6 @@ class IconExporterPlugin(BasePlugin):
 
     # спизжено: safe_getattr из референса
     def _safe_getattr(self, obj, attr, default=None):
-        # --- safely read attribute from java r-class without crashing ---
         try:
             return getattr(obj, attr)
         except Exception:
@@ -1111,14 +1282,12 @@ class IconExporterPlugin(BasePlugin):
         )
 
     def on_plugin_unload(self) -> None:
-        # --- release cached references ---
         self.icons.clear()
         self.animations.clear()
 
     # --- batch export workers (не спизжено, полностью моё) ---
 
     def _batch_export_drawables(self):
-        # --- export all matching drawable icons in selected format ---
         frag = get_last_fragment()
         if not frag:
             return
@@ -1155,6 +1324,7 @@ class IconExporterPlugin(BasePlugin):
             out: str = _get_export_dir()
             ok: int = 0
             fail: int = 0
+            svg_fallbacks: int = 0
 
             for name, rid in matched:
                 try:
@@ -1176,6 +1346,7 @@ class IconExporterPlugin(BasePlugin):
                             dr = _get_drawable(activity, rid)
                             if _render_drawable_to_png(dr, psz, path):
                                 ok += 1
+                                svg_fallbacks += 1
                             else:
                                 fail += 1
                     elif fmt == _FMT_PNG:
@@ -1189,19 +1360,19 @@ class IconExporterPlugin(BasePlugin):
                     logcat(f"Batch error [{name}]: {traceback.format_exc()}")
                     fail += 1
 
-            _ok, _fail, _total = ok, fail, total
-            err_suffix: str = f" (ошибок: {_fail})" if _fail > 0 else ""
-            run_on_ui_thread(
-                lambda: BulletinHelper.show_success(
-                    S["batch_done"].format(ok=_ok, total=_total) + err_suffix
-                )
-            )
+            _ok, _fail, _total, _fb = ok, fail, total, svg_fallbacks
+            parts: List[str] = [S["batch_done"].format(ok=_ok, total=_total)]
+            if _fb > 0:
+                parts.append(f"PNG-фоллбэков: {_fb}")
+            if _fail > 0:
+                parts.append(f"ошибок: {_fail}")
+            msg: str = " · ".join(parts) if len(parts) > 1 else parts[0]
+            run_on_ui_thread(lambda: BulletinHelper.show_success(msg))
             _maybe_show_egg()
 
         run_on_queue(_worker)
 
     def _batch_export_animations(self):
-        # --- export all matching raw lottie animations ---
         frag = get_last_fragment()
         if not frag:
             return
@@ -1252,7 +1423,6 @@ class IconExporterPlugin(BasePlugin):
 
     # спизжено: export_to_file() из референса, слегка переписана
     def _export_names_list(self):
-        # --- save complete icon and animation name list to a text file ---
         try:
             base: str = os.path.join(
                 os.environ.get("EXTERNAL_STORAGE", "/sdcard"), "Download"
@@ -1279,7 +1449,6 @@ class IconExporterPlugin(BasePlugin):
 
     # спизжено: структура create_settings() из референса, расширена экспорт-секцией
     def create_settings(self) -> list:
-        # --- build the plugin settings screen ---
         return [
             Header(text=S["icons"]),
             Input(

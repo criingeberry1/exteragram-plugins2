@@ -1,0 +1,1385 @@
+import traceback
+import os
+import random
+from typing import Optional, List, Dict, Tuple, Any
+
+from android.content import DialogInterface
+from android.graphics import Bitmap, Canvas
+from android.text import SpannableStringBuilder
+from android.util import TypedValue
+from android.view import Gravity, View
+from android.widget import (
+    FrameLayout, ImageView, LinearLayout, ScrollView, TextView
+)
+from android_utils import log, run_on_ui_thread
+from android_utils import log as logcat
+from androidx.appcompat.widget import AppCompatImageView
+from androidx.core.content import ContextCompat
+from base_plugin import BasePlugin
+from client_utils import get_last_fragment, run_on_queue
+from java import dynamic_proxy
+from java.io import FileOutputStream
+from org.telegram.messenger import AndroidUtilities, R, Utilities
+from org.telegram.ui.ActionBar import AlertDialog, BottomSheet, Theme
+from org.telegram.ui.Components import (
+    ColoredImageSpan, LayoutHelper, RLottieImageView, UItem,
+    UniversalRecyclerView
+)
+from org.telegram.ui.Stories.recorder import ButtonWithCounterView
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Selector, Text
+
+# --- метаданные ---
+__id__ = "icon_exporter"
+__name__ = "Export All Telegram Icons"
+__description__ = "эаэвэвэаэаэаэа"
+__author__ = "@insonniiia | CactusPlugins (автор DevSettingIcons) & @mur_live (автор All Telegram Icons)"
+__version__ = "1.0.0"
+__icon__ = "hsrgustinex/63"
+__min_version__ = "11.12.0"
+
+
+# спизжено: импорт exteragram-специфичных классов из референса
+try:
+    from com.exteragram.messenger.icons import ExteraResources
+    from com.exteragram.messenger.preferences.components import AltSeekbar
+    _HAS_EXTERA_UI: bool = True
+except ImportError:
+    _HAS_EXTERA_UI = False
+
+# спизжено: dp shortcut из референса
+dp = AndroidUtilities.dp
+
+# --- android xml namespace for vectordrawable parsing ---
+_ANDROID_NS: str = "http://schemas.android.com/apk/res/android"
+
+# --- export format indices ---
+_FMT_SVG: int = 0
+_FMT_PNG: int = 1
+
+# --- available png render sizes in pixels ---
+_PNG_SIZES: List[int] = [48, 96, 192, 384, 512, 1024]
+_PNG_LABELS: List[str] = ["48", "96", "192", "384", "512", "1024"]
+
+# --- export output subdirectory name ---
+_EXPORT_DIR_NAME: str = "ExportedIcons"
+
+# --- icon type filter indices ---
+_TYPE_ALL: int = 0
+_TYPE_SOLAR: int = 1
+_TYPE_REMIX: int = 2
+_TYPE_DEFAULT: int = 3
+
+# спизжено: словарь имён типов из референса
+_TYPE_NAMES: Dict[int, str] = {
+    _TYPE_SOLAR: "Solar",
+    _TYPE_REMIX: "Remix",
+    _TYPE_DEFAULT: "Default",
+}
+
+# --- localized ui strings ---
+S: Dict[str, str] = {
+    "icons": "Иконки (R.drawable)",
+    "animations": "Анимации (R.raw)",
+    "search": "Поиск",
+    "type": "Тип иконок",
+    "all": "Все",
+    "grid": "Плитка",
+    "list": "Список",
+    "loading": "Загрузка...",
+    "icon_size": "Размер иконки",
+    "anim_size": "Размер анимации",
+    "min": "МИН",
+    "max": "МАКС",
+    "pause": "Остановить",
+    "play": "Запустить",
+    "export_svg": "Экспорт SVG",
+    "export_png": "Экспорт PNG",
+    "export_json": "Экспорт JSON",
+    "export_list": "Сохранить список в файл",
+    "export_all_matched": "Экспорт всех совпадений",
+    "export_done": "Сохранено: {}",
+    "export_error": "Ошибка: {}",
+    "batch_done": "Готово: {ok}/{total}",
+    "not_found": "Не найден: {}",
+    "svg_fallback": "SVG недоступен → PNG: {}",
+    "format": "Формат экспорта",
+    "png_res": "Размер PNG (px)",
+    "other": "Другое",
+}
+
+# --- easter egg pool for random bulletin messages ---
+_EASTER_EGGS: List[str] = [
+    "Я ВСЕ СПИЗДИЛА!!!!",
+    "на самом деле я вайбкодер",
+    "🌵🌵🌵 github.com/Den4ikSuperOstryyPer4ik/CactusPlugins 🌵🌵🌵",
+    "---> t.me/CactusPlugins <--- ТУТ КАКТУС",
+    "спизжено у @CactusPlugins с любовью 🎀",
+    "запретите ей вайбкодить!!! (с) клод который писал этот код",
+]
+
+# --- chance (0.0 - 1.0) that an easter egg bulletin fires on export ---
+_EGG_CHANCE: float = 0.15
+
+def _maybe_show_egg():
+    # --- roll the dice for an easter egg bulletin ---
+    if random.random() < _EGG_CHANCE:
+        egg: str = random.choice(_EASTER_EGGS)
+        run_on_ui_thread(lambda: BulletinHelper.show_info(egg))
+
+# ===========================================================================
+# спизжено: dynamic proxy factory — целиком утащено из референса DevSettingIcons
+# ===========================================================================
+
+def gen(java_class, method_name: str, return_value: bool = False, default_value=None):
+    # спизжено: gen() один-в-один из референса, только тег ошибки поменял
+    def _run(instance, *java_args):
+        try:
+            value = instance._fn(*java_args, *instance._args, **instance._kwargs)
+            if return_value:
+                return value
+        except Exception:
+            logcat("[ERROR] [IconExporter] " + traceback.format_exc())
+            return default_value
+
+    def __init__(self, fn, *args, **kwargs):
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+        super(type(self), self).__init__()
+
+    proxy_cls = type(
+        "Proxy_" + java_class.__name__,
+        (dynamic_proxy(java_class),),
+        {"__init__": __init__, method_name: _run},
+    )
+    return proxy_cls
+
+# спизжено: все четыре proxy-конструктора из референса
+Callback2 = gen(Utilities.Callback2, "run")
+Callback5 = gen(Utilities.Callback5, "run")
+OnClickListener = gen(View.OnClickListener, "onClick")
+OnDismissListener = gen(DialogInterface.OnDismissListener, "onDismiss")
+
+# ===========================================================================
+#  svg conversion: vectordrawable compiled xml -> svg markup
+# ===========================================================================
+
+def _xml_attr(parser, name: str) -> Optional[str]:
+    # --- read attribute value, stripping android dimension suffixes ---
+    val = parser.getAttributeValue(_ANDROID_NS, name)
+    if val is None:
+        return None
+    return str(val).replace("dp", "").replace("sp", "").replace("px", "")
+
+def _xml_color_attr(parser, name: str) -> Optional[str]:
+    # --- read color attribute as hex string ---
+    sv = parser.getAttributeValue(_ANDROID_NS, name)
+    if sv is not None and str(sv).startswith("#"):
+        return str(sv)
+    try:
+        sentinel: int = 0x01FFFFFF
+        iv: int = parser.getAttributeIntValue(_ANDROID_NS, name, sentinel)
+        if iv != sentinel:
+            r: int = (iv >> 16) & 0xFF
+            g: int = (iv >> 8) & 0xFF
+            b: int = iv & 0xFF
+            return f"#{r:02x}{g:02x}{b:02x}"
+    except Exception:
+        pass
+    return None
+
+def _build_path_attrs(parser) -> str:
+    # --- collect all svg-relevant attributes from a vector path element ---
+    pd: str = _xml_attr(parser, "pathData") or ""
+    fc: Optional[str] = _xml_color_attr(parser, "fillColor")
+    sc: Optional[str] = _xml_color_attr(parser, "strokeColor")
+    sw: Optional[str] = _xml_attr(parser, "strokeWidth")
+    fa: Optional[str] = _xml_attr(parser, "fillAlpha")
+    sa: Optional[str] = _xml_attr(parser, "strokeAlpha")
+    ft: Optional[str] = _xml_attr(parser, "fillType")
+    lc: Optional[str] = _xml_attr(parser, "strokeLineCap")
+    lj: Optional[str] = _xml_attr(parser, "strokeLineJoin")
+
+    parts: List[str] = [f'd="{pd}"']
+
+    if fc:
+        parts.append(f'fill="{fc}"')
+    elif sc:
+        parts.append('fill="none"')
+    else:
+        parts.append('fill="#000000"')
+
+    if fa and fa != "1":
+        parts.append(f'fill-opacity="{fa}"')
+    if sc:
+        parts.append(f'stroke="{sc}"')
+    if sw:
+        parts.append(f'stroke-width="{sw}"')
+    if sa and sa != "1":
+        parts.append(f'stroke-opacity="{sa}"')
+    if ft and "evenodd" in str(ft).lower():
+        parts.append('fill-rule="evenodd"')
+    if lc:
+        parts.append(f'stroke-linecap="{str(lc).lower()}"')
+    if lj:
+        parts.append(f'stroke-linejoin="{str(lj).lower()}"')
+
+    return " ".join(parts)
+
+def _build_group_transform(parser) -> str:
+    # --- construct svg transform from android group properties ---
+    transforms: List[str] = []
+    tx: Optional[str] = _xml_attr(parser, "translateX")
+    ty: Optional[str] = _xml_attr(parser, "translateY")
+    rot: Optional[str] = _xml_attr(parser, "rotation")
+    px: Optional[str] = _xml_attr(parser, "pivotX")
+    py: Optional[str] = _xml_attr(parser, "pivotY")
+    sx: Optional[str] = _xml_attr(parser, "scaleX")
+    sy: Optional[str] = _xml_attr(parser, "scaleY")
+
+    if tx or ty:
+        transforms.append(f"translate({tx or 0},{ty or 0})")
+    if rot:
+        transforms.append(f"rotate({rot},{px or 0},{py or 0})")
+    if sx or sy:
+        transforms.append(f"scale({sx or 1},{sy or 1})")
+
+    if not transforms:
+        return ""
+    return f' transform="{" ".join(transforms)}"'
+
+def _vector_xml_to_svg(context, res_id: int) -> Optional[str]:
+    # --- parse compiled android vectordrawable xml and emit svg markup ---
+    from org.xmlpull.v1 import XmlPullParser
+
+    xp = context.getResources().getXml(res_id)
+    lines: List[str] = ['<?xml version="1.0" encoding="utf-8"?>']
+    depth: int = 0
+    is_vector: bool = False
+
+    ev: int = xp.getEventType()
+    while ev != XmlPullParser.END_DOCUMENT:
+        if ev == XmlPullParser.START_TAG:
+            tag: str = str(xp.getName())
+
+            if tag == "vector":
+                vw: str = _xml_attr(xp, "viewportWidth") or "24"
+                vh: str = _xml_attr(xp, "viewportHeight") or "24"
+                lines.append(
+                    f'<svg xmlns="http://www.w3.org/2000/svg" '
+                    f'viewBox="0 0 {vw} {vh}">'
+                )
+                depth = 1
+                is_vector = True
+
+            elif tag == "path" and is_vector:
+                pad: str = "  " * depth
+                attr_str: str = _build_path_attrs(xp)
+                lines.append(f"{pad}<path {attr_str}/>")
+
+            elif tag == "group" and is_vector:
+                pad = "  " * depth
+                transform: str = _build_group_transform(xp)
+                lines.append(f"{pad}<g{transform}>")
+                depth += 1
+
+            elif tag == "clip-path" and is_vector:
+                cpd: str = _xml_attr(xp, "pathData") or ""
+                pad = "  " * depth
+                clip_id: str = f"clip_{depth}"
+                lines.append(
+                    f'{pad}<defs><clipPath id="{clip_id}">'
+                    f'<path d="{cpd}"/></clipPath></defs>'
+                )
+
+        elif ev == XmlPullParser.END_TAG:
+            tag = str(xp.getName())
+            if tag == "vector" and is_vector:
+                lines.append("</svg>")
+            elif tag == "group" and is_vector:
+                depth = max(1, depth - 1)
+                lines.append(f'{"  " * depth}</g>')
+
+        ev = xp.next()
+
+    xp.close()
+    return "\n".join(lines) if is_vector else None
+
+# ===========================================================================
+#  png rasterization
+# ===========================================================================
+
+def _render_drawable_to_png(drawable, size: int, file_path: str) -> bool:
+    # --- rasterize any android drawable to a png bitmap ---
+    if drawable is None:
+        return False
+    try:
+        bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        canvas = Canvas(bmp)
+        drawable.setBounds(0, 0, size, size)
+        drawable.draw(canvas)
+
+        fos = FileOutputStream(file_path)
+        bmp.compress(Bitmap.CompressFormat.PNG, 100, fos)
+        fos.flush()
+        fos.close()
+        bmp.recycle()
+        return True
+    except Exception as e:
+        logcat(f"PNG render failed: {e}")
+        return False
+
+# ===========================================================================
+#  lottie json export from r.raw
+# ===========================================================================
+
+def _export_raw_resource(context, res_id: int, file_path: str) -> bool:
+    # --- export r.raw resource bytes to a file ---
+    try:
+        from java.io import BufferedReader, InputStreamReader
+
+        inp = context.getResources().openRawResource(res_id)
+        reader = BufferedReader(InputStreamReader(inp, "UTF-8"))
+        collected: List[str] = []
+        line = reader.readLine()
+        while line is not None:
+            collected.append(str(line))
+            line = reader.readLine()
+        reader.close()
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(collected))
+        return True
+    except Exception as e:
+        logcat(f"Raw export failed: {e}")
+        return False
+
+# ===========================================================================
+#  helpers
+# ===========================================================================
+
+def _get_export_dir() -> str:
+    # --- resolve export directory under downloads ---
+    base: str = os.path.join(
+        os.environ.get("EXTERNAL_STORAGE", "/sdcard"),
+        "Download",
+        _EXPORT_DIR_NAME,
+    )
+    os.makedirs(base, exist_ok=True)
+    return base
+
+# спизжено: паттерн получения оригинального drawable через ExteraResources из референса
+def _get_drawable(activity, res_id: int):
+    # --- get original drawable, preferring exteraresources if available ---
+    try:
+        if _HAS_EXTERA_UI:
+            res = activity.getResources()
+            if isinstance(res, ExteraResources):
+                return res.getOriginalDrawable(res_id).mutate()
+    except Exception:
+        pass
+    try:
+        return ContextCompat.getDrawable(activity, res_id).mutate()
+    except Exception:
+        return None
+
+# спизжено: логика фильтрации solar/remix/default — переписана из _load_all() референса
+def _matches_type_filter(name: str, type_idx: int, icons_dict: Dict[str, int]) -> bool:
+    # --- check if icon name passes the solar/remix/default type filter ---
+    if type_idx == _TYPE_ALL:
+        return True
+    if type_idx == _TYPE_SOLAR:
+        return "solar" in name
+    if type_idx == _TYPE_REMIX:
+        return "remix" in name
+    if type_idx == _TYPE_DEFAULT:
+        # спизжено: эта тройная проверка один-в-один из референса
+        return (
+            "solar" not in name
+            and "remix" not in name
+            and (
+                f"{name}_remix" in icons_dict
+                or f"{name}_solar" in icons_dict
+            )
+        )
+    return True
+
+# ===========================================================================
+#  icon detail dialog with export buttons
+# ===========================================================================
+
+# спизжено: структура show_icon_full() из референса, но добавлены кнопки экспорта
+def _show_icon_detail(activity, icon_name: str, res_id: int):
+    # --- full-size icon preview dialog with size slider and export ---
+    try:
+        builder = AlertDialog.Builder(activity)
+
+        # спизжено: layout skeleton из show_icon_full() референса
+        frame_layout = FrameLayout(activity)
+        builder.setView(frame_layout)
+
+        scroll_view = ScrollView(activity)
+        scroll_view.setFillViewport(True)
+        frame_layout.addView(scroll_view, LayoutHelper.createFrame(-1, -1))
+
+        linear = LinearLayout(activity)
+        linear.setOrientation(LinearLayout.VERTICAL)
+        linear.setGravity(Gravity.CENTER_HORIZONTAL)
+        scroll_view.addView(
+            linear, LayoutHelper.createFrame(-1, -2, Gravity.LEFT | Gravity.TOP)
+        )
+
+        # спизжено: RLottieImageView + setImageResource из референса
+        icon_view = RLottieImageView(activity)
+        icon_view.setImageResource(res_id)
+        linear.addView(icon_view, LayoutHelper.createLinear(256, 256, Gravity.CENTER_HORIZONTAL))
+
+        # спизжено: AltSeekbar с размером иконки из референса
+        if _HAS_EXTERA_UI:
+            def on_size_change(p):
+                icon_view.setLayoutParams(LayoutHelper.createLinear(int(p), int(p)))
+                icon_view.invalidate()
+
+            seek = AltSeekbar(
+                activity,
+                gen(AltSeekbar.OnDrag, "run")(lambda p: on_size_change(p)),
+                24, 256, S["icon_size"], S["min"], S["max"],
+            )
+            seek.setProgress(1)
+            linear.addView(seek, LayoutHelper.createLinear(-1, -2))
+
+        # спизжено: кнопка копирования имени — ButtonWithCounterView + ColoredImageSpan из референса
+        copy_btn = ButtonWithCounterView(activity, False, None)
+        span = ColoredImageSpan(ContextCompat.getDrawable(activity, R.drawable.msg_copy))
+        ssb = SpannableStringBuilder()
+        ssb.append("d ").setSpan(span, 0, 1, 0)
+        ssb.append(icon_name)
+        copy_btn.setText(ssb, False)
+        # спизжено: addToClipboard + show_copied_to_clipboard из референса
+        copy_btn.setOnClickListener(OnClickListener(
+            lambda _: (
+                BulletinHelper.show_copied_to_clipboard()
+                if AndroidUtilities.addToClipboard(icon_name)
+                else None
+            )
+        ))
+        linear.addView(copy_btn, LayoutHelper.createLinear(-1, 48, 0, 16, 28, 16, 4))
+
+        # --- export svg button (не спизжено, моё родное) ---
+        svg_btn = ButtonWithCounterView(activity, True, None)
+        svg_ssb = SpannableStringBuilder()
+        svg_ssb.append(S["export_svg"])
+        svg_btn.setText(svg_ssb, False)
+        svg_btn.setOnClickListener(OnClickListener(
+            lambda _: run_on_queue(
+                lambda: _do_export_single_icon(activity, icon_name, res_id, _FMT_SVG, 512)
+            )
+        ))
+        linear.addView(svg_btn, LayoutHelper.createLinear(-1, 48, 0, 16, 4, 16, 4))
+
+        # --- export png button (тоже моё, не спизжено) ---
+        png_btn = ButtonWithCounterView(activity, True, None)
+        png_ssb = SpannableStringBuilder()
+        png_ssb.append(S["export_png"] + " (512px)")
+        png_btn.setText(png_ssb, False)
+        png_btn.setOnClickListener(OnClickListener(
+            lambda _: run_on_queue(
+                lambda: _do_export_single_icon(activity, icon_name, res_id, _FMT_PNG, 512)
+            )
+        ))
+        linear.addView(png_btn, LayoutHelper.createLinear(-1, 48, 0, 16, 4, 16, 16))
+
+        dialog = builder.create()
+        dialog.show()
+    except Exception:
+        logcat(traceback.format_exc())
+
+def _do_export_single_icon(
+    activity, name: str, res_id: int, fmt: int, png_size: int
+):
+    # --- background worker: export one drawable icon ---
+    try:
+        out: str = _get_export_dir()
+
+        if fmt == _FMT_SVG:
+            svg_content: Optional[str] = None
+            try:
+                svg_content = _vector_xml_to_svg(activity, res_id)
+            except Exception:
+                logcat(f"SVG parse error for {name}: {traceback.format_exc()}")
+
+            if svg_content:
+                path: str = os.path.join(out, f"{name}.svg")
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(svg_content)
+                _n = name
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_success(S["export_done"].format(f"{_n}.svg"))
+                )
+                _maybe_show_egg()
+                return
+
+            # --- svg unavailable, fallback to png ---
+            path = os.path.join(out, f"{name}_{png_size}px.png")
+            drawable = _get_drawable(activity, res_id)
+            if _render_drawable_to_png(drawable, png_size, path):
+                _n = name
+                _s = png_size
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_info(
+                        S["svg_fallback"].format(f"{_n}_{_s}px.png")
+                    )
+                )
+            else:
+                _n = name
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_error(S["not_found"].format(_n))
+                )
+
+        elif fmt == _FMT_PNG:
+            path = os.path.join(out, f"{name}_{png_size}px.png")
+            drawable = _get_drawable(activity, res_id)
+            if _render_drawable_to_png(drawable, png_size, path):
+                _n = name
+                _s = png_size
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_success(
+                        S["export_done"].format(f"{_n}_{_s}px.png")
+                    )
+                )
+                _maybe_show_egg()
+            else:
+                _n = name
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_error(S["not_found"].format(_n))
+                )
+    except Exception:
+        logcat(traceback.format_exc())
+        _n = name
+        run_on_ui_thread(
+            lambda: BulletinHelper.show_error(S["export_error"].format(_n))
+        )
+
+# ===========================================================================
+#  animation detail dialog with export
+# ===========================================================================
+
+# спизжено: структура show_full_animation() из референса, добавлен экспорт JSON
+def _show_animation_detail(activity, anim_name: str, res_id: int, on_dismiss_cb=None):
+    # --- full-size lottie animation preview with play/pause and export ---
+    try:
+        builder = AlertDialog.Builder(activity)
+
+        # спизжено: тот же layout skeleton
+        frame_layout = FrameLayout(activity)
+        builder.setView(frame_layout)
+
+        scroll_view = ScrollView(activity)
+        scroll_view.setFillViewport(True)
+        frame_layout.addView(scroll_view, LayoutHelper.createFrame(-1, -1))
+
+        linear = LinearLayout(activity)
+        linear.setOrientation(LinearLayout.VERTICAL)
+        linear.setGravity(Gravity.CENTER_HORIZONTAL)
+        scroll_view.addView(
+            linear, LayoutHelper.createFrame(-1, -2, Gravity.LEFT | Gravity.TOP)
+        )
+
+        # спизжено: RLottieImageView + setAutoRepeat + setAnimation из референса
+        anim_view = RLottieImageView(activity)
+        anim_view.setAutoRepeat(True)
+        anim_view.setAnimation(res_id, 256, 256)
+        anim_view.playAnimation()
+        linear.addView(anim_view, LayoutHelper.createLinear(256, 256, Gravity.CENTER_HORIZONTAL))
+
+        # спизжено: AltSeekbar с размером анимации из референса
+        if _HAS_EXTERA_UI:
+            def on_size_change(p):
+                anim_view.setLayoutParams(LayoutHelper.createLinear(int(p), int(p)))
+                anim_view.invalidate()
+
+            seek = AltSeekbar(
+                activity,
+                gen(AltSeekbar.OnDrag, "run")(lambda p: on_size_change(p)),
+                24, 256, S["anim_size"], S["min"], S["max"],
+            )
+            seek.setProgress(1)
+            linear.addView(seek, LayoutHelper.createLinear(-1, -2))
+
+        # спизжено: play/pause кнопка с динамической иконкой из референса
+        play_btn = ButtonWithCounterView(activity, True, None)
+
+        # спизжено: on_click с toggle + setText из референса
+        def _update_play_text(playing: bool):
+            ic_res = R.drawable.msg_round_pause_m if playing else R.drawable.msg_round_play_m
+            sp = ColoredImageSpan(ContextCompat.getDrawable(activity, ic_res))
+            sb = SpannableStringBuilder()
+            sb.append("d ").setSpan(sp, 0, 1, 0)
+            sb.append(S["pause"] if playing else S["play"])
+            play_btn.setText(sb, False)
+
+        def _toggle_play(_=None):
+            if anim_view.isPlaying():
+                anim_view.stopAnimation()
+            else:
+                anim_view.playAnimation()
+            _update_play_text(anim_view.isPlaying())
+
+        _update_play_text(True)
+        play_btn.setOnClickListener(OnClickListener(_toggle_play))
+        linear.addView(play_btn, LayoutHelper.createLinear(-1, 48, 0, 16, 28, 16, 4))
+
+        # спизжено: кнопка копирования имени из референса
+        copy_btn = ButtonWithCounterView(activity, False, None)
+        span = ColoredImageSpan(ContextCompat.getDrawable(activity, R.drawable.msg_copy))
+        ssb = SpannableStringBuilder()
+        ssb.append("d ").setSpan(span, 0, 1, 0)
+        ssb.append(anim_name)
+        copy_btn.setText(ssb, False)
+        copy_btn.setOnClickListener(OnClickListener(
+            lambda _: (
+                BulletinHelper.show_copied_to_clipboard()
+                if AndroidUtilities.addToClipboard(anim_name)
+                else None
+            )
+        ))
+        linear.addView(copy_btn, LayoutHelper.createLinear(-1, 48, 0, 16, 4, 16, 4))
+
+        # --- export json button (не спизжено) ---
+        json_btn = ButtonWithCounterView(activity, True, None)
+        json_ssb = SpannableStringBuilder()
+        json_ssb.append(S["export_json"])
+        json_btn.setText(json_ssb, False)
+        json_btn.setOnClickListener(OnClickListener(
+            lambda _: run_on_queue(
+                lambda: _do_export_single_anim(activity, anim_name, res_id)
+            )
+        ))
+        linear.addView(json_btn, LayoutHelper.createLinear(-1, 48, 0, 16, 4, 16, 16))
+
+        # спизжено: setOnPreDismissListener + play_all callback из референса
+        if on_dismiss_cb:
+            builder.setOnPreDismissListener(OnDismissListener(lambda _: on_dismiss_cb()))
+
+        dialog = builder.create()
+        dialog.show()
+    except Exception:
+        logcat(traceback.format_exc())
+
+def _do_export_single_anim(activity, name: str, res_id: int):
+    # --- background worker: export one raw lottie animation ---
+    try:
+        out: str = _get_export_dir()
+        path: str = os.path.join(out, f"{name}.json")
+        if _export_raw_resource(activity, res_id, path):
+            _n = name
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_success(S["export_done"].format(f"{_n}.json"))
+            )
+            _maybe_show_egg()
+        else:
+            _n = name
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_error(S["export_error"].format(_n))
+            )
+    except Exception:
+        logcat(traceback.format_exc())
+        _n = name
+        run_on_ui_thread(
+            lambda: BulletinHelper.show_error(S["export_error"].format(_n))
+        )
+
+# ===========================================================================
+# спизжено: IconsSheet — переписан из класса IconsSheet референса
+# ===========================================================================
+
+class IconsSheet:
+    def __init__(self, plugin, view_type: int):
+        self.plugin = plugin
+        self.view_type: int = view_type
+        # спизжено: get_last_fragment() + getParentActivity() + getContext() из референса
+        self.fragment = get_last_fragment()
+        self.activity = self.fragment.getParentActivity()
+        self.context = self.fragment.getContext()
+
+        self._loaded: bool = False
+        self._items: List[Any] = []
+        self.count: int = 0
+        self.filter: str = self.plugin.get_setting("icon_filter", "").strip().lower()
+        # спизжено: type setting из референса
+        self.type_idx: int = self.plugin.get_setting("icon_type", _TYPE_ALL)
+
+        self.bottom_sheet = None
+        self.builder = None
+
+        # спизжено: run_on_queue(self._load_all) из референса
+        run_on_queue(self._load_all)
+
+    def _load_all(self):
+        # спизжено: вся структура _load_all() из IconsSheet референса
+        if self._loaded:
+            return
+
+        try:
+            icons: Dict[str, int] = self.plugin.icons
+
+            # спизжено: ExteraResources resolution из референса
+            extera_res = None
+            try:
+                if _HAS_EXTERA_UI:
+                    res = self.context.getResources()
+                    if isinstance(res, ExteraResources):
+                        extera_res = res
+            except Exception:
+                pass
+
+            if self.view_type == 0:
+                # спизжено: grid layout с вычислением row_size из референса
+                width: int = self.context.getResources().getDisplayMetrics().widthPixels
+                icon_w: int = 64 + dp(35)
+                row_size: int = max(1, width // icon_w)
+                frame = LayoutHelper.createFrame(
+                    64, 64, 0, 0, 0,
+                    int((width - icon_w * row_size) / row_size), 0,
+                )
+                # спизжено: ScaleType.CENTER из референса
+                scale = ImageView.ScaleType.CENTER
+
+                row_layout = LinearLayout(self.activity)
+                k: int = 0
+
+                for name, rid in icons.items():
+                    if self.filter and self.filter not in name:
+                        continue
+                    if not _matches_type_filter(name, self.type_idx, icons):
+                        continue
+
+                    try:
+                        # спизжено: AppCompatImageView + setBackground(createSelectorDrawable) из референса
+                        icb = AppCompatImageView(self.activity)
+                        icb.setScaleType(scale)
+                        dr = (
+                            extera_res.getOriginalDrawable(rid).mutate()
+                            if extera_res
+                            else ContextCompat.getDrawable(self.activity, rid).mutate()
+                        )
+                        icb.setImageDrawable(dr)
+                        icb.setBackground(
+                            Theme.createSelectorDrawable(
+                                Theme.getColor(Theme.key_dialogButtonSelector), 1, dp(28)
+                            )
+                        )
+
+                        _n = name
+                        _r = rid
+                        icb.setOnClickListener(OnClickListener(
+                            lambda _, n=_n, r=_r: _show_icon_detail(self.activity, n, r)
+                        ))
+                        row_layout.addView(icb, frame)
+                        k += 1
+                        self.count += 1
+
+                        # спизжено: row_size chunking из референса
+                        if k == row_size:
+                            self._items.append(UItem.asCustom(row_layout))
+                            row_layout = LinearLayout(self.activity)
+                            k = 0
+                    except Exception:
+                        logcat(f"Icon {name} load error: {traceback.format_exc()}")
+
+                if k > 0:
+                    self._items.append(UItem.asCustom(row_layout))
+            else:
+                # спизжено: list mode с UItem.asButton из референса
+                for name, rid in icons.items():
+                    if self.filter and self.filter not in name:
+                        continue
+                    if not _matches_type_filter(name, self.type_idx, icons):
+                        continue
+
+                    try:
+                        dr = (
+                            extera_res.getOriginalDrawable(rid).mutate()
+                            if extera_res
+                            else ContextCompat.getDrawable(self.activity, rid).mutate()
+                        )
+                        self._items.append(UItem.asButton(0, dr, name))
+                        self.count += 1
+                    except Exception:
+                        logcat(f"Icon {name} load error: {traceback.format_exc()}")
+
+        except Exception:
+            logcat(traceback.format_exc())
+
+        self._loaded = True
+        # спизжено: run_on_ui_thread + adapter.update(True) из референса
+        run_on_ui_thread(lambda: self.list_view.adapter.update(True))
+
+    # спизжено: fill_items() с setTitle из референса
+    def fill_items(self, items, adapter):
+        # --- provide items to universalrecyclerview adapter ---
+        try:
+            title: str = S["icons"]
+            if self.filter:
+                title += " • " + self.filter
+            t_name = _TYPE_NAMES.get(self.type_idx)
+            if t_name:
+                title += " • " + t_name
+
+            if not self._loaded:
+                items.add(UItem.asHeader(S["loading"]))
+            else:
+                for item in self._items:
+                    items.add(item)
+                title += f" ({self.count})"
+
+            target = self.bottom_sheet if self.bottom_sheet else self.builder
+            if target:
+                target.setTitle(title, True)
+        except Exception:
+            items.add(UItem.asShadow(traceback.format_exc()))
+
+    # спизжено: on_click dispatch из референса
+    def on_click(self, item, *_):
+        # --- handle list item click ---
+        if self.view_type == 1 and item.text:
+            name: str = str(item.text)
+            rid: int = self.plugin.icons.get(name, 0)
+            if rid:
+                _show_icon_detail(self.activity, name, rid)
+
+    # спизжено: show() с BottomSheet.Builder + UniversalRecyclerView из референса
+    def show(self):
+        # --- create and present the bottom sheet ---
+        self.builder = BottomSheet.Builder(self.activity)
+        self.builder.setApplyTopPadding(False)
+        self.builder.setApplyBottomPadding(False)
+
+        content = FrameLayout(self.activity)
+        self.builder.setCustomView(content)
+        content.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundGray))
+
+        self.list_view = UniversalRecyclerView(
+            self.fragment,
+            Callback2(self.fill_items),
+            Callback5(self.on_click),
+            None,
+        )
+        content.addView(self.list_view, LayoutHelper.createFrame(-1, 700))
+
+        self.bottom_sheet = self.builder.show()
+        self.bottom_sheet.setCanDismissWithSwipe(False)
+
+# ===========================================================================
+# спизжено: AnimationsSheet — переписан из класса AnimationSheet референса
+# ===========================================================================
+
+class AnimationsSheet:
+    def __init__(self, plugin, view_type: int):
+        self.plugin = plugin
+        self.view_type: int = view_type
+        self.fragment = get_last_fragment()
+        self.activity = self.fragment.getParentActivity()
+        self.context = self.fragment.getContext()
+
+        self._loaded: bool = False
+        self._items: List[Any] = []
+        # спизжено: self.all (список анимаций для stop/play) из референса
+        self._anim_views: List[Any] = []
+        self.count: int = 0
+        self.filter: str = self.plugin.get_setting("anim_filter", "").strip().lower()
+
+        self.bottom_sheet = None
+        self.builder = None
+
+        run_on_queue(self._load_all)
+
+    def _load_all(self):
+        # спизжено: вся структура из AnimationSheet._load_all() референса
+        if self._loaded:
+            return
+
+        try:
+            anims: Dict[str, int] = self.plugin.animations
+            scale = ImageView.ScaleType.CENTER
+
+            if self.view_type == 0:
+                # спизжено: grid layout для анимаций из референса
+                width: int = self.context.getResources().getDisplayMetrics().widthPixels
+                icon_w: int = dp(56)
+                row_size: int = max(1, width // icon_w - 1)
+                frame = LayoutHelper.createFrame(
+                    48, 48, 0, 0, 0,
+                    int((width - icon_w * row_size) / row_size), 0,
+                )
+
+                row_layout = LinearLayout(self.activity)
+                k: int = 0
+
+                for name, rid in anims.items():
+                    if self.filter and self.filter not in name:
+                        continue
+
+                    try:
+                        # спизжено: RLottieImageView + setAutoRepeat + playAnimation из референса
+                        icb = RLottieImageView(self.activity)
+                        icb.setScaleType(scale)
+                        icb.setAutoRepeat(True)
+                        icb.setAnimation(rid, 46, 46)
+                        icb.playAnimation()
+                        icb.setBackground(
+                            Theme.createSelectorDrawable(
+                                Theme.getColor(Theme.key_dialogButtonSelector), 1, dp(28)
+                            )
+                        )
+
+                        _n = name
+                        _r = rid
+                        icb.setOnClickListener(OnClickListener(
+                            lambda _, n=_n, r=_r: self._open_anim(n, r)
+                        ))
+                        row_layout.addView(icb, frame)
+                        self._anim_views.append(icb)
+                        k += 1
+                        self.count += 1
+
+                        if k == row_size:
+                            self._items.append(UItem.asCustom(row_layout))
+                            row_layout = LinearLayout(self.activity)
+                            k = 0
+                    except Exception:
+                        logcat(f"Anim {name} load error: {traceback.format_exc()}")
+
+                if k > 0:
+                    self._items.append(UItem.asCustom(row_layout))
+            else:
+                # спизжено: list mode с LinearLayout + TextView из референса
+                text_color: int = Theme.getColor(Theme.key_windowBackgroundWhiteBlackText)
+                frame = LayoutHelper.createFrame(48, 48, 0, 8, 4, 0, 4)
+                frame2 = LayoutHelper.createFrame(-2, -2, Gravity.CENTER_VERTICAL, 12, 0, 0, 0)
+
+                for name, rid in anims.items():
+                    if self.filter and self.filter not in name:
+                        continue
+
+                    try:
+                        layout = LinearLayout(self.activity)
+
+                        icb = RLottieImageView(self.activity)
+                        icb.setScaleType(scale)
+                        icb.setAutoRepeat(True)
+                        icb.setAnimation(rid, 46, 46)
+                        icb.playAnimation()
+                        self._anim_views.append(icb)
+                        layout.addView(icb, frame)
+
+                        tv = TextView(self.activity)
+                        tv.setTextColor(text_color)
+                        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 18)
+                        tv.setGravity(Gravity.CENTER_VERTICAL)
+                        tv.setText(name)
+                        layout.addView(tv, frame2)
+
+                        # спизжено: item.object2 = name из референса
+                        item = UItem.asCustom(layout)
+                        item.object2 = name
+                        self._items.append(item)
+                        self.count += 1
+                    except Exception:
+                        logcat(f"Anim {name} load error: {traceback.format_exc()}")
+
+        except Exception:
+            logcat(traceback.format_exc())
+
+        self._loaded = True
+        run_on_ui_thread(lambda: self.list_view.adapter.update(True))
+
+    # спизжено: open_animation() + stopAnimation/playAnimation для всех из референса
+    def _open_anim(self, name: str, rid: int):
+        # --- stop all sheet animations, open detail, resume on dismiss ---
+        for v in self._anim_views:
+            try:
+                v.stopAnimation()
+            except Exception:
+                pass
+
+        def _resume():
+            for v in self._anim_views:
+                try:
+                    v.playAnimation()
+                except Exception:
+                    pass
+
+        _show_animation_detail(self.activity, name, rid, on_dismiss_cb=_resume)
+
+    def fill_items(self, items, adapter):
+        # --- provide items to universalrecyclerview adapter ---
+        try:
+            title: str = S["animations"]
+            if self.filter:
+                title += " • " + self.filter
+
+            if not self._loaded:
+                items.add(UItem.asHeader(S["loading"]))
+            else:
+                for item in self._items:
+                    items.add(item)
+                title += f" ({self.count})"
+
+            target = self.bottom_sheet if self.bottom_sheet else self.builder
+            if target:
+                target.setTitle(title, True)
+        except Exception:
+            items.add(UItem.asShadow(traceback.format_exc()))
+
+    def on_click(self, item, *_):
+        # --- handle list item click ---
+        if self.view_type == 1 and item.object2:
+            name: str = str(item.object2)
+            rid: int = self.plugin.animations.get(name, 0)
+            if rid:
+                self._open_anim(name, rid)
+
+    # спизжено: show() — тот же BottomSheet.Builder паттерн из референса
+    def show(self):
+        # --- create and present the bottom sheet ---
+        self.builder = BottomSheet.Builder(self.activity)
+        self.builder.setApplyTopPadding(False)
+        self.builder.setApplyBottomPadding(False)
+
+        content = FrameLayout(self.activity)
+        self.builder.setCustomView(content)
+        content.setBackgroundColor(Theme.getColor(Theme.key_windowBackgroundGray))
+
+        self.list_view = UniversalRecyclerView(
+            self.fragment,
+            Callback2(self.fill_items),
+            Callback5(self.on_click),
+            None,
+        )
+        content.addView(self.list_view, LayoutHelper.createFrame(-1, 700))
+
+        self.bottom_sheet = self.builder.show()
+        self.bottom_sheet.setCanDismissWithSwipe(False)
+
+# ===========================================================================
+#  main plugin class
+# ===========================================================================
+
+class IconExporterPlugin(BasePlugin):
+
+    def __init__(self):
+        super().__init__()
+        self.icons: Dict[str, int] = {}
+        self.animations: Dict[str, int] = {}
+
+    # спизжено: safe_getattr из референса
+    def _safe_getattr(self, obj, attr, default=None):
+        # --- safely read attribute from java r-class without crashing ---
+        try:
+            return getattr(obj, attr)
+        except Exception:
+            return default
+
+    def on_plugin_load(self) -> None:
+        # спизжено: enumeration через dir(R.drawable) + walrus operator из референса
+        allowed_chars: str = "abcdefghijklmnopqrstuvwxyz0123456789_"
+
+        self.icons = {
+            name: attr
+            for name in dir(R.drawable)
+            if (
+                all(c in allowed_chars for c in name)
+                and not name.startswith("_")
+                and (attr := self._safe_getattr(R.drawable, name))
+            )
+        }
+
+        self.animations = {
+            name: attr
+            for name in dir(R.raw)
+            if (
+                all(c in allowed_chars for c in name)
+                and not name.startswith("_")
+                and (attr := self._safe_getattr(R.raw, name))
+            )
+        }
+
+        self.log(
+            f"Loaded: {len(self.icons)} drawable, {len(self.animations)} raw"
+        )
+
+    def on_plugin_unload(self) -> None:
+        # --- release cached references ---
+        self.icons.clear()
+        self.animations.clear()
+
+    # --- batch export workers (не спизжено, полностью моё) ---
+
+    def _batch_export_drawables(self):
+        # --- export all matching drawable icons in selected format ---
+        frag = get_last_fragment()
+        if not frag:
+            return
+        activity = frag.getParentActivity()
+        if not activity:
+            return
+
+        query: str = self.get_setting("icon_filter", "").strip().lower()
+        fmt: int = self.get_setting("export_format", _FMT_SVG)
+        pidx: int = self.get_setting("png_res", 4)
+        psz: int = _PNG_SIZES[pidx] if 0 <= pidx < len(_PNG_SIZES) else 512
+        type_idx: int = self.get_setting("icon_type", _TYPE_ALL)
+
+        matched: List[Tuple[str, int]] = []
+        for name, rid in self.icons.items():
+            if query and query not in name:
+                continue
+            if not _matches_type_filter(name, type_idx, self.icons):
+                continue
+            matched.append((name, rid))
+
+        if not matched:
+            BulletinHelper.show_error("Совпадений не найдено")
+            return
+
+        if len(matched) > 1000:
+            BulletinHelper.show_error(f"Слишком много ({len(matched)}), уточните фильтр")
+            return
+
+        total: int = len(matched)
+        BulletinHelper.show_info(f"Экспорт {total} иконок...")
+
+        def _worker():
+            out: str = _get_export_dir()
+            ok: int = 0
+            fail: int = 0
+
+            for name, rid in matched:
+                try:
+                    if fmt == _FMT_SVG:
+                        svg: Optional[str] = None
+                        try:
+                            svg = _vector_xml_to_svg(activity, rid)
+                        except Exception:
+                            pass
+
+                        if svg:
+                            path: str = os.path.join(out, f"{name}.svg")
+                            with open(path, "w", encoding="utf-8") as f:
+                                f.write(svg)
+                            ok += 1
+                        else:
+                            # --- non-vector drawable, fallback to png ---
+                            path = os.path.join(out, f"{name}_{psz}px.png")
+                            dr = _get_drawable(activity, rid)
+                            if _render_drawable_to_png(dr, psz, path):
+                                ok += 1
+                            else:
+                                fail += 1
+                    elif fmt == _FMT_PNG:
+                        path = os.path.join(out, f"{name}_{psz}px.png")
+                        dr = _get_drawable(activity, rid)
+                        if _render_drawable_to_png(dr, psz, path):
+                            ok += 1
+                        else:
+                            fail += 1
+                except Exception:
+                    logcat(f"Batch error [{name}]: {traceback.format_exc()}")
+                    fail += 1
+
+            _ok, _fail, _total = ok, fail, total
+            err_suffix: str = f" (ошибок: {_fail})" if _fail > 0 else ""
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_success(
+                    S["batch_done"].format(ok=_ok, total=_total) + err_suffix
+                )
+            )
+            _maybe_show_egg()
+
+        run_on_queue(_worker)
+
+    def _batch_export_animations(self):
+        # --- export all matching raw lottie animations ---
+        frag = get_last_fragment()
+        if not frag:
+            return
+        activity = frag.getParentActivity()
+        if not activity:
+            return
+
+        query: str = self.get_setting("anim_filter", "").strip().lower()
+
+        matched: List[Tuple[str, int]] = [
+            (name, rid) for name, rid in self.animations.items()
+            if not query or query in name
+        ]
+
+        if not matched:
+            BulletinHelper.show_error("Совпадений не найдено")
+            return
+
+        total: int = len(matched)
+        BulletinHelper.show_info(f"Экспорт {total} анимаций...")
+
+        def _worker():
+            out: str = _get_export_dir()
+            ok: int = 0
+            fail: int = 0
+
+            for name, rid in matched:
+                try:
+                    path: str = os.path.join(out, f"{name}.json")
+                    if _export_raw_resource(activity, rid, path):
+                        ok += 1
+                    else:
+                        fail += 1
+                except Exception:
+                    logcat(f"Batch anim error [{name}]: {traceback.format_exc()}")
+                    fail += 1
+
+            _ok, _fail, _total = ok, fail, total
+            err_suffix: str = f" (ошибок: {_fail})" if _fail > 0 else ""
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_success(
+                    S["batch_done"].format(ok=_ok, total=_total) + err_suffix
+                )
+            )
+            _maybe_show_egg()
+
+        run_on_queue(_worker)
+
+    # спизжено: export_to_file() из референса, слегка переписана
+    def _export_names_list(self):
+        # --- save complete icon and animation name list to a text file ---
+        try:
+            base: str = os.path.join(
+                os.environ.get("EXTERNAL_STORAGE", "/sdcard"), "Download"
+            )
+            os.makedirs(base, exist_ok=True)
+            path: str = os.path.join(base, "All_Telegram_Icons_List.txt")
+
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("=== TELEGRAM ICONS ===\n")
+                f.write(f"Всего R.drawable: {len(self.icons)}\n")
+                f.write(f"Всего R.raw: {len(self.animations)}\n\n")
+                for name in sorted(self.icons.keys()):
+                    f.write(f"{name}\n")
+                f.write("\n")
+                for name in sorted(self.animations.keys()):
+                    f.write(f"{name}\n")
+
+            BulletinHelper.show_success(S["export_done"].format(path))
+        except Exception as e:
+            self.log(f"List export error: {e}")
+            BulletinHelper.show_error(S["export_error"].format(str(e)[:80]))
+
+    # --- settings ui ---
+
+    # спизжено: структура create_settings() из референса, расширена экспорт-секцией
+    def create_settings(self) -> list:
+        # --- build the plugin settings screen ---
+        return [
+            Header(text=S["icons"]),
+            Input(
+                key="icon_filter",
+                text=S["search"],
+                icon="msg_search",
+                default="",
+            ),
+            # спизжено: Selector с типами Solar/Remix/Default из референса
+            Selector(
+                key="icon_type",
+                text=S["type"],
+                default=_TYPE_ALL,
+                items=[S["all"], "Solar", "Remix", "Default"],
+                icon="menu_select_quote_solar",
+            ),
+            # спизжено: кнопки Плитка/Список из референса
+            Text(
+                text=S["grid"],
+                accent=True,
+                on_click=lambda _: IconsSheet(self, 0).show(),
+                icon="input_bot2_solar",
+            ),
+            Text(
+                text=S["list"],
+                accent=True,
+                on_click=lambda _: IconsSheet(self, 1).show(),
+                icon="msg_reorder",
+            ),
+            Selector(
+                key="export_format",
+                text=S["format"],
+                default=_FMT_SVG,
+                items=["SVG (вектор)", "PNG (растр)"],
+                icon="msg_photo_settings",
+            ),
+            Selector(
+                key="png_res",
+                text=S["png_res"],
+                default=4,
+                items=_PNG_LABELS,
+                icon="msg_zoomin",
+            ),
+            Text(
+                text=S["export_all_matched"] + " (drawable)",
+                accent=True,
+                on_click=lambda _: self._batch_export_drawables(),
+                icon="msg_download",
+            ),
+            Divider(
+                text="Некоторые фичи были спизжены из All Telegram Icons "
+                     "от @mur_live (форкер) и DevSettingIcons от @CactusPlugins (автор)"
+            ),
+
+            Header(text=S["animations"]),
+            Input(
+                key="anim_filter",
+                text=S["search"],
+                icon="msg_search",
+                default="",
+            ),
+            Text(
+                text=S["grid"],
+                accent=True,
+                on_click=lambda _: AnimationsSheet(self, 0).show(),
+                icon="input_bot2_solar",
+            ),
+            Text(
+                text=S["list"],
+                accent=True,
+                on_click=lambda _: AnimationsSheet(self, 1).show(),
+                icon="msg_reorder",
+            ),
+            Text(
+                text=S["export_all_matched"] + " (Lottie JSON)",
+                accent=True,
+                on_click=lambda _: self._batch_export_animations(),
+                icon="msg_download",
+            ),
+            Divider(
+                text="🌵🌵🌵 github.com/Den4ikSuperOstryyPer4ik/CactusPlugins 🌵🌵🌵"
+            ),
+
+            Header(text=S["other"]),
+            Text(
+                text=S["export_list"],
+                accent=True,
+                on_click=lambda _: self._export_names_list(),
+                icon="msg_log_solar",
+            ),
+            Divider(text=f"Экспорт → Download/{_EXPORT_DIR_NAME}"),
+            Text(
+                text="на самом деле я вайбкодер",
+                icon="msg_secret",
+                red=True,
+                on_click=lambda _: BulletinHelper.show_info(
+                    "Я ВСЕ СПИЗДИЛА!!!!"
+                ),
+            ),
+            Divider(
+                text="---> t.me/CactusPlugins <--- ТУТ КАКТУС"
+            ),
+        ]

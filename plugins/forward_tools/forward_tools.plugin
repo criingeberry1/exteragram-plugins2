@@ -3,11 +3,10 @@ from datetime import datetime
 
 from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy, MethodHook, MethodReplacement
 from ui.settings import Header, Switch, Divider, Text
-from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
-from android_utils import log, run_on_ui_thread
+from android_utils import log
 from hook_utils import find_class, get_private_field, set_private_field
-from client_utils import get_last_fragment, get_messages_controller
+from client_utils import get_messages_controller
 
 from java.util import ArrayList
 from java.lang import Boolean, Integer, Long
@@ -26,7 +25,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -41,10 +40,7 @@ except Exception:
 
 _CA_CLASS = ChatActivity.getClass()
 
-# ==========================================================
-# utility helpers
-# ==========================================================
-
+# --- utility helpers ---
 def _al_to_list(java_al: Any) -> List[Any]:
     # --- convert java arraylist to python list ---
     return [java_al.get(i) for i in range(java_al.size())]
@@ -63,7 +59,7 @@ def _sparse_keys(sparse: Any) -> List[int]:
     return [sparse.keyAt(i) for i in range(sparse.size())]
 
 def _chunks(lst: List[Any], size: int) -> List[List[Any]]:
-    # --- split list into fixed-size chunks ---
+    # --- split list into fixed size chunks ---
     return [lst[i:i + size] for i in range(0, len(lst), size)]
 
 def _sel_index(param: Any) -> int:
@@ -89,7 +85,7 @@ def _make_sparse(chat_activity: Any) -> Any:
     return SparseArray()
 
 def _dec_counter(ca: Any, counter_field: str, button_field: str) -> None:
-    # --- decrement selection counter and re-enable button at zero ---
+    # --- decrement selection counter and reenable button at zero ---
     try:
         val: int = get_private_field(ca, counter_field) - 2
         set_private_field(ca, counter_field, Integer(val))
@@ -99,7 +95,7 @@ def _dec_counter(ca: Any, counter_field: str, button_field: str) -> None:
                 btn.setEnabled(True)
                 btn.setAlpha(1.0)
     except Exception as e:
-        log(f"ForwardTools: dec counter error — {e}")
+        log(f"ForwardTools: dec counter error {e}")
 
 def _cancel_selection(ca: Any) -> None:
     # --- dismiss message selection action mode ---
@@ -111,7 +107,7 @@ def _cancel_selection(ca: Any) -> None:
         m2.setAccessible(True)
         m2.invoke(ca, [True])
     except Exception as e:
-        log(f"ForwardTools: cancel selection error — {e}")
+        log(f"ForwardTools: cancel selection error {e}")
 
 def _update_reply_btn(ca: Any, show: bool) -> None:
     # --- toggle reply button visibility ---
@@ -125,10 +121,10 @@ def _update_reply_btn(ca: Any, show: bool) -> None:
             if btn:
                 btn.setVisibility(View.VISIBLE if show else View.GONE)
     except Exception as e:
-        log(f"ForwardTools: reply btn error — {e}")
+        log(f"ForwardTools: reply btn error {e}")
 
 def _update_select_btn(ca: Any) -> None:
-    # --- update select-between button based on selection gaps ---
+    # --- update select between button based on selection gaps ---
     try:
         sp = get_private_field(ca, "selectedMessagesIds")
         msgs = get_private_field(ca, "messages")
@@ -160,12 +156,9 @@ def _update_select_btn(ca: Any) -> None:
                 if btn.getVisibility() != vis:
                     btn.setVisibility(vis)
     except Exception as e:
-        log(f"ForwardTools: select btn error — {e}")
+        log(f"ForwardTools: select btn error {e}")
 
-# ==========================================================
-# no-forward-limit xposed hooks (based on @zwylair code)
-# ==========================================================
-
+# --- no forward limit hooks ---
 class _SelectorHook(MethodHook):
     def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
         self.plugin = plugin
@@ -175,7 +168,7 @@ class _SelectorHook(MethodHook):
         self._skip_after: bool = False
 
     def before_hooked_method(self, param: Any) -> None:
-        # --- replace sparse array to bypass 100-message cap ---
+        # --- replace sparse array to bypass cap ---
         if not self.plugin.get_setting("no_forward_limit", True):
             return
 
@@ -271,7 +264,7 @@ class _MultiSelHook(MethodHook):
             m = listener.getClass().getMethod("limitReached")
             self.plugin.hook_method(m, _LimitBypass())
         except Exception as e:
-            log(f"ForwardTools: multi-sel hook error — {e}")
+            log(f"ForwardTools: multi sel hook error {e}")
 
 class _LimitBypass(MethodReplacement):
     def replace_hooked_method(self, param: Any) -> bool:
@@ -285,7 +278,7 @@ class _ChunkedDelete(MethodHook):
         self.plugin = plugin
 
     def before_hooked_method(self, param: Any) -> None:
-        # --- split large deletes into 100-message batches ---
+        # --- split large deletes into batches ---
         if not self.plugin.get_setting("no_forward_limit", True):
             return
 
@@ -301,19 +294,12 @@ class _ChunkedDelete(MethodHook):
             if i < len(_chunks(ids, self._SIZE)) - 1:
                 param.method.invoke(param.thisObject, param.args)
 
-# ==========================================================
-# main plugin class
-# ==========================================================
-
+# --- main plugin class ---
 class ForwardToolsPlugin(BasePlugin):
 
     def __init__(self) -> None:
         super().__init__()
         self._sel_hook: Optional[_SelectorHook] = None
-
-    # ======================================================
-    # lifecycle
-    # ======================================================
 
     def on_plugin_load(self) -> None:
         # --- register context menu for copy with authors ---
@@ -324,18 +310,10 @@ class ForwardToolsPlugin(BasePlugin):
             icon="msg_copy"
         ))
 
-        # --- register chat menu for quick settings ---
-        self.add_menu_item(MenuItemData(
-            menu_type=MenuItemType.CHAT_ACTION_MENU,
-            text="Forward Tools",
-            on_click=self._on_settings_menu,
-            icon="msg_customize"
-        ))
-
         # --- hook forward request for state cleanup ---
         self.add_hook("TL_messages_forwardMessages")
 
-        # --- register no-forward-limit hooks ---
+        # --- register no forward limit hooks ---
         self._init_nfl()
 
     def on_plugin_unload(self) -> None:
@@ -348,10 +326,6 @@ class ForwardToolsPlugin(BasePlugin):
         if name == "TL_messages_forwardMessages" and self._sel_hook:
             self._sel_hook.clear()
         return HookResult()
-
-    # ======================================================
-    # no-forward-limit registration
-    # ======================================================
 
     def _init_nfl(self) -> None:
         # --- safely register all nfl xposed hooks ---
@@ -381,86 +355,63 @@ class ForwardToolsPlugin(BasePlugin):
                 Integer.TYPE, Boolean.TYPE, Integer.TYPE
             )
             self.hook_method(m4, _ChunkedDelete(self))
-
-            log("ForwardTools: nfl hooks registered")
         except Exception as e:
-            log(f"ForwardTools: nfl init failed — {e}")
+            log(f"ForwardTools: nfl init failed {e}")
 
-    # ======================================================
-    # author resolution
-    # ======================================================
-
-    @staticmethod
-    def _fwd_author(msg: Any) -> Optional[str]:
-        # --- extract original forward author name ---
+    def _author(self, msg: Any) -> str:
+        # --- resolve actual message sender prioritizing original forwarder ---
         try:
             owner = getattr(msg, "messageOwner", None)
-            if not owner:
-                return None
-            fwd = getattr(owner, "fwd_from", None)
-            if not fwd:
-                return None
+            if owner:
+                fwd = getattr(owner, "fwd_from", None)
+                if fwd:
+                    # --- hidden sender stores name directly ---
+                    raw_name = getattr(fwd, "from_name", None)
+                    if raw_name and str(raw_name).strip():
+                        return str(raw_name).strip()
 
-            # --- hidden sender stores name directly ---
-            raw_name: Optional[str] = getattr(fwd, "from_name", None)
-            if raw_name and str(raw_name).strip():
-                return str(raw_name).strip()
+                    from_id = getattr(fwd, "from_id", None)
+                    if from_id:
+                        ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
+                        
+                        uid = getattr(from_id, "user_id", 0)
+                        if uid != 0:
+                            u = ctrl.getUser(uid)
+                            if u:
+                                n = f"{u.first_name or ''} {u.last_name or ''}".strip()
+                                if n:
+                                    return n
+                                    
+                        cid = getattr(from_id, "channel_id", 0)
+                        if cid != 0:
+                            c = ctrl.getChat(cid)
+                            if c and c.title:
+                                return str(c.title).strip()
+                                
+                        chatid = getattr(from_id, "chat_id", 0)
+                        if chatid != 0:
+                            c = ctrl.getChat(chatid)
+                            if c and c.title:
+                                return str(c.title).strip()
 
-            from_id = getattr(fwd, "from_id", None)
-            if not from_id:
-                return None
-
-            ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
-
-            uid: int = getattr(from_id, "user_id", 0)
-            if uid:
-                u = ctrl.getUser(uid)
-                if u:
-                    n = f"{u.first_name or ''} {u.last_name or ''}".strip()
-                    if n:
-                        return n
-
-            for fld in ("channel_id", "chat_id"):
-                cid: int = getattr(from_id, fld, 0)
-                if cid:
-                    c = ctrl.getChat(cid)
-                    if c and c.title:
-                        return str(c.title).strip()
-            return None
-        except Exception:
-            return None
-
-    @staticmethod
-    def _sender_name(msg: Any) -> Optional[str]:
-        # --- resolve actual message sender ---
-        try:
-            sid: int = msg.getSenderId()
-            if not sid:
-                return None
+            # --- fallback to direct sender ---
+            sid = msg.getSenderId()
             ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
             if sid > 0:
                 u = ctrl.getUser(sid)
                 if u:
                     n = f"{u.first_name or ''} {u.last_name or ''}".strip()
-                    return n if n else None
-            else:
+                    if n:
+                        return n
+            elif sid < 0:
                 c = ctrl.getChat(-sid)
                 if c and c.title:
                     return str(c.title).strip()
-            return None
         except Exception:
-            return None
+            pass
+        return "Unknown"
 
-    def _author(self, msg: Any) -> str:
-        # --- best available author with fallback ---
-        return self._fwd_author(msg) or self._sender_name(msg) or "Unknown"
-
-    # ======================================================
-    # text extraction
-    # ======================================================
-
-    @staticmethod
-    def _text(msg: Any) -> str:
+    def _text(self, msg: Any) -> str:
         # --- extract display text or caption ---
         for f in ("messageText", "caption"):
             v = getattr(msg, f, None)
@@ -473,19 +424,14 @@ class ForwardToolsPlugin(BasePlugin):
                 return str(raw)
         return ""
 
-    # ======================================================
-    # selected messages
-    # ======================================================
-
-    @staticmethod
-    def _selected(fragment: Any) -> List[Any]:
+    def _selected(self, fragment: Any) -> List[Any]:
         # --- gather all selected messages sorted by date ---
         try:
             sp = get_private_field(fragment, "selectedMessagesIds")
             if not sp:
                 return []
             bag: Dict[int, Any] = {}
-            for idx in range(2):
+            for idx in range(2): # --- usually 2 sparse arrays for selected messages ---
                 s = sp[idx]
                 if s is None:
                     continue
@@ -496,15 +442,11 @@ class ForwardToolsPlugin(BasePlugin):
                 key=lambda m: getattr(getattr(m, "messageOwner", None), "date", 0)
             )
         except Exception as e:
-            log(f"ForwardTools: selected fetch error — {e}")
+            log(f"ForwardTools: selected fetch error {e}")
             return []
 
-    # ======================================================
-    # formatting engine
-    # ======================================================
-
     def _format(self, msgs: List[Any]) -> str:
-        # --- build compact multi-message text with optional dates and timestamps ---
+        # --- build compact multi message text ---
         ts_on: bool = self.get_setting("timestamps", False)
         dates_on: bool = self.get_setting("dates", False)
         prefix_on: bool = self.get_setting("with_label", False)
@@ -525,16 +467,17 @@ class ForwardToolsPlugin(BasePlugin):
 
             # --- insert date separator when day changes ---
             if dates_on and d_str and d_str != cur_date:
-                if cur_date is not None:
+                if lines:
                     lines.append("")
                 lines.append(f"--- {d_str} ---")
                 lines.append("")
                 cur_date = d_str
-                cur_author = None
+                cur_author = None # --- reset author so it prints after date ---
 
             # --- insert author header when sender changes ---
             if author != cur_author:
-                if cur_author is not None:
+                # --- ensure single empty line between different authors ---
+                if lines and lines[-1] != "" and lines[-1] != f"--- {d_str} ---":
                     lines.append("")
                 hdr = f"Forwarded from {author}:" if prefix_on else f"{author}:"
                 lines.append(hdr)
@@ -545,10 +488,6 @@ class ForwardToolsPlugin(BasePlugin):
             lines.append(line)
 
         return "\n".join(lines)
-
-    # ======================================================
-    # copy handler
-    # ======================================================
 
     def _on_copy(self, ctx: Dict[str, Any]) -> None:
         # --- copy selected or single message with original authors ---
@@ -572,55 +511,11 @@ class ForwardToolsPlugin(BasePlugin):
             AndroidUtilities.addToClipboard(result)
             BulletinHelper.show_copied_to_clipboard()
         except Exception as e:
-            log(f"ForwardTools: copy error — {e}")
-            BulletinHelper.show_error(f"Copy failed: {e}")
-
-    # ======================================================
-    # quick settings dialog
-    # ======================================================
-
-    def _on_settings_menu(self, ctx: Dict[str, Any]) -> None:
-        # --- open quick toggle dialog from chat action menu ---
-        fragment = ctx.get("fragment") or get_last_fragment()
-        if not fragment:
-            BulletinHelper.show_error("Cannot open settings")
-            return
-        activity = fragment.getParentActivity()
-        if not activity:
-            BulletinHelper.show_error("Cannot open settings")
-            return
-        self._dialog(activity, fragment)
-
-    def _dialog(self, activity: Any, fragment: Any) -> None:
-        # --- render settings dialog with toggle items ---
-        keys = ["timestamps", "dates", "with_label", "no_forward_limit"]
-        labels = ["Timestamps [hh:mm]", "Date headers", "'Forwarded from' prefix", "No forward limit"]
-        defaults = [False, False, False, True]
-
-        items: List[str] = []
-        for i, k in enumerate(keys):
-            on: bool = self.get_setting(k, defaults[i])
-            items.append(f"{'✓' if on else '✗'}  {labels[i]}")
-
-        def on_tap(bld: AlertDialogBuilder, which: int) -> None:
-            # --- toggle setting and refresh dialog ---
-            cur = self.get_setting(keys[which], defaults[which])
-            self.set_setting(keys[which], not cur)
-            bld.dismiss()
-            self._dialog(activity, fragment)
-
-        bld = AlertDialogBuilder(activity)
-        bld.set_title("Forward Tools")
-        bld.set_items(items, on_tap)
-        bld.set_negative_button("Close", lambda b, w: b.dismiss())
-        bld.show()
-
-    # ======================================================
-    # settings page
-    # ======================================================
+            log(f"ForwardTools: copy error {e}")
+            BulletinHelper.show_error("Copy failed")
 
     def create_settings(self) -> List[Any]:
-        # --- plugin settings screen ---
+        # --- native plugin settings screen with proper switches ---
         return [
             Header(text="Copy formatting"),
             Switch(

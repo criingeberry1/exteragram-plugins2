@@ -4,9 +4,9 @@ from datetime import datetime
 from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy, MethodHook, MethodReplacement
 from ui.settings import Header, Switch, Divider, Text
 from ui.bulletin import BulletinHelper
-from android_utils import log
+from android_utils import log, run_on_ui_thread
 from hook_utils import find_class, get_private_field, set_private_field
-from client_utils import get_messages_controller
+from client_utils import get_last_fragment, get_messages_controller
 
 from java.util import ArrayList
 from java.lang import Boolean, Integer, Long
@@ -14,6 +14,9 @@ from android.view import View
 from org.telegram.messenger import MessageObject, BuildVars, UserConfig, MessagesController, AndroidUtilities
 from org.telegram.ui import ChatActivity
 from org.telegram.tgnet import TLRPC, TLObject
+
+from com.exteragram.messenger.plugins import PluginsController
+from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
 
 # --- метаданные ---
 __id__ = "forward_tools"
@@ -25,7 +28,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -40,7 +43,10 @@ except Exception:
 
 _CA_CLASS = ChatActivity.getClass()
 
-# --- utility helpers ---
+# ==========================================================
+# utility helpers
+# ==========================================================
+
 def _al_to_list(java_al: Any) -> List[Any]:
     # --- convert java arraylist to python list ---
     return [java_al.get(i) for i in range(java_al.size())]
@@ -158,7 +164,33 @@ def _update_select_btn(ca: Any) -> None:
     except Exception as e:
         log(f"ForwardTools: select btn error {e}")
 
-# --- no forward limit hooks ---
+# ==========================================================
+# hooks
+# ==========================================================
+
+class _ClipboardHook(MethodHook):
+    def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        # --- intercept native copy to format text and override clipboard string ---
+        if not self.plugin.get_setting("override_native_copy", True):
+            return
+        try:
+            frag = get_last_fragment()
+            if not frag or not isinstance(frag, ChatActivity):
+                return
+            msgs = self.plugin._selected(frag)
+            # --- if no messages are explicitly selected skip overriding ---
+            if len(msgs) == 0:
+                return
+                
+            res = self.plugin._format(msgs)
+            if res.strip():
+                param.args[0] = res
+        except Exception as e:
+            log(f"ForwardTools: clipboard hook error {e}")
+
 class _SelectorHook(MethodHook):
     def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
         self.plugin = plugin
@@ -294,7 +326,10 @@ class _ChunkedDelete(MethodHook):
             if i < len(_chunks(ids, self._SIZE)) - 1:
                 param.method.invoke(param.thisObject, param.args)
 
-# --- main plugin class ---
+# ==========================================================
+# main plugin class
+# ==========================================================
+
 class ForwardToolsPlugin(BasePlugin):
 
     def __init__(self) -> None:
@@ -310,11 +345,16 @@ class ForwardToolsPlugin(BasePlugin):
             icon="msg_copy"
         ))
 
-        # --- hook forward request for state cleanup ---
-        self.add_hook("TL_messages_forwardMessages")
+        # --- register chat menu button to open native settings ---
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.CHAT_ACTION_MENU,
+            text="Forward Tools Settings",
+            icon="msg_settings_hw",
+            on_click=self._open_plugin_settings
+        ))
 
-        # --- register no forward limit hooks ---
-        self._init_nfl()
+        self.add_hook("TL_messages_forwardMessages")
+        self._init_hooks()
 
     def on_plugin_unload(self) -> None:
         # --- clear selection state ---
@@ -327,8 +367,8 @@ class ForwardToolsPlugin(BasePlugin):
             self._sel_hook.clear()
         return HookResult()
 
-    def _init_nfl(self) -> None:
-        # --- safely register all nfl xposed hooks ---
+    def _init_hooks(self) -> None:
+        # --- register all xposed hooks safely ---
         try:
             self._sel_hook = _SelectorHook(self)
 
@@ -355,17 +395,36 @@ class ForwardToolsPlugin(BasePlugin):
                 Integer.TYPE, Boolean.TYPE, Integer.TYPE
             )
             self.hook_method(m4, _ChunkedDelete(self))
+
+            m_clip = AndroidUtilities.getClass().getDeclaredMethod(
+                "addToClipboard", find_class("java.lang.CharSequence")
+            )
+            m_clip.setAccessible(True)
+            self.hook_method(m_clip, _ClipboardHook(self))
+
+            log("ForwardTools: hooks registered successfully")
         except Exception as e:
-            log(f"ForwardTools: nfl init failed {e}")
+            log(f"ForwardTools: hooks init failed {e}")
+
+    def _open_plugin_settings(self, context: Any = None) -> None:
+        # --- open native plugin settings directly from chat ---
+        try:
+            java_plugin = PluginsController.getInstance().plugins.get(self.id)
+            last_fragment = get_last_fragment()
+            if last_fragment and java_plugin:
+                last_fragment.presentFragment(PluginSettingsActivity(java_plugin))
+        except Exception as e:
+            log(f"ForwardTools: error opening settings {e}")
+            BulletinHelper.show_error("Failed to open settings")
 
     def _author(self, msg: Any) -> str:
-        # --- resolve actual message sender prioritizing original forwarder ---
+        # --- extract actual message sender prioritizing nested forward headers ---
         try:
             owner = getattr(msg, "messageOwner", None)
             if owner:
                 fwd = getattr(owner, "fwd_from", None)
                 if fwd:
-                    # --- hidden sender stores name directly ---
+                    # --- hidden sender stores name directly in fwd_from ---
                     raw_name = getattr(fwd, "from_name", None)
                     if raw_name and str(raw_name).strip():
                         return str(raw_name).strip()
@@ -379,9 +438,8 @@ class ForwardToolsPlugin(BasePlugin):
                             u = ctrl.getUser(uid)
                             if u:
                                 n = f"{u.first_name or ''} {u.last_name or ''}".strip()
-                                if n:
-                                    return n
-                                    
+                                if n: return n
+                                
                         cid = getattr(from_id, "channel_id", 0)
                         if cid != 0:
                             c = ctrl.getChat(cid)
@@ -394,15 +452,14 @@ class ForwardToolsPlugin(BasePlugin):
                             if c and c.title:
                                 return str(c.title).strip()
 
-            # --- fallback to direct sender ---
+            # --- fallback to direct sender if not forwarded ---
             sid = msg.getSenderId()
             ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
             if sid > 0:
                 u = ctrl.getUser(sid)
                 if u:
                     n = f"{u.first_name or ''} {u.last_name or ''}".strip()
-                    if n:
-                        return n
+                    if n: return n
             elif sid < 0:
                 c = ctrl.getChat(-sid)
                 if c and c.title:
@@ -431,7 +488,7 @@ class ForwardToolsPlugin(BasePlugin):
             if not sp:
                 return []
             bag: Dict[int, Any] = {}
-            for idx in range(2): # --- usually 2 sparse arrays for selected messages ---
+            for idx in range(2): 
                 s = sp[idx]
                 if s is None:
                     continue
@@ -446,7 +503,7 @@ class ForwardToolsPlugin(BasePlugin):
             return []
 
     def _format(self, msgs: List[Any]) -> str:
-        # --- build compact multi message text ---
+        # --- strict formatting without unnecessary empty lines ---
         ts_on: bool = self.get_setting("timestamps", False)
         dates_on: bool = self.get_setting("dates", False)
         prefix_on: bool = self.get_setting("with_label", False)
@@ -457,8 +514,13 @@ class ForwardToolsPlugin(BasePlugin):
 
         for msg in msgs:
             owner = getattr(msg, "messageOwner", None)
-            stamp: int = getattr(owner, "date", 0) if owner else 0
-            dt = datetime.fromtimestamp(stamp) if stamp else None
+            stamp = getattr(owner, "date", 0) if owner else 0
+            dt = None
+            if stamp:
+                try:
+                    dt = datetime.fromtimestamp(int(stamp))
+                except Exception:
+                    pass
 
             d_str: str = dt.strftime("%d.%m.%Y") if dt else ""
             t_str: str = dt.strftime("%H:%M") if dt else ""
@@ -468,9 +530,9 @@ class ForwardToolsPlugin(BasePlugin):
             # --- insert date separator when day changes ---
             if dates_on and d_str and d_str != cur_date:
                 if lines:
-                    lines.append("")
+                    lines.append("") 
                 lines.append(f"--- {d_str} ---")
-                lines.append("")
+                lines.append("") 
                 cur_date = d_str
                 cur_author = None # --- reset author so it prints after date ---
 
@@ -490,7 +552,7 @@ class ForwardToolsPlugin(BasePlugin):
         return "\n".join(lines)
 
     def _on_copy(self, ctx: Dict[str, Any]) -> None:
-        # --- copy selected or single message with original authors ---
+        # --- explicit fallback copy for single message via long press ---
         try:
             fragment = ctx.get("fragment")
             single = ctx.get("message")
@@ -511,13 +573,20 @@ class ForwardToolsPlugin(BasePlugin):
             AndroidUtilities.addToClipboard(result)
             BulletinHelper.show_copied_to_clipboard()
         except Exception as e:
-            log(f"ForwardTools: copy error {e}")
+            log(f"ForwardTools: explicit copy error {e}")
             BulletinHelper.show_error("Copy failed")
 
     def create_settings(self) -> List[Any]:
-        # --- native plugin settings screen with proper switches ---
+        # --- native plugin settings screen ---
         return [
             Header(text="Copy formatting"),
+            Switch(
+                key="override_native_copy",
+                text="Override native copy",
+                default=True,
+                subtext="Automatically format text when using the standard Telegram copy button for multiple messages",
+                icon="msg_copy"
+            ),
             Switch(
                 key="timestamps",
                 text="Timestamps [hh:mm]",

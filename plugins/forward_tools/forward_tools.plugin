@@ -28,7 +28,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -43,10 +43,7 @@ except Exception:
 
 _CA_CLASS = ChatActivity.getClass()
 
-# ==========================================================
-# utility helpers
-# ==========================================================
-
+# --- utility helpers ---
 def _al_to_list(java_al: Any) -> List[Any]:
     # --- convert java arraylist to python list ---
     return [java_al.get(i) for i in range(java_al.size())]
@@ -164,10 +161,7 @@ def _update_select_btn(ca: Any) -> None:
     except Exception as e:
         log(f"ForwardTools: select btn error {e}")
 
-# ==========================================================
-# hooks
-# ==========================================================
-
+# --- hooks ---
 class _ClipboardHook(MethodHook):
     def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
         self.plugin = plugin
@@ -326,10 +320,7 @@ class _ChunkedDelete(MethodHook):
             if i < len(_chunks(ids, self._SIZE)) - 1:
                 param.method.invoke(param.thisObject, param.args)
 
-# ==========================================================
-# main plugin class
-# ==========================================================
-
+# --- main plugin class ---
 class ForwardToolsPlugin(BasePlugin):
 
     def __init__(self) -> None:
@@ -507,6 +498,7 @@ class ForwardToolsPlugin(BasePlugin):
         ts_on: bool = self.get_setting("timestamps", False)
         dates_on: bool = self.get_setting("dates", False)
         prefix_on: bool = self.get_setting("with_label", False)
+        replies_on: bool = self.get_setting("format_replies", True)
 
         lines: List[str] = []
         cur_date: Optional[str] = None
@@ -544,6 +536,16 @@ class ForwardToolsPlugin(BasePlugin):
                 hdr = f"Forwarded from {author}:" if prefix_on else f"{author}:"
                 lines.append(hdr)
                 cur_author = author
+
+            # --- format reply block if message is a reply ---
+            if replies_on:
+                reply_obj = getattr(msg, "replyMessageObject", None)
+                if reply_obj:
+                    reply_author = self._author(reply_obj)
+                    reply_text = self._text(reply_obj) or "[Media]"
+                    words = reply_text.split()
+                    short_quote = " ".join(words[:5]) + ("..." if len(words) > 5 else "")
+                    body = f"> {reply_author}: {short_quote}\n{body}"
 
             # --- append message body with optional timestamp ---
             line = f"[{t_str}] {body}" if ts_on and t_str else body
@@ -586,6 +588,13 @@ class ForwardToolsPlugin(BasePlugin):
                 default=True,
                 subtext="Automatically format text when using the standard Telegram copy button for multiple messages",
                 icon="msg_copy"
+            ),
+            Switch(
+                key="format_replies",
+                text="Format replies",
+                default=True,
+                subtext="Add '> Name: text...' for replied-to messages",
+                icon="msg_reply"
             ),
             Switch(
                 key="timestamps",

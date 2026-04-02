@@ -2,28 +2,79 @@ import os
 import requests
 from typing import Dict, Any, List
 
-from base_plugin import BasePlugin, MenuItemData, MenuItemType
-from hook_utils import find_class
-from android_utils import run_on_ui_thread
-from client_utils import run_on_queue, send_message
-from ui.settings import Header, Input
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
+from hook_utils import find_class, set_private_field
+from android_utils import run_on_ui_thread, log
+from client_utils import run_on_queue
+from ui.settings import Header, Input, Selector, Text
 from ui.bulletin import BulletinHelper
 from ui.alert import AlertDialogBuilder
-from markdown_utils import parse_markdown
 
 # --- метаданные ---
 __id__ = "whisper_transcribing"
 __name__ = "Whisper Ai для распознавания речи"
 __description__ = "Пока не придумала"
 __author__ = "@insonniiia"
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 __icon__ = "hsrgustinex/39"
 __min_version__ = "11.12.0"
 
 
+# --- xposed hook for intercepting message rendering ---
+class LocalTranscriptionHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param):
+        try:
+            if not self.plugin.transcriptions:
+                return
+
+            message_object = param.args[0]
+            if not message_object:
+                return
+
+            msg_id = message_object.getId()
+            dialog_id = message_object.getDialogId()
+            cache_key = f"{msg_id}_{dialog_id}"
+
+            new_text = self.plugin.transcriptions.get(cache_key)
+            if not new_text:
+                return
+
+            if hasattr(message_object, "caption") and message_object.caption is not None:
+                message_object.caption = new_text
+                if set_private_field:
+                    try:
+                        set_private_field(message_object, "captionLayout", None)
+                    except Exception as e:
+                        log(f"caption layout reset fault: {str(e)}")
+            else:
+                try:
+                    message_object.applyNewText(new_text)
+                except Exception:
+                    message_object.messageText = new_text
+                
+                if set_private_field:
+                    try:
+                        set_private_field(message_object, "textLayout", None)
+                    except Exception as e:
+                        log(f"text layout reset fault: {str(e)}")
+
+            cell = param.thisObject
+            run_on_ui_thread(lambda: cell.invalidate())
+
+        except Exception as e:
+            log(f"local transcription hook fault: {str(e)}")
+
 class WhisperTranscriptionPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.transcriptions = {}
+        self.unhooks = []
+        self.models = ["whisper-large-v3", "whisper-large-v3-turbo"]
+
     def on_plugin_load(self):
-        # --- registering context menu item for audio messages ---
         self.add_menu_item(
             MenuItemData(
                 menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
@@ -33,31 +84,69 @@ class WhisperTranscriptionPlugin(BasePlugin):
                 condition="message.isVoice() || message.isMusic()"
             )
         )
+        self._install_hooks()
+
+    def on_plugin_unload(self):
+        for unhook in self.unhooks:
+            try:
+                unhook()
+            except Exception as e:
+                log(f"failed to unhook: {str(e)}")
+        self.unhooks.clear()
+
+    def _install_hooks(self):
+        try:
+            cell_class = find_class("org.telegram.ui.Cells.ChatMessageCell")
+            if not cell_class:
+                return
+
+            for method in cell_class.getClass().getDeclaredMethods():
+                if method.getName() == "setMessageContent":
+                    unhook = self.hook_method(method, LocalTranscriptionHook(self), priority=40)
+                    if unhook:
+                        self.unhooks.append(unhook)
+        except Exception as e:
+            log(f"hook installation fault: {str(e)}")
 
     def create_settings(self) -> List[Any]:
-        # --- generating settings screen for api configuration ---
+        # --- generating settings screen with instructions and configs ---
         return [
-            Header(text="groq api configuration"),
+            Header(text="groq api setup"),
+            Text(
+                text="1. visit console.groq.com/keys\n2. register or login\n3. generate new api key\n4. paste it below",
+                icon="msg_info"
+            ),
             Input(
                 key="groq_api_key",
-                text="groq api key",
+                text="api key",
                 default="",
-                subtext="required for whisper transcription (console.groq.com)",
-                icon="msg_settings"
+                icon="msg_key"
+            ),
+            Header(text="transcription settings"),
+            Selector(
+                key="whisper_model",
+                text="ai model",
+                items=self.models,
+                default=0,
+                icon="msg_bots"
+            ),
+            Input(
+                key="whisper_lang",
+                text="default language code",
+                default="",
+                subtext="e.g. 'ru' or 'en'. leave blank for auto-detect.",
+                icon="msg_language"
             )
         ]
 
     def _handle_transcription_click(self, context: Dict[str, Any]):
-        # --- retrieving context variables ---
         message = context.get("message")
-        dialog_id = context.get("dialog_id")
         fragment = context.get("fragment")
 
-        # --- validating required dependencies ---
-        if not message or not dialog_id or not fragment:
+        if not message or not fragment:
             return
 
-        api_key = self.get_setting("groq_api_key", "")
+        api_key = self.get_setting("groq_api_key", "").strip()
         if not api_key:
             BulletinHelper.show_error("groq api key is missing in settings", fragment)
             return
@@ -73,9 +162,9 @@ class WhisperTranscriptionPlugin(BasePlugin):
         progress_dialog.show()
 
         # --- offloading heavy network task to background queue ---
-        run_on_queue(lambda: self._process_transcription(message, dialog_id, api_key, progress_dialog, fragment))
+        run_on_queue(lambda: self._process_transcription(message, api_key, progress_dialog, fragment))
 
-    def _process_transcription(self, message: Any, dialog_id: int, api_key: str, dialog: AlertDialogBuilder, fragment: Any):
+    def _process_transcription(self, message: Any, api_key: str, dialog: AlertDialogBuilder, fragment: Any):
         # --- resolving file loader class via reflection ---
         file_loader_class = find_class("org.telegram.messenger.FileLoader")
         if not file_loader_class:
@@ -97,14 +186,21 @@ class WhisperTranscriptionPlugin(BasePlugin):
             self._cleanup_with_error(dialog, fragment, f"failed to locate local file: {str(e)}")
             return
 
-        # --- executing groq api request ---
+        # --- preparing api request payload ---
+        model_idx = self.get_setting("whisper_model", 0)
+        selected_model = self.models[model_idx] if 0 <= model_idx < len(self.models) else self.models[0]
+        lang_code = self.get_setting("whisper_lang", "").strip().lower()
+
         url = "https://api.groq.com/openai/v1/audio/transcriptions"
         headers = {"Authorization": f"Bearer {api_key}"}
+        data = {"model": selected_model}
+        if lang_code:
+            data["language"] = lang_code
         
+        # --- executing groq api request ---
         try:
             with open(file_path, "rb") as f:
                 files = {"file": (os.path.basename(file_path), f)}
-                data = {"model": "whisper-large-v3"}
                 response = requests.post(url, headers=headers, files=files, data=data, timeout=120)
         except Exception as e:
             self._cleanup_with_error(dialog, fragment, f"network execution error: {str(e)}")
@@ -126,35 +222,80 @@ class WhisperTranscriptionPlugin(BasePlugin):
             self._cleanup_with_error(dialog, fragment, "no speech detected in audio")
             return
 
-        # --- passing result to dispatcher ---
-        self._send_transcription(dialog_id, message.getId(), transcribed_text, dialog, fragment)
+        # --- passing result to ui thread state manager ---
+        self._apply_local_transcription(message, fragment, transcribed_text, dialog)
 
-    def _send_transcription(self, dialog_id: int, msg_id: int, text: str, dialog: AlertDialogBuilder, fragment: Any):
-        # --- structuring output message with standard markdown ---
-        formatted_text = f"**Transcription:**\n{text}"
+    def _apply_local_transcription(self, message_object: Any, fragment: Any, transcribed_text: str, dialog: AlertDialogBuilder):
+        msg_id = message_object.getId()
+        dialog_id = message_object.getDialogId()
+        cache_key = f"{msg_id}_{dialog_id}"
+
+        # --- formatting transcription output ---
+        formatted_transcription = f"★ | {transcribed_text}"
         
-        try:
-            parsed_message = parse_markdown(formatted_text)
-            params = {
-                "peer": dialog_id,
-                "reply_to_msg_id": msg_id,
-                "message": parsed_message.text,
-                "entities": [entity.to_tlrpc_object() for entity in parsed_message.entities]
-            }
-        except Exception as e:
-            self._cleanup_with_error(dialog, fragment, f"markdown entity compilation failed: {str(e)}")
-            return
+        # --- safely reading original message content ---
+        original_text = ""
+        if hasattr(message_object, "caption") and message_object.caption:
+            original_text = str(message_object.caption)
+        elif message_object.messageText:
+            original_text = str(message_object.messageText)
 
-        # --- synchronizing with main thread to dispatch message and dismiss dialog ---
-        def _finalize():
+        # --- appending new text to original ---
+        if original_text:
+            new_text = f"{original_text}\n\n{formatted_transcription}"
+        else:
+            new_text = formatted_transcription
+
+        self.transcriptions[cache_key] = new_text
+
+        # --- synchronizing ui updates ---
+        def _update_ui():
             try:
                 dialog.dismiss()
-                send_message(params)
-                BulletinHelper.show_success("Transcription dispatched", fragment)
+                self._force_update_via_controller(message_object, fragment, new_text)
+                BulletinHelper.show_success("transcription applied locally", fragment)
             except Exception as e:
-                BulletinHelper.show_error(f"failed to send reply: {str(e)}", fragment)
+                log(f"ui synchronization fault: {str(e)}")
 
-        run_on_ui_thread(_finalize)
+        run_on_ui_thread(_update_ui)
+
+    def _force_update_via_controller(self, message_object: Any, fragment: Any, new_text: str):
+        # --- applying text modification directly to instance ---
+        try:
+            if hasattr(message_object, "caption") and message_object.caption is not None:
+                message_object.caption = new_text
+            else:
+                try:
+                    message_object.applyNewText(new_text)
+                except Exception:
+                    message_object.messageText = new_text
+
+            # --- invalidating cached layout measurements ---
+            if set_private_field:
+                for field in ("captionLayout", "textLayout"):
+                    try:
+                        set_private_field(message_object, field, None)
+                    except Exception as e:
+                        log(f"layout cleanup fault on {field}: {str(e)}")
+
+            # --- forcing recycler view adapter to rebind view ---
+            list_view = fragment.getChatListView()
+            if not list_view:
+                return
+                
+            adapter = list_view.getAdapter()
+            if not adapter:
+                return
+
+            msg_id = message_object.getId()
+            for i in range(adapter.getItemCount()):
+                item = adapter.getItem(i)
+                if item and hasattr(item, "getId") and item.getId() == msg_id:
+                    adapter.notifyItemChanged(i)
+                    break
+
+        except Exception as e:
+            log(f"adapter targeted update fault: {str(e)}")
 
     def _cleanup_with_error(self, dialog: AlertDialogBuilder, fragment: Any, error_msg: str):
         # --- tearing down ui state gracefully on exception ---

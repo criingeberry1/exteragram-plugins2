@@ -16,7 +16,7 @@ __id__ = "whisper_transcribing"
 __name__ = "Whisper Ai для распознавания речи"
 __description__ = "Пока не придумала"
 __author__ = "@insonniiia"
-__version__ = "5.0.1"
+__version__ = "5.0.2"
 __icon__ = "hsrgustinex/39"
 __min_version__ = "11.12.0"
 
@@ -47,8 +47,11 @@ class LocalTranscriptionHook(MethodHook):
             if not new_text:
                 return
 
-            if hasattr(message_object, "caption") and message_object.caption is not None:
+            # --- applying text correctly based on media type ---
+            if message_object.isVoice() or message_object.isMusic() or (hasattr(message_object, "caption") and message_object.caption):
                 message_object.caption = new_text
+                if hasattr(message_object, "messageOwner") and message_object.messageOwner:
+                    message_object.messageOwner.message = str(new_text)
                 if set_private_field:
                     try:
                         set_private_field(message_object, "captionLayout", None)
@@ -250,12 +253,12 @@ class WhisperTranscriptionPlugin(BasePlugin):
         # --- formatting transcription output ---
         formatted_transcription = f"★ | {transcribed_text}"
         
-        # --- safely reading original message content ---
+        # --- safely reading original message content taking media type into account ---
         original_text = ""
-        if hasattr(message_object, "caption") and message_object.caption:
-            original_text = str(message_object.caption)
-        elif message_object.messageText:
-            original_text = str(message_object.messageText)
+        if message_object.isVoice() or message_object.isMusic() or (hasattr(message_object, "caption") and message_object.caption):
+            original_text = str(message_object.caption) if message_object.caption else ""
+        else:
+            original_text = str(message_object.messageText) if message_object.messageText else ""
 
         # --- appending new text to original without duplicating transcription tags ---
         if original_text and "★ |" not in original_text:
@@ -306,21 +309,26 @@ class WhisperTranscriptionPlugin(BasePlugin):
 
             new_text = self.transcriptions_cache.content.get(f"{msg_id}_{dialog_id}")
             if new_text:
-                if hasattr(target, "caption") and target.caption is not None:
+                # --- applying text correctly based on media type ---
+                if target.isVoice() or target.isMusic() or (hasattr(target, "caption") and target.caption):
                     target.caption = new_text
+                    if hasattr(target, "messageOwner") and target.messageOwner:
+                        target.messageOwner.message = str(new_text)
+                    if set_private_field:
+                        try:
+                            set_private_field(target, "captionLayout", None)
+                        except Exception:
+                            pass
                 else:
                     try:
                         target.applyNewText(new_text)
                     except Exception:
                         target.messageText = new_text
-
-            # --- cleaning up cached views sizes ---
-            if set_private_field:
-                for field in ("captionLayout", "textLayout"):
-                    try:
-                        set_private_field(target, field, None)
-                    except Exception:
-                        pass
+                    if set_private_field:
+                        try:
+                            set_private_field(target, "textLayout", None)
+                        except Exception:
+                            pass
 
             # --- triggering recycler view update ---
             list_view = fragment.getChatListView()

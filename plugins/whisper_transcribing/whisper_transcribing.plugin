@@ -1,0 +1,166 @@
+import requests
+import os
+from typing import Any, List, Optional
+
+from base_plugin import BasePlugin, MethodHook, hook_filters, HookFilter
+from hook_utils import find_class
+from android_utils import log, run_on_ui_thread
+from client_utils import run_on_queue, get_last_fragment
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Switch, Divider
+from org.telegram.messenger import R as R_tg
+
+# --- метаданные ---
+__id__ = "whisper_transcribing"
+__name__ = "Whisper Ai для распознавания речи"
+__description__ = "Пока не придумала"
+__author__ = "@insonniiia"
+__version__ = "1.0.0"
+__icon__ = "hsrgustinex/39"
+__min_version__ = "11.12.0"
+
+
+# --- hook handler for transcription request ---
+class WhisperTranscribeHook(MethodHook):
+    def __init__(self, plugin: 'WhisperPlugin'):
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any):
+        # --- param.args[0] is dialog_id, param.args[1] is MessageObject ---
+        message_object = param.args[1]
+        
+        if not self.plugin.get_setting("whisper_enabled", True):
+            return
+
+        # --- cancel native transcription request ---
+        param.setResult(None)
+        
+        # --- start background processing ---
+        run_on_queue(lambda: self.plugin.process_whisper_transcription(message_object))
+
+class WhisperPlugin(BasePlugin):
+    def on_plugin_load(self):
+        # --- find messagescontroller class ---
+        messages_controller_class = find_class("org.telegram.messenger.MessagesController")
+        if not messages_controller_class:
+            log("whisper_plugin: messagescontroller not found")
+            return
+
+        # --- find messageobject class for parameter type ---
+        message_object_class = find_class("org.telegram.messenger.MessageObject")
+        
+        try:
+            # --- target method: transcribeAudio(long dialogId, MessageObject messageObject) ---
+            target_method = messages_controller_class.getClass().getDeclaredMethod(
+                "transcribeAudio", 
+                [Long.TYPE if hasattr(Long, 'TYPE') else long, message_object_class]
+            )
+            
+            # --- register the hook ---
+            self.hook_method(target_method, WhisperTranscribeHook(self))
+            log("whisper_plugin: hooked transcribeaudio successfully")
+        except Exception as e:
+            log(f"whisper_plugin: failed to hook transcription: {str(e)}")
+
+    def process_whisper_transcription(self, message_object: Any):
+        # --- get api key and endpoint from settings ---
+        api_key = self.get_setting("openai_api_key", "")
+        endpoint = self.get_setting("whisper_api_endpoint", "https://api.openai.com/v1/audio/transcriptions")
+
+        if not api_key:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Whisper API Key is missing!"))
+            return
+
+        # --- notify user that transcription started ---
+        run_on_ui_thread(lambda: BulletinHelper.show_simple("Whisper: Обработка...", R_tg.raw.timer))
+
+        # --- extract audio file path from telegram message object ---
+        try:
+            # --- assuming the file is already downloaded by the user clicking the button ---
+            message_document = message_object.getDocument()
+            file_path = self.get_file_path(message_document)
+            
+            if not file_path or not os.path.exists(file_path):
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Файл не найден. Сначала скачайте аудио."))
+                return
+
+            # --- prepare request to whisper api ---
+            headers = {"Authorization": f"Bearer {api_key}"}
+            files = {"file": open(file_path, "rb")}
+            data = {"model": "whisper-1"}
+
+            # --- perform network call ---
+            response = requests.post(endpoint, headers=headers, files=files, data=data, timeout=30)
+            
+            if response.status_code == 200:
+                text = response.json().get("text", "Текст не распознан.")
+                # --- show result to user ---
+                run_on_ui_thread(lambda: self.show_result_bulletin(text))
+            else:
+                error_msg = f"API Error: {response.status_code}"
+                run_on_ui_thread(lambda: BulletinHelper.show_error(error_msg))
+
+        except Exception as e:
+            log(f"whisper_plugin: transcription error: {str(e)}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка при работе с Whisper AI"))
+
+    def get_file_path(self, document: Any) -> Optional[str]:
+        # --- internal telegram logic to get path from document ---
+        try:
+            # --- accessing fileloader via reflection to get local path ---
+            file_loader_class = find_class("org.telegram.messenger.FileLoader")
+            get_path_method = file_loader_class.getClass().getMethod("getPathToAttach", [find_class("org.telegram.tgnet.TLObject"), bool])
+            java_file = get_path_method.invoke(None, [document, True])
+            return java_file.toString()
+        except:
+            return None
+
+    def show_result_bulletin(self, text: str):
+        # --- display text in a multi-line bulletin with a copy button ---
+        fragment = get_last_fragment()
+        BulletinHelper.show_with_button(
+            text=text,
+            icon_res_id=R_tg.raw.info,
+            button_text="Копировать",
+            on_click=lambda: self.copy_to_clipboard(text),
+            fragment=fragment
+        )
+
+    def copy_to_clipboard(self, text: str):
+        # --- helper to copy text ---
+        try:
+            from android.content import Context
+            from android.content import ClipboardManager, ClipData
+            activity = get_last_fragment().getParentActivity()
+            clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE)
+            clip = ClipData.newPlainText("Whisper Transcription", text)
+            clipboard.setPrimaryClip(clip)
+            BulletinHelper.show_success("Текст скопирован!")
+        except Exception as e:
+            log(f"whisper_plugin: copy error: {str(e)}")
+
+    def create_settings(self) -> List[Any]:
+        return [
+            Header(text="Whisper AI Transcription"),
+            Switch(
+                key="whisper_enabled",
+                text="Включить Whisper AI",
+                default=True,
+                subtext="Заменяет стандартную транскрибацию Telegram на Whisper"
+            ),
+            Divider(),
+            Input(
+                key="openai_api_key",
+                text="OpenAI API Key",
+                default="",
+                subtext="Введите ваш ключ от OpenAI",
+                icon="msg_permissions"
+            ),
+            Input(
+                key="whisper_api_endpoint",
+                text="API Endpoint",
+                default="https://api.openai.com/v1/audio/transcriptions",
+                subtext="URL для запросов (OpenAI или свой сервер)",
+                icon="msg_link"
+            )
+        ]

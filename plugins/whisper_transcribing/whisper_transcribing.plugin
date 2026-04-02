@@ -2,12 +2,15 @@ import requests
 import os
 from typing import Any, List, Optional
 
-from base_plugin import BasePlugin, MethodHook, hook_filters, HookFilter
+# --- основные инструменты движка ---
+from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class
 from android_utils import log, run_on_ui_thread
 from client_utils import run_on_queue, get_last_fragment
 from ui.bulletin import BulletinHelper
 from ui.alert import AlertDialogBuilder
+
+# --- компоненты настроек (импортируем всё необходимое для интерфейса) ---
 from ui.settings import Header, Input, Switch, Divider, Selector
 from org.telegram.messenger import R as R_tg
 
@@ -16,165 +19,161 @@ __id__ = "whisper_transcribing"
 __name__ = "Whisper Ai для распознавания речи"
 __description__ = "Пока не придумала"
 __author__ = "@insonniiia"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __icon__ = "hsrgustinex/39"
 __min_version__ = "11.12.0"
 
 
-# --- hook handler for transcription button ---
+# --- обработчик хука для перехвата кнопки расшифровки ---
 class GroqTranscribeHook(MethodHook):
     def __init__(self, plugin: 'GroqWhisperPlugin'):
         self.plugin = plugin
 
     def before_hooked_method(self, param: Any):
-        # --- args: [long dialog_id, MessageObject message_object] ---
+        # --- аргументы: [long dialog_id, MessageObject message_object] ---
+        # --- берем второй аргумент (индекс 1), это сам объект сообщения ---
         message_object = param.args[1]
         
-        # --- check if plugin is enabled ---
+        # --- если плагин выключен в его собственных настройках, ничего не делаем ---
         if not self.plugin.get_setting("groq_enabled", True):
             return
 
-        # --- cancel native telegram transcription ---
+        # --- блокируем стандартную расшифровку телеграма ---
+        # --- это предотвращает отправку аудио на серверы TG ---
         param.setResult(None)
         
-        # --- run background processing ---
+        # --- запускаем нашу обработку в фоновом потоке ---
         run_on_queue(lambda: self.plugin.process_groq_transcription(message_object))
 
 class GroqWhisperPlugin(BasePlugin):
     def on_plugin_load(self):
-        # --- find necessary java classes ---
+        # --- ищем класс контроллера сообщений ---
         messages_controller_class = find_class("org.telegram.messenger.MessagesController")
-        message_object_class = find_class("org.telegram.messenger.MessageObject")
         
-        if not messages_controller_class or not message_object_class:
-            log("groq_whisper: core classes not found")
+        if not messages_controller_class:
+            log("groq_whisper: messagescontroller class not found")
             return
 
         try:
-            # --- hook transcribeAudio method ---
-            # --- using reflection to get the method with long and messageobject params ---
-            long_class = find_class("java.lang.Long").getField("TYPE").get(None)
-            target_method = messages_controller_class.getClass().getDeclaredMethod(
+            # --- используем hook_all_methods, чтобы не возиться с типами аргументов java ---
+            # --- это самый надежный способ «попасть» в метод transcribeAudio ---
+            self.hook_all_methods(
+                messages_controller_class, 
                 "transcribeAudio", 
-                long_class, 
-                message_object_class
+                GroqTranscribeHook(self)
             )
-            
-            self.hook_method(target_method, GroqTranscribeHook(self))
-            log("groq_whisper: hooked successfully")
+            log("groq_whisper: hook applied successfully to all transcribeAudio methods")
         except Exception as e:
-            log(f"groq_whisper: hook error: {str(e)}")
+            log(f"groq_whisper: loading error: {str(e)}")
 
     def process_groq_transcription(self, message_object: Any):
-        # --- get configuration from settings ---
+        # --- тянем настройки, которые ты укажешь в меню (когда оно появится) ---
         api_key = self.get_setting("groq_api_key", "")
         model = self.get_setting("groq_model_name", "whisper-large-v3")
         endpoint = "https://api.groq.com/openai/v1/audio/transcriptions"
 
         if not api_key:
-            run_on_ui_thread(lambda: BulletinHelper.show_error("Groq API Key не указан!"))
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Введи Groq API Key в настройках!"))
             return
 
-        # --- indicate that plugin is working (non-native feel) ---
+        # --- показываем, что плагин начал работу (визуальный отклик) ---
         run_on_ui_thread(lambda: BulletinHelper.show_simple(
-            "Groq AI: Обработка аудио...", 
-            R_tg.raw.lightning # --- lightning icon for speed indication ---
+            "Groq AI: Транскрибация...", 
+            R_tg.raw.lightning
         ))
 
         try:
-            # --- get file path from telegram storage ---
+            # --- достаем путь к файлу из сообщения ---
             document = message_object.getDocument()
             file_path = self._get_local_path(document)
             
             if not file_path or not os.path.exists(file_path):
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Файл не скачан или не найден."))
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Аудио еще не скачано. Прослушай его сначала."))
                 return
 
-            # --- prepare multipart request ---
+            # --- готовим запрос к groq cloud ---
             headers = {"Authorization": f"Bearer {api_key}"}
-            files = {"file": (os.path.basename(file_path), open(file_path, "rb"), "audio/ogg")}
-            data = {"model": model, "response_format": "json"}
+            # --- читаем файл ---
+            with open(file_path, "rb") as f:
+                files = {"file": (os.path.basename(file_path), f, "audio/ogg")}
+                data = {"model": model, "response_format": "json"}
 
-            # --- api call ---
-            response = requests.post(endpoint, headers=headers, files=files, data=data, timeout=25)
+                # --- отправляем ---
+                response = requests.post(endpoint, headers=headers, files=files, data=data, timeout=30)
             
             if response.status_code == 200:
-                result_text = response.json().get("text", "")
-                # --- show result in a dedicated dialog ---
-                run_on_ui_thread(lambda: self._show_result_dialog(result_text))
+                text = response.json().get("text", "Пустой результат.")
+                # --- выводим результат в диалог ---
+                run_on_ui_thread(lambda: self._show_result_dialog(text))
             else:
-                log(f"groq_error: {response.text}")
-                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Groq API Error: {response.status_code}"))
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Groq Error: {response.status_code}"))
 
         except Exception as e:
-            log(f"groq_whisper: critical error: {str(e)}")
-            run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка плагина Groq"))
+            log(f"groq_whisper: processing error: {str(e)}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Ошибка при запросе к Whisper"))
 
     def _get_local_path(self, document: Any) -> Optional[str]:
-        # --- internal method to resolve telegram file path ---
+        # --- магия получения пути к файлу через внутренний загрузчик телеги ---
         try:
             file_loader = find_class("org.telegram.messenger.FileLoader")
-            method = file_loader.getClass().getMethod("getPathToAttach", find_class("org.telegram.tgnet.TLObject"), bool)
-            java_file = method.invoke(None, document, True)
-            return java_file.toString()
+            # --- вызываем статический метод getPathToAttach ---
+            method = file_loader.getClass().getMethod("getPathToAttach", [find_class("org.telegram.tgnet.TLObject"), bool])
+            java_file = method.invoke(None, [document, True])
+            return str(java_file)
         except:
             return None
 
     def _show_result_dialog(self, text: str):
-        # --- using alertdialogbuilder to make it obvious it's a plugin result ---
+        # --- создаем окно с результатом (AlertDialogBuilder) ---
         activity = get_last_fragment().getParentActivity()
         if not activity:
             return
 
         builder = AlertDialogBuilder(activity)
-        builder.set_title("Groq Whisper (Plugin)")
+        builder.set_title("Whisper (Groq Cloud)")
         builder.set_message(text)
         
-        # --- button to copy text ---
-        def on_copy(b, w):
-            self._copy_to_clipboard(text)
-            b.dismiss()
-
-        builder.set_positive_button("Копировать", on_copy)
+        # --- добавляем кнопку копирования для удобства ---
+        builder.set_positive_button("Скопировать", lambda b, w: self._copy_and_close(text, b))
         builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
         builder.show()
 
-    def _copy_to_clipboard(self, text: str):
-        # --- utility for clipboard ---
+    def _copy_and_close(self, text: str, builder: Any):
         try:
             from android.content import Context, ClipData
             activity = get_last_fragment().getParentActivity()
             clipboard = activity.getSystemService(Context.CLIPBOARD_SERVICE)
-            clip = ClipData.newPlainText("Groq", text)
+            clip = ClipData.newPlainText("Whisper", text)
             clipboard.setPrimaryClip(clip)
             BulletinHelper.show_success("Текст скопирован")
         except:
             pass
+        builder.dismiss()
 
+    # --- ВОТ ЭТОТ МЕТОД РИСУЕТ ШЕСТЕРЕНКУ В МЕНЮ ПЛАГИНОВ ---
     def create_settings(self) -> List[Any]:
         return [
-            Header(text="Настройки Groq Cloud"),
+            Header(text="Whisper via Groq Cloud"),
             Switch(
                 key="groq_enabled",
-                text="Использовать Groq для расшифровки",
+                text="Включить замену",
                 default=True,
-                subtext="Заменяет нативную расшифровку на Groq Whisper"
+                subtext="Использовать Groq вместо нативной расшифровки"
             ),
             Divider(),
             Input(
                 key="groq_api_key",
-                text="API Key",
+                text="Groq API Key",
                 default="",
-                subtext="Ключ из console.groq.com",
+                subtext="Вставь свой ключ с console.groq.com",
                 icon="msg_permissions"
             ),
             Selector(
                 key="groq_model_name",
-                text="Модель Whisper",
+                text="Выбор модели",
                 items=["whisper-large-v3", "distil-whisper-large-v3-en"],
                 default=0,
-                subtext="Large — точнее, Distil — быстрее"
+                subtext="Large — лучше для русского, Distil — быстрее"
             ),
-            Divider(text="Информация"),
-            Header(text="Плагин перехватывает нажатие кнопки расшифровки и выводит результат в отдельное окно.")
+            Divider(text="Настройки плагина подтянутся после правильной загрузки кода.")
         ]

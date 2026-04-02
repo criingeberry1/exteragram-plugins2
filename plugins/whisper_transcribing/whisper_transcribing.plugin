@@ -1,11 +1,12 @@
 import os
 import requests
+import traceback
 from typing import Dict, Any, List
 
 from base_plugin import BasePlugin, MenuItemData, MenuItemType, MethodHook
 from hook_utils import find_class, set_private_field
 from android_utils import run_on_ui_thread, log
-from client_utils import run_on_queue
+from client_utils import run_on_queue, get_messages_controller
 from ui.settings import Header, Input, Selector, Text
 from ui.bulletin import BulletinHelper
 from ui.alert import AlertDialogBuilder
@@ -15,30 +16,34 @@ __id__ = "whisper_transcribing"
 __name__ = "Whisper Ai для распознавания речи"
 __description__ = "Пока не придумала"
 __author__ = "@insonniiia"
-__version__ = "5.0.0"
+__version__ = "5.0.1"
 __icon__ = "hsrgustinex/39"
 __min_version__ = "11.12.0"
 
 
-# --- xposed hook for intercepting message rendering ---
+# --- safe import of zwylib for local caching ---
+try:
+    import zwylib
+except ImportError:
+    zwylib = None
+
+# --- xposed hook for local transcription rendering via zwylib ---
 class LocalTranscriptionHook(MethodHook):
     def __init__(self, plugin):
         self.plugin = plugin
 
     def before_hooked_method(self, param):
         try:
-            if not self.plugin.transcriptions:
+            cache = self.plugin.transcriptions_cache
+            if not cache or not cache.content:
                 return
 
             message_object = param.args[0]
             if not message_object:
                 return
 
-            msg_id = message_object.getId()
-            dialog_id = message_object.getDialogId()
-            cache_key = f"{msg_id}_{dialog_id}"
-
-            new_text = self.plugin.transcriptions.get(cache_key)
+            key = f"{message_object.getId()}_{message_object.getDialogId()}"
+            new_text = cache.content.get(key)
             if not new_text:
                 return
 
@@ -47,8 +52,8 @@ class LocalTranscriptionHook(MethodHook):
                 if set_private_field:
                     try:
                         set_private_field(message_object, "captionLayout", None)
-                    except Exception as e:
-                        log(f"caption layout reset fault: {str(e)}")
+                    except Exception:
+                        pass
             else:
                 try:
                     message_object.applyNewText(new_text)
@@ -58,33 +63,45 @@ class LocalTranscriptionHook(MethodHook):
                 if set_private_field:
                     try:
                         set_private_field(message_object, "textLayout", None)
-                    except Exception as e:
-                        log(f"text layout reset fault: {str(e)}")
+                    except Exception:
+                        pass
 
             cell = param.thisObject
             run_on_ui_thread(lambda: cell.invalidate())
 
         except Exception as e:
-            log(f"local transcription hook fault: {str(e)}")
+            log(f"local transcription hook fault: {e}")
 
 class WhisperTranscriptionPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
-        self.transcriptions = {}
+        self.transcriptions_cache = None
         self.unhooks = []
         self.models = ["whisper-large-v3", "whisper-large-v3-turbo"]
 
     def on_plugin_load(self):
-        self.add_menu_item(
-            MenuItemData(
-                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
-                text="Transcribe Audio",
-                on_click=self._handle_transcription_click,
-                icon="msg_translate",
-                condition="message.isVoice() || message.isMusic()"
+        # --- validating zwylib presence before initialization ---
+        if zwylib is None:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("zwylib is missing! please install it."))
+            return
+
+        try:
+            # --- initializing persistent json cache file ---
+            self.transcriptions_cache = zwylib.JsonCacheFile("WhisperTranscriptions_data", {})
+            
+            self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                    text="Transcribe Audio",
+                    on_click=self._handle_transcription_click,
+                    icon="msg_translate",
+                    condition="message.isVoice() || message.isMusic()"
+                )
             )
-        )
-        self._install_hooks()
+            self._install_hooks()
+        except Exception as e:
+            log(f"plugin load fault: {e}")
+            traceback.print_exc()
 
     def on_plugin_unload(self):
         for unhook in self.unhooks:
@@ -102,7 +119,7 @@ class WhisperTranscriptionPlugin(BasePlugin):
 
             for method in cell_class.getClass().getDeclaredMethods():
                 if method.getName() == "setMessageContent":
-                    unhook = self.hook_method(method, LocalTranscriptionHook(self), priority=40)
+                    unhook = self.hook_method(method, LocalTranscriptionHook(self), priority=30)
                     if unhook:
                         self.unhooks.append(unhook)
         except Exception as e:
@@ -228,7 +245,7 @@ class WhisperTranscriptionPlugin(BasePlugin):
     def _apply_local_transcription(self, message_object: Any, fragment: Any, transcribed_text: str, dialog: AlertDialogBuilder):
         msg_id = message_object.getId()
         dialog_id = message_object.getDialogId()
-        cache_key = f"{msg_id}_{dialog_id}"
+        key = f"{msg_id}_{dialog_id}"
 
         # --- formatting transcription output ---
         formatted_transcription = f"★ | {transcribed_text}"
@@ -240,59 +257,86 @@ class WhisperTranscriptionPlugin(BasePlugin):
         elif message_object.messageText:
             original_text = str(message_object.messageText)
 
-        # --- appending new text to original ---
-        if original_text:
+        # --- appending new text to original without duplicating transcription tags ---
+        if original_text and "★ |" not in original_text:
             new_text = f"{original_text}\n\n{formatted_transcription}"
+        elif original_text: 
+            parts = original_text.split("★ |")
+            new_text = f"{parts[0].strip()}\n\n{formatted_transcription}"
         else:
             new_text = formatted_transcription
 
-        self.transcriptions[cache_key] = new_text
+        # --- saving to zwylib cache and writing to disk ---
+        self.transcriptions_cache.content[key] = new_text.strip()
+        self.transcriptions_cache.write()
 
-        # --- synchronizing ui updates ---
+        # --- synchronizing ui updates via controller ---
         def _update_ui():
             try:
                 dialog.dismiss()
-                self._force_update_via_controller(message_object, fragment, new_text)
+                self._force_update_via_controller(message_object, fragment)
                 BulletinHelper.show_success("transcription applied locally", fragment)
             except Exception as e:
                 log(f"ui synchronization fault: {str(e)}")
 
         run_on_ui_thread(_update_ui)
 
-    def _force_update_via_controller(self, message_object: Any, fragment: Any, new_text: str):
-        # --- applying text modification directly to instance ---
+    def _force_update_via_controller(self, message_object: Any, fragment: Any):
+        # --- updating the central telegram messages cache ---
         try:
-            if hasattr(message_object, "caption") and message_object.caption is not None:
-                message_object.caption = new_text
-            else:
-                try:
-                    message_object.applyNewText(new_text)
-                except Exception:
-                    message_object.messageText = new_text
+            controller = get_messages_controller()
+            if not controller:
+                return
 
-            # --- invalidating cached layout measurements ---
+            dialog_id = message_object.getDialogId()
+            msg_id = message_object.getId()
+
+            messages = controller.getMessagesStorage().getMessages(dialog_id, False)
+            if not messages:
+                return
+
+            target = None
+            for msg in messages:
+                if msg.getId() == msg_id:
+                    target = msg
+                    break
+
+            if not target:
+                return
+
+            new_text = self.transcriptions_cache.content.get(f"{msg_id}_{dialog_id}")
+            if new_text:
+                if hasattr(target, "caption") and target.caption is not None:
+                    target.caption = new_text
+                else:
+                    try:
+                        target.applyNewText(new_text)
+                    except Exception:
+                        target.messageText = new_text
+
+            # --- cleaning up cached views sizes ---
             if set_private_field:
                 for field in ("captionLayout", "textLayout"):
                     try:
-                        set_private_field(message_object, field, None)
-                    except Exception as e:
-                        log(f"layout cleanup fault on {field}: {str(e)}")
+                        set_private_field(target, field, None)
+                    except Exception:
+                        pass
 
-            # --- forcing recycler view adapter to rebind view ---
+            # --- triggering recycler view update ---
             list_view = fragment.getChatListView()
             if not list_view:
                 return
                 
             adapter = list_view.getAdapter()
-            if not adapter:
-                return
-
-            msg_id = message_object.getId()
-            for i in range(adapter.getItemCount()):
-                item = adapter.getItem(i)
-                if item and hasattr(item, "getId") and item.getId() == msg_id:
-                    adapter.notifyItemChanged(i)
-                    break
+            if adapter:
+                position = -1
+                for i in range(adapter.getItemCount()):
+                    item = adapter.getItem(i)
+                    if item and item.getId() == msg_id:
+                        position = i
+                        break
+                if position != -1:
+                    adapter.notifyItemChanged(position)
 
         except Exception as e:
             log(f"adapter targeted update fault: {str(e)}")

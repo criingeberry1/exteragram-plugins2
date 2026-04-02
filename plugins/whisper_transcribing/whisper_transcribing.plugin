@@ -1,192 +1,167 @@
-import requests
 import os
-import traceback
-from typing import Any, List, Dict, Optional
+import requests
+from typing import Dict, Any, List
 
-# --- импорт базовых системных компонентов ---
-from base_plugin import BasePlugin, MethodReplacement, MethodHook, HookResult, HookStrategy
-from hook_utils import find_class, set_private_field
-from android_utils import log, run_on_ui_thread
-from client_utils import run_on_queue, get_last_fragment
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from hook_utils import find_class
+from android_utils import run_on_ui_thread
+from client_utils import run_on_queue, send_message
+from ui.settings import Header, Input
 from ui.bulletin import BulletinHelper
-
-# --- компоненты интерфейса ---
-from ui.settings import Header, Input, Switch, Divider, Selector
-from org.telegram.messenger import R as R_tg
+from ui.alert import AlertDialogBuilder
+from markdown_utils import parse_markdown
 
 # --- метаданные ---
 __id__ = "whisper_transcribing"
 __name__ = "Whisper Ai для распознавания речи"
 __description__ = "Пока не придумала"
 __author__ = "@insonniiia"
-__version__ = "3.0.0"
+__version__ = "4.0.0"
 __icon__ = "hsrgustinex/39"
 __min_version__ = "11.12.0"
 
 
-# --- глобальный кэш для хранения транскрипций в рамках сессии ---
-transcription_cache: Dict[str, str] = {}
-
-# --- хук для внедрения текста в ячейку чата ---
-class MessageContentHook(MethodHook):
-    def __init__(self, plugin: 'GroqWhisperPlugin'):
-        self.plugin = plugin
-        super(MessageContentHook, self).__init__()
-
-    def before_hooked_method(self, param: Any):
-        # --- аргумент 0 это messageobject ---
-        try:
-            message_object = param.args[0]
-            if not message_object:
-                return
-
-            # --- формируем уникальный ключ сообщения ---
-            msg_key = f"{message_object.getId()}_{message_object.getDialogId()}"
-            
-            # --- если в кэше есть текст для этого сообщения ---
-            if msg_key in transcription_cache:
-                new_text = transcription_cache[msg_key]
-                
-                # --- подменяем текст в объекте ---
-                if hasattr(message_object, "caption") and message_object.caption is not None:
-                    message_object.caption = new_text
-                    set_private_field(message_object, "captionLayout", None)
-                else:
-                    try:
-                        message_object.applyNewText(new_text)
-                    except:
-                        message_object.messageText = new_text
-                    set_private_field(message_object, "textLayout", None)
-        except:
-            pass
-
-# --- замена метода запуска транскрибации ---
-class TranscribeReplacement(MethodReplacement):
-    def __init__(self, plugin: 'GroqWhisperPlugin'):
-        self.plugin = plugin
-        super(TranscribeReplacement, self).__init__()
-
-    def replace_hooked_method(self, param: Any):
-        # --- полностью блокируем натив и запускаем свою логику ---
-        try:
-            msg_obj = None
-            for arg in param.args:
-                if arg and "MessageObject" in str(arg.getClass().getName()):
-                    msg_obj = arg
-                    break
-            
-            if msg_obj:
-                run_on_queue(lambda: self.plugin.process_whisper_locally(msg_obj))
-        except:
-            log(traceback.format_exc())
-        return None
-
-class GroqWhisperPlugin(BasePlugin):
-    def __init__(self):
-        super().__init__()
-        self.unhooks: List[Any] = []
-
+class WhisperTranscriptionPlugin(BasePlugin):
     def on_plugin_load(self):
-        # --- блокируем сетевой запрос тг ---
-        self.add_hook("TL_messages_transcribeAudio")
-        
-        try:
-            # --- 1. заменяем логику нажатия кнопки ---
-            controller = find_class("org.telegram.messenger.MessagesController")
-            if controller:
-                self.hook_all_methods(controller, "transcribeAudio", TranscribeReplacement(self))
-            
-            # --- 2. хукаем отрисовку ячейки сообщения ---
-            cell_class = find_class("org.telegram.ui.Cells.ChatMessageCell")
-            if cell_class:
-                # --- ищем метод setmessagecontent через рефлексию ---
-                for method in cell_class.getClass().getDeclaredMethods():
-                    if method.getName() == "setMessageContent":
-                        self.unhooks.append(self.hook_method(method, MessageContentHook(self)))
-            
-            log("groq_local: all hooks installed")
-        except:
-            log(traceback.format_exc())
-
-    def pre_request_hook(self, name: str, account: int, request: Any) -> HookResult:
-        # --- отменяем нативный запрос к серверам ---
-        if name == "TL_messages_transcribeAudio":
-            return HookResult(strategy=HookStrategy.CANCEL)
-        return HookResult()
-
-    def process_whisper_locally(self, msg_obj: Any):
-        api_key = self.get_setting("gro_key", "")
-        if not api_key:
-            run_on_ui_thread(lambda: BulletinHelper.show_error("Нужен Groq API Key!"))
-            return
-
-        run_on_ui_thread(lambda: BulletinHelper.show_simple("Whisper: Обработка...", R_tg.raw.transcribe))
-
-        try:
-            # --- получение пути к файлу ---
-            doc = msg_obj.getDocument()
-            path = self._get_path(doc)
-            
-            if not path or not os.path.exists(path):
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Сначала скачай аудио!"))
-                return
-
-            # --- запрос к groq ---
-            headers = {"Authorization": f"Bearer {api_key}"}
-            with open(path, "rb") as f:
-                files = {"file": (os.path.basename(path), f, "audio/ogg")}
-                data = {"model": "whisper-large-v3"}
-                resp = requests.post("https://api.groq.com/openai/v1/audio/transcriptions", headers=headers, files=files, data=data, timeout=30)
-
-            if resp.status_code == 200:
-                text = resp.json().get("text", "")
-                msg_key = f"{msg_obj.getId()}_{msg_obj.getDialogId()}"
-                
-                # --- сохраняем в кэш и форсируем обновление ---
-                transcription_cache[msg_key] = "[Whisper]: " + text
-                run_on_ui_thread(lambda: self._force_update_cell(msg_obj))
-            else:
-                run_on_ui_thread(lambda: BulletinHelper.show_error(f"API Error: {resp.status_code}"))
-
-        except:
-            log(traceback.format_exc())
-
-    def _get_path(self, document: Any) -> Optional[str]:
-        try:
-            loader = find_class("org.telegram.messenger.FileLoader")
-            method = loader.getClass().getMethod("getPathToAttach", [find_class("org.telegram.tgnet.TLObject"), bool])
-            return str(method.invoke(None, [document, True]))
-        except:
-            return None
-
-    def _force_update_cell(self, msg_obj: Any):
-        # --- заставляем список чата перерисовать конкретное сообщение ---
-        try:
-            fragment = get_last_fragment()
-            if not fragment: return
-            
-            list_view = fragment.getChatListView()
-            if not list_view: return
-            
-            adapter = list_view.getAdapter()
-            if not adapter: return
-
-            # --- ищем позицию сообщения в адаптере ---
-            msg_id = msg_obj.getId()
-            for i in range(adapter.getItemCount()):
-                item = adapter.getItem(i)
-                if item and hasattr(item, "getId") and item.getId() == msg_id:
-                    adapter.notifyItemChanged(i)
-                    break
-            
-            BulletinHelper.show_success("Готово!")
-        except:
-            pass
+        # --- registering context menu item for audio messages ---
+        self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                text="Transcribe Audio",
+                on_click=self._handle_transcription_click,
+                icon="msg_translate",
+                condition="message.isVoice() || message.isMusic()"
+            )
+        )
 
     def create_settings(self) -> List[Any]:
+        # --- generating settings screen for api configuration ---
         return [
-            Header(text="Whisper Local Injector"),
-            Input(key="gro_key", text="Groq API Key", default="", icon="msg_permissions"),
-            Divider(),
-            Header(text="Результат будет вписан прямо в текст сообщения локально.")
+            Header(text="groq api configuration"),
+            Input(
+                key="groq_api_key",
+                text="groq api key",
+                default="",
+                subtext="required for whisper transcription (console.groq.com)",
+                icon="msg_settings"
+            )
         ]
+
+    def _handle_transcription_click(self, context: Dict[str, Any]):
+        # --- retrieving context variables ---
+        message = context.get("message")
+        dialog_id = context.get("dialog_id")
+        fragment = context.get("fragment")
+
+        # --- validating required dependencies ---
+        if not message or not dialog_id or not fragment:
+            return
+
+        api_key = self.get_setting("groq_api_key", "")
+        if not api_key:
+            BulletinHelper.show_error("groq api key is missing in settings", fragment)
+            return
+
+        activity = fragment.getParentActivity()
+        if not activity:
+            return
+
+        # --- displaying blocking loading spinner on ui thread ---
+        progress_dialog = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+        progress_dialog.set_title("Transcribing audio...")
+        progress_dialog.set_cancelable(False)
+        progress_dialog.show()
+
+        # --- offloading heavy network task to background queue ---
+        run_on_queue(lambda: self._process_transcription(message, dialog_id, api_key, progress_dialog, fragment))
+
+    def _process_transcription(self, message: Any, dialog_id: int, api_key: str, dialog: AlertDialogBuilder, fragment: Any):
+        # --- resolving file loader class via reflection ---
+        file_loader_class = find_class("org.telegram.messenger.FileLoader")
+        if not file_loader_class:
+            self._cleanup_with_error(dialog, fragment, "internal error finding file loader")
+            return
+
+        # --- retrieving local file path from telegram cache ---
+        try:
+            account = message.currentAccount
+            file_loader_instance = file_loader_class.getInstance(account)
+            file_obj = file_loader_instance.getPathToMessage(message.messageOwner)
+
+            if not file_obj or not file_obj.exists():
+                self._cleanup_with_error(dialog, fragment, "audio file is not downloaded locally")
+                return
+
+            file_path = file_obj.getAbsolutePath()
+        except Exception as e:
+            self._cleanup_with_error(dialog, fragment, f"failed to locate local file: {str(e)}")
+            return
+
+        # --- executing groq api request ---
+        url = "https://api.groq.com/openai/v1/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        
+        try:
+            with open(file_path, "rb") as f:
+                files = {"file": (os.path.basename(file_path), f)}
+                data = {"model": "whisper-large-v3"}
+                response = requests.post(url, headers=headers, files=files, data=data, timeout=120)
+        except Exception as e:
+            self._cleanup_with_error(dialog, fragment, f"network execution error: {str(e)}")
+            return
+
+        # --- validating rest api response state ---
+        if response.status_code != 200:
+            self._cleanup_with_error(dialog, fragment, f"groq api rejected request: {response.status_code}")
+            return
+
+        try:
+            response_data = response.json()
+            transcribed_text = response_data.get("text", "").strip()
+        except Exception as e:
+            self._cleanup_with_error(dialog, fragment, f"json parsing fault: {str(e)}")
+            return
+
+        if not transcribed_text:
+            self._cleanup_with_error(dialog, fragment, "no speech detected in audio")
+            return
+
+        # --- passing result to dispatcher ---
+        self._send_transcription(dialog_id, message.getId(), transcribed_text, dialog, fragment)
+
+    def _send_transcription(self, dialog_id: int, msg_id: int, text: str, dialog: AlertDialogBuilder, fragment: Any):
+        # --- structuring output message with standard markdown ---
+        formatted_text = f"**Transcription:**\n{text}"
+        
+        try:
+            parsed_message = parse_markdown(formatted_text)
+            params = {
+                "peer": dialog_id,
+                "reply_to_msg_id": msg_id,
+                "message": parsed_message.text,
+                "entities": [entity.to_tlrpc_object() for entity in parsed_message.entities]
+            }
+        except Exception as e:
+            self._cleanup_with_error(dialog, fragment, f"markdown entity compilation failed: {str(e)}")
+            return
+
+        # --- synchronizing with main thread to dispatch message and dismiss dialog ---
+        def _finalize():
+            try:
+                dialog.dismiss()
+                send_message(params)
+                BulletinHelper.show_success("Transcription dispatched", fragment)
+            except Exception as e:
+                BulletinHelper.show_error(f"failed to send reply: {str(e)}", fragment)
+
+        run_on_ui_thread(_finalize)
+
+    def _cleanup_with_error(self, dialog: AlertDialogBuilder, fragment: Any, error_msg: str):
+        # --- tearing down ui state gracefully on exception ---
+        def _teardown():
+            try:
+                dialog.dismiss()
+                BulletinHelper.show_error(error_msg, fragment)
+            except Exception:
+                pass
+        run_on_ui_thread(_teardown)

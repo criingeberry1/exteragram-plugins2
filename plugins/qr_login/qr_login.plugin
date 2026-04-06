@@ -1,7 +1,5 @@
-import json
-from xposed import MethodHook
-from base_plugin import BasePlugin, hook_filters
-from filters import ArgumentIsNull, ResultIsInstanceOf
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class
 from ui.bulletin import BulletinHelper
 from org.telegram.messenger import R as R_tg
 
@@ -10,63 +8,99 @@ __id__ = "qr_login"
 __name__ = "Login with QR"
 __description__ = "v1"
 __author__ = "@insonniiia"
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 __icon__ = "sticks_09490_by_TgEmodziBot/12"
 __min_version__ = "11.12.0"
 
 
-class EliteLoginReverserPlugin(BasePlugin):
-    # --- initializing the elite telegram reverse engineering plugin ---
-    def on_plugin_load(self):
-        # --- registering the central state machine hook for loginactivity ---
-        self.hook_method("org.telegram.ui.LoginActivity#setPage", self.on_set_page_intercepted)
-        # --- registering the hook for qr code token payload parsing ---
-        self.hook_method("org.telegram.messenger.MessagesController#acceptLoginToken", self.on_accept_login_token)
-        # --- registering the hook for datacenter migration handling ---
-        self.hook_method("org.telegram.messenger.MessagesController#importLoginToken", self.on_import_login_token)
+class SetPageHook(MethodHook):
+    def __init__(self, plugin):
+        # --- storing plugin reference for logging ---
+        self.plugin = plugin
 
-    # --- cleanup and memory release procedures ---
+    # --- intercepting ui state transitions ---
+    def before_hooked_method(self, param):
+        try:
+            # --- validating arguments existence ---
+            if not param.args:
+                return
+            
+            # --- reading the first argument which is the page index ---
+            page_index = param.args[0]
+            
+            if page_index == 0:
+                BulletinHelper.show_info("intercepted view_phone_input state transition")
+            elif page_index == 12:
+                BulletinHelper.show_success("email two factor authentication state intercepted")
+            elif page_index == 18:
+                BulletinHelper.show_simple("payment gateway state detected", R_tg.raw.timer)
+        except Exception as e:
+            # --- logging unexpected parsing errors ---
+            self.plugin.log("failed to process setpage hook: " + str(e))
+
+class AcceptLoginTokenHook(MethodHook):
+    def __init__(self, plugin):
+        # --- storing plugin reference for logging ---
+        self.plugin = plugin
+
+    # --- intercepting token acceptance ---
+    def before_hooked_method(self, param):
+        try:
+            # --- checking payload validity ---
+            if param.args and param.args[0] is not None:
+                BulletinHelper.show_simple("qr code authentication token captured", R_tg.raw.info)
+        except Exception as e:
+            # --- logging unexpected token payload errors ---
+            self.plugin.log("failed to process login token: " + str(e))
+
+class ImportLoginTokenHook(MethodHook):
+    def __init__(self, plugin):
+        # --- storing plugin reference for logging ---
+        self.plugin = plugin
+
+    # --- intercepting token import ---
+    def before_hooked_method(self, param):
+        try:
+            # --- executing visual feedback for datacenter migration ---
+            BulletinHelper.show_success("cross datacenter token migration initiated")
+        except Exception as e:
+            # --- logging migration visual feedback failure ---
+            self.plugin.log("failed to notify token import: " + str(e))
+
+class EliteLoginReverserPlugin(BasePlugin):
+    # --- loading the elite plugin ---
+    def on_plugin_load(self):
+        try:
+            # --- resolving target classes via reflection ---
+            login_activity_class = find_class("org.telegram.ui.LoginActivity")
+            messages_controller_class = find_class("org.telegram.messenger.MessagesController")
+            
+            if login_activity_class:
+                # --- registering login activity hooks dynamically ---
+                self.hook_all_methods(login_activity_class, "setPage", SetPageHook(self))
+            else:
+                # --- alerting user about missing class ---
+                BulletinHelper.show_error("failed to resolve login activity class")
+                
+            if messages_controller_class:
+                # --- registering messages controller hooks dynamically ---
+                self.hook_all_methods(messages_controller_class, "acceptLoginToken", AcceptLoginTokenHook(self))
+                self.hook_all_methods(messages_controller_class, "importLoginToken", ImportLoginTokenHook(self))
+            else:
+                # --- alerting user about missing messages controller class ---
+                BulletinHelper.show_error("failed to resolve messages controller class")
+                
+        except Exception as e:
+            # --- handling critical initialization errors ---
+            self.log("critical error during plugin initialization: " + str(e))
+            BulletinHelper.show_error("plugin initialization failed check logs")
+
+    # --- releasing resources ---
     def on_plugin_unload(self):
         # --- silent memory cleanup ---
         pass
 
-    # --- application lifecycle management ---
+    # --- handling app lifecycle events ---
     def on_app_event(self, event_type):
         # --- state preservation logic ---
         pass
-
-    # --- intercepting the ui state transition dynamically ---
-    def on_set_page_intercepted(self, param):
-        # --- extracting the target page index from java context ---
-        page_index = param.args
-        
-        # --- zero index represents the initial phone input state ---
-        if page_index == 0:
-            BulletinHelper.show_info("intercepted view_phone_input state transition")
-        # --- index twelve represents the email addition state for 2fa ---
-        elif page_index == 12:
-            BulletinHelper.show_success("email two factor authentication state intercepted")
-        # --- index eighteen represents the internal payment transition ---
-        elif page_index == 18:
-            BulletinHelper.show_simple("payment gateway state detected", R_tg.raw.timer)
-        
-        # --- returning control to the original java method execution ---
-        return param.getResult()
-
-    # --- intercepting token acceptance for qr code login ---
-    def on_accept_login_token(self, param):
-        # --- extracting the raw byte array token payload ---
-        token_bytes = param.args
-        
-        if token_bytes is not None:
-            # --- providing immediate native visual feedback to the user ---
-            BulletinHelper.show_simple("qr code authentication token captured", R_tg.raw.info)
-            
-        # --- returning control flow ---
-        return param.getResult()
-
-    # --- intercepting token import during datacenter mismatch ---
-    def on_import_login_token(self, param):
-        # --- handling the dc migration logic gracefully ---
-        BulletinHelper.show_success("cross datacenter token migration initiated")
-        return param.getResult()

@@ -4,6 +4,7 @@ from android_utils import OnClickListener
 from ui.bulletin import BulletinHelper
 from typing import Any, Optional
 from java.lang import Integer, Boolean
+import java.lang.reflect.Modifier as Modifier
 
 # --- import android ui classes ---
 from android.widget import ImageView, FrameLayout
@@ -18,14 +19,14 @@ __id__ = "qr_login"
 __name__ = "Login with QR"
 __description__ = "v1"
 __author__ = "@insonniiia"
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 __icon__ = "sticks_09490_by_TgEmodziBot/12"
 __min_version__ = "11.12.0"
 
 
 class QRLoginPlugin(BasePlugin):
 
-    _qr_view_index: int = 12
+    _qr_view_index: int = -1
     _qr_button: Optional[Any] = None
 
     def on_plugin_load(self) -> None:
@@ -41,17 +42,34 @@ class QRLoginPlugin(BasePlugin):
         self._qr_button = None
 
     def _resolve_qr_view_index(self, login_cls: Any) -> None:
-        # --- find the exact constant for qr code view in telegram sources ---
-        for name in ["VIEW_CODE_QR", "VIEW_QR", "VIEW_CODE_QR_LOGIN", "VIEW_NEW_QR"]:
+        # --- scan all declared fields to dynamically find the qr constant ---
+        try:
+            for field in login_cls.getDeclaredFields():
+                modifiers = field.getModifiers()
+                if Modifier.isStatic(modifiers) and field.getType() == Integer.TYPE:
+                    name = field.getName().upper()
+                    if "QR" in name:
+                        field.setAccessible(True)
+                        self._qr_view_index = int(field.get(None))
+                        self.log(f"resolved qr index dynamically: {self._qr_view_index} via {name}")
+                        return
+        except Exception as e:
+            self.log(f"field scan failed: {e}")
+
+        # --- fallback list if reflection scan fails ---
+        for name in ["VIEW_CODE_QR", "VIEW_QR", "VIEW_CODE_QR_LOGIN", "VIEW_NEW_QR", "VIEW_QR_LOGIN", "VIEW_QR_CODE"]:
             try:
                 field = login_cls.getDeclaredField(name)
                 field.setAccessible(True)
-                value = field.get(None)
-                if value is not None:
-                    self._qr_view_index = int(value)
-                    return
+                self._qr_view_index = int(field.get(None))
+                self.log(f"resolved qr index via fallback: {self._qr_view_index}")
+                return
             except Exception:
                 continue
+        
+        # --- safe fallback for newer telegram versions if all else fails ---
+        if self._qr_view_index == -1:
+            self._qr_view_index = 13
 
     def _open_qr_page(self, activity: Any) -> None:
         # --- invoke setpage to switch to the qr view ---
@@ -74,7 +92,7 @@ class QRLoginPlugin(BasePlugin):
             )
         except Exception as e:
             self.log(f"setpage failed: {e}")
-            BulletinHelper.show_error("could not open qr login", activity)
+            BulletinHelper.show_error("Ошибка при открытии QR-кода", activity)
 
     def _install_hooks(self, login_cls: Any) -> None:
         plugin = self
@@ -97,13 +115,16 @@ class QRLoginPlugin(BasePlugin):
                     metrics = context.getResources().getDisplayMetrics()
                     size_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 48.0, metrics))
                     padding_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 12.0, metrics))
-                    margin_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 10.0, metrics))
+                    
+                    # --- increase top margin to lower the button away from the status bar ---
+                    top_margin_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 64.0, metrics))
+                    right_margin_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 10.0, metrics))
 
-                    # --- configure layout parameters to pin it to top right ---
+                    # --- configure layout parameters to pin it to top right but slightly lower ---
                     layout_params = FrameLayout.LayoutParams(size_px, size_px)
                     layout_params.gravity = Gravity.TOP | Gravity.RIGHT
-                    layout_params.topMargin = margin_px
-                    layout_params.rightMargin = margin_px
+                    layout_params.topMargin = top_margin_px
+                    layout_params.rightMargin = right_margin_px
 
                     qr_btn.setLayoutParams(layout_params)
                     qr_btn.setPadding(padding_px, padding_px, padding_px, padding_px)

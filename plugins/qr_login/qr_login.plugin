@@ -1,9 +1,16 @@
 from base_plugin import BasePlugin, MethodHook
-from hook_utils import find_class, get_private_field
-from android_utils import log, OnClickListener
+from hook_utils import find_class
+from android_utils import OnClickListener
 from ui.bulletin import BulletinHelper
-from typing import Any
+from typing import Any, Optional
 from java.lang import Integer, Boolean
+
+# --- import android ui classes ---
+from android.widget import ImageView, FrameLayout
+from android.view import ViewGroup, View, Gravity
+from android.util import TypedValue
+
+# --- import telegram resources ---
 from org.telegram.messenger import R as R_tg
 
 # --- метаданные ---
@@ -11,7 +18,7 @@ __id__ = "qr_login"
 __name__ = "Login with QR"
 __description__ = "v1"
 __author__ = "@insonniiia"
-__version__ = "1.1.1"
+__version__ = "1.2.0"
 __icon__ = "sticks_09490_by_TgEmodziBot/12"
 __min_version__ = "11.12.0"
 
@@ -19,15 +26,19 @@ __min_version__ = "11.12.0"
 class QRLoginPlugin(BasePlugin):
 
     _qr_view_index: int = 12
+    _qr_button: Optional[Any] = None
 
     def on_plugin_load(self) -> None:
         login_cls = find_class("org.telegram.ui.LoginActivity")
         if not login_cls:
-            self.log("LoginActivity class not found")
+            self.log("loginactivity class not found")
             return
 
         self._resolve_qr_view_index(login_cls)
-        self._install_hook(login_cls)
+        self._install_hooks(login_cls)
+
+    def on_plugin_unload(self) -> None:
+        self._qr_button = None
 
     def _resolve_qr_view_index(self, login_cls: Any) -> None:
         # --- find the exact constant for qr code view in telegram sources ---
@@ -38,7 +49,6 @@ class QRLoginPlugin(BasePlugin):
                 value = field.get(None)
                 if value is not None:
                     self._qr_view_index = int(value)
-                    self.log(f"resolved qr index: {self._qr_view_index}")
                     return
             except Exception:
                 continue
@@ -64,45 +74,67 @@ class QRLoginPlugin(BasePlugin):
             )
         except Exception as e:
             self.log(f"setpage failed: {e}")
-            BulletinHelper.show_error("Could not open QR Login", activity)
+            BulletinHelper.show_error("could not open qr login", activity)
 
-    def _install_hook(self, login_cls: Any) -> None:
+    def _install_hooks(self, login_cls: Any) -> None:
         plugin = self
+
+        class CreateViewHook(MethodHook):
+            def after_hooked_method(self, param: Any) -> None:
+                try:
+                    root_view = param.getResult()
+                    if not isinstance(root_view, ViewGroup):
+                        return
+
+                    activity = param.thisObject
+                    context = root_view.getContext()
+
+                    # --- create a standalone imageview for the qr button ---
+                    qr_btn = ImageView(context)
+                    qr_btn.setImageResource(R_tg.drawable.msg_qrcode)
+
+                    # --- calculate sizing in pixels ---
+                    metrics = context.getResources().getDisplayMetrics()
+                    size_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 48.0, metrics))
+                    padding_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 12.0, metrics))
+                    margin_px = int(TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 10.0, metrics))
+
+                    # --- configure layout parameters to pin it to top right ---
+                    layout_params = FrameLayout.LayoutParams(size_px, size_px)
+                    layout_params.gravity = Gravity.TOP | Gravity.RIGHT
+                    layout_params.topMargin = margin_px
+                    layout_params.rightMargin = margin_px
+
+                    qr_btn.setLayoutParams(layout_params)
+                    qr_btn.setPadding(padding_px, padding_px, padding_px, padding_px)
+
+                    # --- attach native click listener using extera wrapper ---
+                    def on_qr_click(v: Any) -> None:
+                        plugin._open_qr_page(activity)
+
+                    qr_btn.setOnClickListener(OnClickListener(on_qr_click))
+
+                    # --- add view directly to the root framelayout hierarchy ---
+                    root_view.addView(qr_btn)
+                    plugin._qr_button = qr_btn
+
+                except Exception as e:
+                    plugin.log(f"createview hook error: {e}")
 
         class SetPageHook(MethodHook):
             def after_hooked_method(self, param: Any) -> None:
-                # --- ensure we only add the button on the main phone entry page ---
-                current_page = param.args[0]
-                if current_page != 0:
-                    return
+                try:
+                    if not plugin._qr_button:
+                        return
 
-                login_activity = param.thisObject
+                    # --- only show the button on the initial phone entry page index zero ---
+                    page_index = param.args[0]
+                    if page_index == 0:
+                        plugin._qr_button.setVisibility(View.VISIBLE)
+                    else:
+                        plugin._qr_button.setVisibility(View.GONE)
+                except Exception as e:
+                    plugin.log(f"setpage hook error: {e}")
 
-                # --- fetch actionbar via reflection ---
-                action_bar = get_private_field(login_activity, "actionBar")
-                if not action_bar:
-                    return
-
-                # --- retrieve or create the action bar menu ---
-                menu = action_bar.createMenu()
-                if not menu:
-                    return
-
-                # --- prevent duplicate buttons if setpage is called multiple times ---
-                existing_item = menu.getItem(7777)
-                if existing_item:
-                    return
-
-                # --- add qr icon to the top right corner ---
-                qr_item = menu.addItem(7777, R_tg.drawable.msg_qrcode)
-                if not qr_item:
-                    return
-
-                # --- attach native click listener using extera wrapper ---
-                def on_qr_click(v: Any):
-                    plugin._open_qr_page(login_activity)
-
-                qr_item.setOnClickListener(OnClickListener(on_qr_click))
-
-        # --- hook setpage because createview menu gets cleared during page transitions ---
+        self.hook_all_methods(login_cls, "createView", CreateViewHook())
         self.hook_all_methods(login_cls, "setPage", SetPageHook())

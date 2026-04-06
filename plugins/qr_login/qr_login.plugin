@@ -14,7 +14,7 @@ __id__ = "qr_login"
 __name__ = "Login with QR"
 __description__ = "v1"
 __author__ = "@insonniiia"
-__version__ = "6.0.0"
+__version__ = "6.0.1"
 __icon__ = "sticks_09490_by_TgEmodziBot/12"
 __min_version__ = "11.12.0"
 
@@ -49,13 +49,20 @@ class DualQRLoginPlugin(BasePlugin):
 
     def _generate_qr_for_new_account(self):
         try:
-            # --- find an empty account slot to host the new session ---
+            # --- find an empty account slot safely (avoids array out of bounds exceptions) ---
             user_config_class = find_class("org.telegram.messenger.UserConfig")
+            if not user_config_class:
+                self._show_bulletin("error", "Класс UserConfig не найден")
+                return
+
             free_account = -1
-            
             for i in range(10):
-                if not user_config_class.getInstance(i).isClientActivated():
-                    free_account = i
+                try:
+                    if not user_config_class.getInstance(i).isClientActivated():
+                        free_account = i
+                        break
+                except Exception:
+                    # --- stop iterating if max configured accounts is reached ---
                     break
                     
             if free_account == -1:
@@ -66,21 +73,29 @@ class DualQRLoginPlugin(BasePlugin):
             
             # --- construct the export token request ---
             request_class = find_class("org.telegram.tgnet.TLRPC$TL_auth_exportLoginToken")
+            if not request_class:
+                self._show_bulletin("error", "Класс TL_auth_exportLoginToken не найден")
+                return
+                
             req = request_class()
             
+            # --- fetch app credentials dynamically with fallbacks ---
             build_vars = find_class("org.telegram.messenger.BuildVars")
-            req.api_id = get_static_private_field(build_vars, "APP_ID")
-            req.api_hash = get_static_private_field(build_vars, "APP_HASH")
+            api_id = get_static_private_field(build_vars, "APP_ID") if build_vars else None
+            api_hash = get_static_private_field(build_vars, "APP_HASH") if build_vars else None
             
-            array_list_class = find_class("java.util.ArrayList")
-            req.except_ids = array_list_class()
+            req.api_id = api_id if api_id else 6
+            req.api_hash = api_hash if api_hash else "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+            
+            # --- except_ids is natively initialized as an arraylist, no need to override it ---
             
             # --- start the initial request which fetches the token ---
             self._poll_export_token(free_account, req, None)
             
         except Exception as e:
             log(f"qr generation setup error: {str(e)}")
-            self._show_bulletin("error", "Внутренняя ошибка инициализации")
+            # --- directly display the python error to trace the issue if it fails again ---
+            self._show_bulletin("error", f"Ошибка: {str(e)}")
 
     def _poll_export_token(self, account_id: int, request: Any, dialog_builder: Any):
         # --- use the connections manager of the empty slot ---
@@ -112,7 +127,6 @@ class DualQRLoginPlugin(BasePlugin):
                 else:
                     # --- token is still valid, sleep in background and poll again ---
                     def wait_and_poll():
-                        # --- ensure the dialog was not manually closed by the user ---
                         if dialog_builder.get_dialog() and dialog_builder.get_dialog().isShowing():
                             time.sleep(3)
                             self._poll_export_token(account_id, request, dialog_builder)
@@ -183,7 +197,7 @@ class DualQRLoginPlugin(BasePlugin):
             self._show_bulletin("success", f"Аккаунт {user.first_name} добавлен! Перезапустите приложение.")
         except Exception as e:
             log(f"account apply error: {str(e)}")
-            self._show_bulletin("error", "Ошибка применения аккаунта")
+            self._show_bulletin("error", f"Ошибка применения: {str(e)}")
 
     def _authorize_device(self, account: int, token_b64: str):
         try:

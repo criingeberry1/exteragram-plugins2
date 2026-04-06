@@ -1,9 +1,11 @@
 import base64
+import requests
 from typing import Any
-from base_plugin import BasePlugin, HookResult, HookStrategy
-from android_utils import run_on_ui_thread, log
-from client_utils import get_last_fragment
-from hook_utils import find_class
+from base_plugin import BasePlugin, MethodHook
+from hook_utils import find_class, get_static_private_field
+from android_utils import run_on_ui_thread, log, OnClickListener
+from client_utils import run_on_queue
+from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
 
 # --- метаданные ---
@@ -11,96 +13,130 @@ __id__ = "qr_login"
 __name__ = "Login with QR"
 __description__ = "v1"
 __author__ = "@insonniiia"
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 __icon__ = "sticks_09490_by_TgEmodziBot/12"
 __min_version__ = "11.12.0"
 
 
-class QRLoginPlugin(BasePlugin):
-    def on_plugin_load(self):
-        # --- register the message sending hook ---
-        self.add_on_send_message_hook()
+class LoginUIHook(MethodHook):
+    def __init__(self, plugin):
+        self.plugin = plugin
 
-    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
-        # --- check if message is a string and starts with the command ---
-        if not hasattr(params, 'message') or not isinstance(params.message, str):
-            return HookResult()
-            
-        if not params.message.startswith(".qr"):
-            return HookResult()
+    def after_hooked_method(self, param: Any):
+        view = param.getResult()
+        # --- verify view is manipulatable ---
+        if not view or not hasattr(view, 'addView'):
+            return
 
-        # --- split message to extract the link or token ---
-        parts = params.message.strip().split(" ", 1)
-        if len(parts) < 2:
-            self._show_notification("error", "Usage: .qr [tg://login?token=...]")
-            return HookResult(strategy=HookStrategy.CANCEL)
-
-        token_string = parts[1].strip()
-
-        # --- extract the base64 token if a full uri was provided ---
-        if "token=" in token_string:
-            token_string = token_string.split("token=")[1].split("&")[0]
-
-        # --- initiate authorization process ---
-        self._authorize_device(account, token_string)
-
-        # --- cancel the outgoing message ---
-        return HookResult(strategy=HookStrategy.CANCEL)
-
-    def _authorize_device(self, account: int, token_b64: str):
         try:
-            # --- add missing padding for standard python base64 decoding ---
-            padding_needed = len(token_b64) % 4
-            if padding_needed:
-                token_b64 += "=" * (4 - padding_needed)
-
-            # --- decode base64 string into bytes ---
-            token_bytes = base64.urlsafe_b64decode(token_b64)
-
-            # --- locate the api request class ---
-            request_class = find_class("org.telegram.tgnet.TLRPC$TL_auth_acceptLoginToken")
-            if not request_class:
-                self._show_notification("error", "API request class not found")
+            button_class = find_class("android.widget.Button")
+            if not button_class:
                 return
 
-            request = request_class()
-            request.token = token_bytes
+            context = view.getContext()
+            btn = button_class(context)
+            btn.setText("QR Login")
 
-            # --- locate connections manager to dispatch the request ---
-            connections_manager_class = find_class("org.telegram.tgnet.ConnectionsManager")
-            if not connections_manager_class:
-                self._show_notification("error", "ConnectionsManager class not found")
-                return
-                
-            connections_manager = connections_manager_class.getInstance(account)
+            # --- setup layout parameters for bottom placement ---
+            layout_params_class = find_class("android.widget.FrameLayout$LayoutParams")
+            gravity_class = find_class("android.view.Gravity")
+            
+            if layout_params_class and gravity_class:
+                params = layout_params_class(-2, -2)
+                params.gravity = gravity_class.BOTTOM | gravity_class.CENTER_HORIZONTAL
+                params.bottomMargin = 150
+                view.addView(btn, params)
+            else:
+                view.addView(btn)
 
-            # --- define the network response callback ---
-            def on_network_result(response: Any, error: Any):
-                if error:
-                    self._show_notification("error", f"Authorization failed: {error.text}")
-                else:
-                    self._show_notification("success", "Device successfully authorized")
+            # --- attach click listener ---
+            def on_click(v: Any):
+                self.plugin.initiate_qr_generation(context, param.thisObject)
 
-            # --- dispatch the request ---
-            connections_manager.sendRequest(request, on_network_result)
-            self._show_notification("info", "Authorizing new device...")
+            btn.setOnClickListener(OnClickListener(on_click))
 
         except Exception as e:
-            log(f"QR Login Error: {str(e)}")
-            self._show_notification("error", "Invalid token or format")
+            log(f"ui hook error: {str(e)}")
 
-    def _show_notification(self, alert_type: str, text: str):
-        # --- execute bulletin ui logic on the main thread ---
-        def display_bulletin():
-            fragment = get_last_fragment()
-            if not fragment:
-                return
+class QRLoginGeneratorPlugin(BasePlugin):
+    def on_plugin_load(self):
+        try:
+            # --- hook login screen initialization ---
+            login_activity_class = find_class("org.telegram.ui.LoginActivity")
+            if login_activity_class:
+                context_class = find_class("android.content.Context")
+                method = login_activity_class.getDeclaredMethod("createView", context_class)
+                self.hook_method(method, LoginUIHook(self))
+        except Exception as e:
+            self.log(f"initialization error: {str(e)}")
+
+    def initiate_qr_generation(self, context: Any, fragment: Any):
+        # --- show loading indicator to user ---
+        BulletinHelper.show_info("Generating QR token...", fragment)
+
+        try:
+            # --- prepare api token request ---
+            request_class = find_class("org.telegram.tgnet.TLRPC$TL_auth_exportLoginToken")
+            request = request_class()
+
+            # --- fetch internal api credentials ---
+            build_vars = find_class("org.telegram.messenger.BuildVars")
+            request.api_id = get_static_private_field(build_vars, "APP_ID")
+            request.api_hash = get_static_private_field(build_vars, "APP_HASH")
+
+            array_list_class = find_class("java.util.ArrayList")
+            request.except_ids = array_list_class()
+
+            # --- dispatch request using unauthenticated account index zero ---
+            connections_manager_class = find_class("org.telegram.tgnet.ConnectionsManager")
+            connections_manager = connections_manager_class.getInstance(0)
+
+            def network_callback(response: Any, error: Any):
+                if error:
+                    run_on_ui_thread(lambda: BulletinHelper.show_error(f"Error: {error.text}", fragment))
+                    return
+
+                # --- encode raw bytes to valid base64 token ---
+                token_b64 = base64.urlsafe_b64encode(response.token).decode('utf-8').rstrip("=")
+                login_uri = f"tg://login?token={token_b64}"
+
+                # --- proceed to fetch and display image ---
+                self.display_qr_code(context, login_uri, fragment)
+
+            connections_manager.sendRequest(request, network_callback)
+
+        except Exception as e:
+            log(f"token request error: {str(e)}")
+            BulletinHelper.show_error("Failed to process request", fragment)
+
+    def display_qr_code(self, context: Any, uri: str, fragment: Any):
+        def fetch_image():
+            try:
+                # --- retrieve qr image from external api ---
+                api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=500x500&data={uri}"
+                res = requests.get(api_url, timeout=10)
                 
-            if alert_type == "error":
-                BulletinHelper.show_error(text, fragment)
-            elif alert_type == "success":
-                BulletinHelper.show_success(text, fragment)
-            else:
-                BulletinHelper.show_info(text, fragment)
-                
-        run_on_ui_thread(display_bulletin)
+                bitmap_factory_class = find_class("android.graphics.BitmapFactory")
+                bitmap = bitmap_factory_class.decodeByteArray(res.content, 0, len(res.content))
+
+                # --- render dialog on main thread ---
+                def show_dialog():
+                    builder = AlertDialogBuilder(context)
+                    builder.set_title("Scan to Login")
+                    builder.set_message("Scan with an already logged-in device.")
+                    
+                    image_view_class = find_class("android.widget.ImageView")
+                    image_view = image_view_class(context)
+                    image_view.setImageBitmap(bitmap)
+                    image_view.setPadding(40, 40, 40, 40)
+                    
+                    builder.set_view(image_view)
+                    builder.show()
+
+                run_on_ui_thread(show_dialog)
+            except Exception as e:
+                log(f"image load error: {str(e)}")
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Could not load QR image", fragment))
+
+        # --- execute network call in background queue ---
+        run_on_queue(fetch_image)

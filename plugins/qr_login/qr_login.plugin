@@ -1,26 +1,24 @@
 from base_plugin import BasePlugin, MethodHook
 from hook_utils import find_class, get_private_field
-from android_utils import log, run_on_ui_thread
+from android_utils import log, OnClickListener
 from ui.bulletin import BulletinHelper
-from typing import Any, Optional
+from typing import Any
 from java.lang import Integer, Boolean
+from org.telegram.messenger import R as R_tg
 
 # --- метаданные ---
 __id__ = "qr_login"
 __name__ = "Login with QR"
 __description__ = "v1"
 __author__ = "@insonniiia"
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 __icon__ = "sticks_09490_by_TgEmodziBot/12"
 __min_version__ = "11.12.0"
 
 
-DEFAULT_QR_VIEW_INDEX: int = 12
-
 class QRLoginPlugin(BasePlugin):
 
-    _login_activity: Optional[Any] = None
-    _qr_view_index: int = DEFAULT_QR_VIEW_INDEX
+    _qr_view_index: int = 12
 
     def on_plugin_load(self) -> None:
         login_cls = find_class("org.telegram.ui.LoginActivity")
@@ -31,10 +29,8 @@ class QRLoginPlugin(BasePlugin):
         self._resolve_qr_view_index(login_cls)
         self._install_hook(login_cls)
 
-    def on_plugin_unload(self) -> None:
-        self._login_activity = None
-
     def _resolve_qr_view_index(self, login_cls: Any) -> None:
+        # --- find the exact constant for qr code view in telegram sources ---
         for name in ["VIEW_CODE_QR", "VIEW_QR", "VIEW_CODE_QR_LOGIN", "VIEW_NEW_QR"]:
             try:
                 field = login_cls.getDeclaredField(name)
@@ -42,16 +38,13 @@ class QRLoginPlugin(BasePlugin):
                 value = field.get(None)
                 if value is not None:
                     self._qr_view_index = int(value)
-                    self.log(f"QR view index: {self._qr_view_index} via {name}")
+                    self.log(f"resolved qr index: {self._qr_view_index}")
                     return
             except Exception:
                 continue
-        self.log(f"Using default QR view index: {self._qr_view_index}")
 
-    def _open_qr_page(self) -> None:
-        activity = self._login_activity
-        if not activity:
-            return
+    def _open_qr_page(self, activity: Any) -> None:
+        # --- invoke setpage to switch to the qr view ---
         try:
             bundle_cls = find_class("android.os.Bundle")
             method = activity.getClass().getDeclaredMethod(
@@ -70,49 +63,46 @@ class QRLoginPlugin(BasePlugin):
                 Boolean(False),
             )
         except Exception as e:
-            self.log(f"setPage failed: {e}")
-            BulletinHelper.show_error("Could not open QR Login")
+            self.log(f"setpage failed: {e}")
+            BulletinHelper.show_error("Could not open QR Login", activity)
 
     def _install_hook(self, login_cls: Any) -> None:
         plugin = self
 
-        class AfterCreateViewHook(MethodHook):
+        class SetPageHook(MethodHook):
             def after_hooked_method(self, param: Any) -> None:
-                try:
-                    login_activity = param.thisObject
-                    plugin._login_activity = login_activity
+                # --- ensure we only add the button on the main phone entry page ---
+                current_page = param.args[0]
+                if current_page != 0:
+                    return
 
-                    # --- get the actionbar and add a menu with qr button ---
-                    action_bar = get_private_field(login_activity, "actionBar")
-                    if not action_bar:
-                        plugin.log("ActionBar not found")
-                        return
+                login_activity = param.thisObject
 
-                    # --- create menu if it doesn't exist ---
-                    menu = action_bar.createMenu()
-                    if not menu:
-                        plugin.log("Cannot create menu")
-                        return
+                # --- fetch actionbar via reflection ---
+                action_bar = get_private_field(login_activity, "actionBar")
+                if not action_bar:
+                    return
 
-                    # --- add a direct qr icon button to the actionbar ---
-                    from org.telegram.messenger import R as R_tg
-                    from org.telegram.ui.ActionBar import ActionBarMenuItem
+                # --- retrieve or create the action bar menu ---
+                menu = action_bar.createMenu()
+                if not menu:
+                    return
 
-                    qr_item = menu.addItem(
-                        7777,
-                        R_tg.drawable.msg_qrcode
-                    )
+                # --- prevent duplicate buttons if setpage is called multiple times ---
+                existing_item = menu.getItem(7777)
+                if existing_item:
+                    return
 
-                    # --- set click listener on the item ---
-                    from android.view import View
+                # --- add qr icon to the top right corner ---
+                qr_item = menu.addItem(7777, R_tg.drawable.msg_qrcode)
+                if not qr_item:
+                    return
 
-                    class QRClickListener(View.OnClickListener):
-                        def onClick(self, v: Any) -> None:
-                            run_on_ui_thread(plugin._open_qr_page)
+                # --- attach native click listener using extera wrapper ---
+                def on_qr_click(v: Any):
+                    plugin._open_qr_page(login_activity)
 
-                    qr_item.setOnClickListener(QRClickListener())
+                qr_item.setOnClickListener(OnClickListener(on_qr_click))
 
-                except Exception as e:
-                    plugin.log(f"Hook error: {e}")
-
-        self.hook_all_methods(login_cls, "createView", AfterCreateViewHook())
+        # --- hook setpage because createview menu gets cleared during page transitions ---
+        self.hook_all_methods(login_cls, "setPage", SetPageHook())

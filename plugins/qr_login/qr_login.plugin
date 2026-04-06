@@ -1,106 +1,138 @@
-from base_plugin import BasePlugin, MethodHook
-from hook_utils import find_class
+from typing import Any
+from android_utils import OnClickListener
+from hook_utils import find_class, get_private_field
 from ui.bulletin import BulletinHelper
 from org.telegram.messenger import R as R_tg
+from base_plugin import BasePlugin, MethodHook
 
 # --- метаданные ---
 __id__ = "qr_login"
 __name__ = "Login with QR"
 __description__ = "v1"
 __author__ = "@insonniiia"
-__version__ = "2.0.1"
+__version__ = "3.0.0"
 __icon__ = "sticks_09490_by_TgEmodziBot/12"
 __min_version__ = "11.12.0"
 
 
-class SetPageHook(MethodHook):
-    def __init__(self, plugin):
-        # --- storing plugin reference for logging ---
-        self.plugin = plugin
+# --- defining constants to avoid magic numbers ---
+QR_MENU_ITEM_ID = 9482
+MIN_PAGE_INDEX = 4
+MAX_PAGE_INDEX = 10
 
-    # --- intercepting ui state transitions ---
-    def before_hooked_method(self, param):
-        try:
-            # --- validating arguments existence ---
-            if not param.args:
-                return
-            
-            # --- reading the first argument which is the page index ---
-            page_index = param.args[0]
-            
-            if page_index == 0:
-                BulletinHelper.show_info("intercepted view_phone_input state transition")
-            elif page_index == 12:
-                BulletinHelper.show_success("email two factor authentication state intercepted")
-            elif page_index == 18:
-                BulletinHelper.show_simple("payment gateway state detected", R_tg.raw.timer)
-        except Exception as e:
-            # --- logging unexpected parsing errors ---
-            self.plugin.log("failed to process setpage hook: " + str(e))
-
-class AcceptLoginTokenHook(MethodHook):
-    def __init__(self, plugin):
-        # --- storing plugin reference for logging ---
-        self.plugin = plugin
-
-    # --- intercepting token acceptance ---
-    def before_hooked_method(self, param):
-        try:
-            # --- checking payload validity ---
-            if param.args and param.args[0] is not None:
-                BulletinHelper.show_simple("qr code authentication token captured", R_tg.raw.info)
-        except Exception as e:
-            # --- logging unexpected token payload errors ---
-            self.plugin.log("failed to process login token: " + str(e))
-
-class ImportLoginTokenHook(MethodHook):
-    def __init__(self, plugin):
-        # --- storing plugin reference for logging ---
-        self.plugin = plugin
-
-    # --- intercepting token import ---
-    def before_hooked_method(self, param):
-        try:
-            # --- executing visual feedback for datacenter migration ---
-            BulletinHelper.show_success("cross datacenter token migration initiated")
-        except Exception as e:
-            # --- logging migration visual feedback failure ---
-            self.plugin.log("failed to notify token import: " + str(e))
-
-class EliteLoginReverserPlugin(BasePlugin):
-    # --- loading the elite plugin ---
+class EliteLoginPlugin(BasePlugin):
+    # --- initializing the elite telegram reverse engineering plugin ---
     def on_plugin_load(self):
         try:
-            # --- resolving target classes via reflection ---
             login_activity_class = find_class("org.telegram.ui.LoginActivity")
-            messages_controller_class = find_class("org.telegram.messenger.MessagesController")
             
             if login_activity_class:
-                # --- registering login activity hooks dynamically ---
-                self.hook_all_methods(login_activity_class, "setPage", SetPageHook(self))
+                # --- hooking createview to inject our custom action bar button ---
+                self.hook_all_methods(login_activity_class, "createView", InjectQrButtonHook(self))
+                # --- hooking setpage to track and log transitions for debugging ---
+                self.hook_all_methods(login_activity_class, "setPage", SetPageTrackerHook(self))
             else:
-                # --- alerting user about missing class ---
-                BulletinHelper.show_error("failed to resolve login activity class")
-                
-            if messages_controller_class:
-                # --- registering messages controller hooks dynamically ---
-                self.hook_all_methods(messages_controller_class, "acceptLoginToken", AcceptLoginTokenHook(self))
-                self.hook_all_methods(messages_controller_class, "importLoginToken", ImportLoginTokenHook(self))
-            else:
-                # --- alerting user about missing messages controller class ---
-                BulletinHelper.show_error("failed to resolve messages controller class")
+                BulletinHelper.show_error("login activity class not found")
                 
         except Exception as e:
-            # --- handling critical initialization errors ---
-            self.log("critical error during plugin initialization: " + str(e))
-            BulletinHelper.show_error("plugin initialization failed check logs")
+            self.log("critical initialization error: " + str(e))
+            BulletinHelper.show_error("plugin initialization failed")
 
-    # --- releasing resources ---
     def on_plugin_unload(self):
         # --- silent memory cleanup ---
         pass
 
-    # --- handling app lifecycle events ---
-    def on_app_event(self, event_type):
+    def on_app_event(self, event_type: Any):
         # --- state preservation logic ---
         pass
+
+    def trigger_qr_login(self, activity: Any):
+        try:
+            # --- first approach executing reflection to dynamically locate native qr method ---
+            for m in activity.getClass().getDeclaredMethods():
+                method_name = m.getName().lower()
+                if "qr" in method_name and len(m.getParameterTypes()) == 0:
+                    m.setAccessible(True)
+                    m.invoke(activity)
+                    BulletinHelper.show_success("qr login initialized via native method")
+                    return
+            
+            # --- second approach dynamic page discovery mechanism ---
+            views_array = get_private_field(activity, "views")
+            if not views_array:
+                BulletinHelper.show_error("views array is inaccessible")
+                return
+            
+            # --- storing current state to revert if necessary ---
+            current_page = get_private_field(activity, "currentViewNum")
+            if current_page is None:
+                current_page = 0
+                
+            is_found = False
+            
+            # --- bruteforcing likely indices for qr view instantiation ---
+            for idx in range(MIN_PAGE_INDEX, MAX_PAGE_INDEX):
+                activity.setPage(idx, False, None, False)
+                
+                if views_array[idx]:
+                    class_name = views_array[idx].getClass().getName().lower()
+                    
+                    # --- validating the newly instantiated view by its class name ---
+                    if "qr" in class_name:
+                        BulletinHelper.show_success("qr login state activated dynamically")
+                        is_found = True
+                        break
+                        
+            if not is_found:
+                # --- reverting to original state if qr view is completely missing ---
+                activity.setPage(current_page, False, None, False)
+                BulletinHelper.show_error("qr login view not found in this version")
+                
+        except Exception as e:
+            self.log("failed to trigger qr login: " + str(e))
+            BulletinHelper.show_error("unexpected error during qr transition")
+
+class InjectQrButtonHook(MethodHook):
+    def __init__(self, plugin: EliteLoginPlugin):
+        # --- storing plugin reference ---
+        self.plugin = plugin
+
+    def after_hooked_method(self, param: Any):
+        try:
+            activity = param.thisObject
+            action_bar = activity.getActionBar()
+            
+            if not action_bar:
+                return
+
+            menu = action_bar.createMenu()
+            
+            # --- injecting the qr code login button with a unique identifier ---
+            qr_btn = menu.addItem(QR_MENU_ITEM_ID, R_tg.drawable.msg_qrcode)
+            
+            def on_qr_click(view: Any):
+                self.plugin.trigger_qr_login(activity)
+                
+            # --- attaching our custom click listener to the action bar item ---
+            qr_btn.setOnClickListener(OnClickListener(on_qr_click))
+            
+        except Exception as e:
+            self.plugin.log("failed to inject action bar button: " + str(e))
+
+class SetPageTrackerHook(MethodHook):
+    def __init__(self, plugin: EliteLoginPlugin):
+        # --- storing plugin reference ---
+        self.plugin = plugin
+        
+    def before_hooked_method(self, param: Any):
+        try:
+            if not param.args:
+                return
+            
+            page_index = param.args[0]
+            # --- logging the state transition to help with future reverse engineering ---
+            self.plugin.log("transitioning to login page index: " + str(page_index))
+            
+        except Exception:
+            # --- silent fail for tracker ---
+            pass

@@ -1,10 +1,11 @@
 import base64
+import time
 import requests
 from typing import Any
-from base_plugin import BasePlugin, MethodHook
+from base_plugin import BasePlugin, HookResult, HookStrategy
 from hook_utils import find_class, get_static_private_field
-from android_utils import run_on_ui_thread, log, OnClickListener
-from client_utils import run_on_queue
+from android_utils import run_on_ui_thread, log
+from client_utils import get_last_fragment, run_on_queue
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
 
@@ -13,118 +14,137 @@ __id__ = "qr_login"
 __name__ = "Login with QR"
 __description__ = "v1"
 __author__ = "@insonniiia"
-__version__ = "5.0.0"
+__version__ = "6.0.0"
 __icon__ = "sticks_09490_by_TgEmodziBot/12"
 __min_version__ = "11.12.0"
 
 
-class LoginUIHook(MethodHook):
-    def __init__(self, plugin):
-        self.plugin = plugin
-
-    def after_hooked_method(self, param: Any):
-        view = param.getResult()
-        # --- verify view is manipulatable ---
-        if not view or not hasattr(view, 'addView'):
-            return
-
-        try:
-            button_class = find_class("android.widget.Button")
-            if not button_class:
-                return
-
-            context = view.getContext()
-            btn = button_class(context)
-            btn.setText("QR Login")
-
-            # --- setup layout parameters for bottom placement ---
-            layout_params_class = find_class("android.widget.FrameLayout$LayoutParams")
-            gravity_class = find_class("android.view.Gravity")
-            
-            if layout_params_class and gravity_class:
-                params = layout_params_class(-2, -2)
-                params.gravity = gravity_class.BOTTOM | gravity_class.CENTER_HORIZONTAL
-                params.bottomMargin = 150
-                view.addView(btn, params)
-            else:
-                view.addView(btn)
-
-            # --- attach click listener ---
-            def on_click(v: Any):
-                self.plugin.initiate_qr_generation(context, param.thisObject)
-
-            btn.setOnClickListener(OnClickListener(on_click))
-
-        except Exception as e:
-            log(f"ui hook error: {str(e)}")
-
-class QRLoginGeneratorPlugin(BasePlugin):
+class DualQRLoginPlugin(BasePlugin):
     def on_plugin_load(self):
-        try:
-            # --- hook login screen initialization ---
-            login_activity_class = find_class("org.telegram.ui.LoginActivity")
-            if login_activity_class:
-                context_class = find_class("android.content.Context")
-                method = login_activity_class.getDeclaredMethod("createView", context_class)
-                self.hook_method(method, LoginUIHook(self))
-        except Exception as e:
-            self.log(f"initialization error: {str(e)}")
+        # --- hook outgoing messages to catch commands ---
+        self.add_on_send_message_hook()
 
-    def initiate_qr_generation(self, context: Any, fragment: Any):
-        # --- show loading indicator to user ---
-        BulletinHelper.show_info("Generating QR token...", fragment)
+    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
+        # --- validate message object ---
+        if not hasattr(params, 'message') or not isinstance(params.message, str):
+            return HookResult()
+            
+        # --- check for qr command ---
+        if not params.message.startswith(".qr"):
+            return HookResult()
 
+        parts = params.message.strip().split(" ", 1)
+        
+        # --- route to correct functionality based on arguments ---
+        if len(parts) == 1:
+            self._generate_qr_for_new_account()
+        else:
+            token_string = parts[1].strip()
+            if "token=" in token_string:
+                token_string = token_string.split("token=")[1].split("&")[0]
+            self._authorize_device(account, token_string)
+
+        # --- prevent command from sending into chat ---
+        return HookResult(strategy=HookStrategy.CANCEL)
+
+    def _generate_qr_for_new_account(self):
         try:
-            # --- prepare api token request ---
+            # --- find an empty account slot to host the new session ---
+            user_config_class = find_class("org.telegram.messenger.UserConfig")
+            free_account = -1
+            
+            for i in range(10):
+                if not user_config_class.getInstance(i).isClientActivated():
+                    free_account = i
+                    break
+                    
+            if free_account == -1:
+                self._show_bulletin("error", "Нет свободных слотов для аккаунтов")
+                return
+                
+            self._show_bulletin("info", f"Подготовка сессии (Слот {free_account})...")
+            
+            # --- construct the export token request ---
             request_class = find_class("org.telegram.tgnet.TLRPC$TL_auth_exportLoginToken")
-            request = request_class()
-
-            # --- fetch internal api credentials ---
+            req = request_class()
+            
             build_vars = find_class("org.telegram.messenger.BuildVars")
-            request.api_id = get_static_private_field(build_vars, "APP_ID")
-            request.api_hash = get_static_private_field(build_vars, "APP_HASH")
-
+            req.api_id = get_static_private_field(build_vars, "APP_ID")
+            req.api_hash = get_static_private_field(build_vars, "APP_HASH")
+            
             array_list_class = find_class("java.util.ArrayList")
-            request.except_ids = array_list_class()
-
-            # --- dispatch request using unauthenticated account index zero ---
-            connections_manager_class = find_class("org.telegram.tgnet.ConnectionsManager")
-            connections_manager = connections_manager_class.getInstance(0)
-
-            def network_callback(response: Any, error: Any):
-                if error:
-                    run_on_ui_thread(lambda: BulletinHelper.show_error(f"Error: {error.text}", fragment))
-                    return
-
-                # --- encode raw bytes to valid base64 token ---
-                token_b64 = base64.urlsafe_b64encode(response.token).decode('utf-8').rstrip("=")
-                login_uri = f"tg://login?token={token_b64}"
-
-                # --- proceed to fetch and display image ---
-                self.display_qr_code(context, login_uri, fragment)
-
-            connections_manager.sendRequest(request, network_callback)
-
+            req.except_ids = array_list_class()
+            
+            # --- start the initial request which fetches the token ---
+            self._poll_export_token(free_account, req, None)
+            
         except Exception as e:
-            log(f"token request error: {str(e)}")
-            BulletinHelper.show_error("Failed to process request", fragment)
+            log(f"qr generation setup error: {str(e)}")
+            self._show_bulletin("error", "Внутренняя ошибка инициализации")
 
-    def display_qr_code(self, context: Any, uri: str, fragment: Any):
-        def fetch_image():
+    def _poll_export_token(self, account_id: int, request: Any, dialog_builder: Any):
+        # --- use the connections manager of the empty slot ---
+        cm_class = find_class("org.telegram.tgnet.ConnectionsManager")
+        cm = cm_class.getInstance(account_id)
+        
+        def network_callback(response: Any, error: Any):
+            if error:
+                log(f"network error during polling: {error.text}")
+                if dialog_builder:
+                    run_on_ui_thread(lambda: dialog_builder.dismiss())
+                self._show_bulletin("error", f"Ошибка авторизации: {error.text}")
+                return
+                
+            response_class = response.getClass().getName()
+            
+            # --- check if the token was successfully accepted by the other device ---
+            if "TL_auth_loginTokenSuccess" in response_class:
+                user = response.authorization.user
+                run_on_ui_thread(lambda: self._apply_new_account(account_id, user, dialog_builder))
+                
+            # --- token generated and waiting for scan ---
+            elif "TL_auth_loginToken" in response_class:
+                if not dialog_builder:
+                    # --- first response, encode token and create the ui dialog ---
+                    token_b64 = base64.urlsafe_b64encode(response.token).decode('utf-8').rstrip("=")
+                    login_uri = f"tg://login?token={token_b64}"
+                    run_on_ui_thread(lambda: self._show_qr_dialog(login_uri, account_id, request))
+                else:
+                    # --- token is still valid, sleep in background and poll again ---
+                    def wait_and_poll():
+                        # --- ensure the dialog was not manually closed by the user ---
+                        if dialog_builder.get_dialog() and dialog_builder.get_dialog().isShowing():
+                            time.sleep(3)
+                            self._poll_export_token(account_id, request, dialog_builder)
+                    run_on_queue(wait_and_poll)
+                    
+        # --- dispatch the polling request ---
+        cm.sendRequest(request, network_callback)
+
+    def _show_qr_dialog(self, uri: str, account_id: int, request: Any):
+        fragment = get_last_fragment()
+        if not fragment:
+            return
+            
+        context = fragment.getParentActivity()
+        if not context:
+            return
+            
+        def fetch_and_show():
             try:
-                # --- retrieve qr image from external api ---
+                # --- fetch qr code image from external api ---
                 api_url = f"https://api.qrserver.com/v1/create-qr-code/?size=500x500&data={uri}"
                 res = requests.get(api_url, timeout=10)
                 
                 bitmap_factory_class = find_class("android.graphics.BitmapFactory")
                 bitmap = bitmap_factory_class.decodeByteArray(res.content, 0, len(res.content))
-
-                # --- render dialog on main thread ---
+                
                 def show_dialog():
                     builder = AlertDialogBuilder(context)
-                    builder.set_title("Scan to Login")
-                    builder.set_message("Scan with an already logged-in device.")
+                    builder.set_title("Вход в новый аккаунт")
+                    builder.set_message("Отсканируйте этот QR-код с другого вашего устройства (где уже есть нужный аккаунт), чтобы добавить его сюда.")
                     
+                    # --- setup image view for the qr bitmap ---
                     image_view_class = find_class("android.widget.ImageView")
                     image_view = image_view_class(context)
                     image_view.setImageBitmap(bitmap)
@@ -132,11 +152,84 @@ class QRLoginGeneratorPlugin(BasePlugin):
                     
                     builder.set_view(image_view)
                     builder.show()
-
+                    
+                    # --- start background polling loop now that ui is visible ---
+                    def start_polling():
+                        time.sleep(3)
+                        if builder.get_dialog() and builder.get_dialog().isShowing():
+                            self._poll_export_token(account_id, request, builder)
+                            
+                    run_on_queue(start_polling)
+                    
                 run_on_ui_thread(show_dialog)
             except Exception as e:
-                log(f"image load error: {str(e)}")
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Could not load QR image", fragment))
+                log(f"qr image load error: {str(e)}")
+                self._show_bulletin("error", "Не удалось загрузить картинку QR-кода")
+                
+        run_on_queue(fetch_and_show)
 
-        # --- execute network call in background queue ---
-        run_on_queue(fetch_image)
+    def _apply_new_account(self, account_id: int, user: Any, dialog_builder: Any):
+        try:
+            # --- write the authorization payload to the database ---
+            user_config_class = find_class("org.telegram.messenger.UserConfig")
+            user_config = user_config_class.getInstance(account_id)
+            user_config.setCurrentUser(user)
+            user_config.saveConfig(True)
+            
+            # --- cleanup the qr dialog ---
+            if dialog_builder and dialog_builder.get_dialog():
+                dialog_builder.dismiss()
+                
+            self._show_bulletin("success", f"Аккаунт {user.first_name} добавлен! Перезапустите приложение.")
+        except Exception as e:
+            log(f"account apply error: {str(e)}")
+            self._show_bulletin("error", "Ошибка применения аккаунта")
+
+    def _authorize_device(self, account: int, token_b64: str):
+        try:
+            # --- correct base64 padding for python standard library ---
+            padding = len(token_b64) % 4
+            if padding:
+                token_b64 += "=" * (4 - padding)
+
+            token_bytes = base64.urlsafe_b64decode(token_b64)
+
+            # --- prepare session approval request ---
+            request_class = find_class("org.telegram.tgnet.TLRPC$TL_auth_acceptLoginToken")
+            if not request_class:
+                return
+
+            request = request_class()
+            request.token = token_bytes
+
+            cm_class = find_class("org.telegram.tgnet.ConnectionsManager")
+            cm = cm_class.getInstance(account)
+
+            def network_callback(response: Any, error: Any):
+                if error:
+                    self._show_bulletin("error", f"Ошибка: {error.text}")
+                else:
+                    self._show_bulletin("success", "Второе устройство успешно авторизовано!")
+
+            cm.sendRequest(request, network_callback)
+            self._show_bulletin("info", "Одобряем вход...")
+
+        except Exception as e:
+            log(f"token decode error: {str(e)}")
+            self._show_bulletin("error", "Неверный формат токена")
+
+    def _show_bulletin(self, alert_type: str, text: str):
+        # --- route native popups to the main thread ---
+        def display():
+            fragment = get_last_fragment()
+            if not fragment:
+                return
+                
+            if alert_type == "error":
+                BulletinHelper.show_error(text, fragment)
+            elif alert_type == "success":
+                BulletinHelper.show_success(text, fragment)
+            else:
+                BulletinHelper.show_info(text, fragment)
+                
+        run_on_ui_thread(display)

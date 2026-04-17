@@ -29,7 +29,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.5"
+__version__ = "2.2.6"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -169,10 +169,11 @@ def _bytes_key(obj: Any) -> bytes:
     # --- safely convert java byte array to python bytes for mapping ---
     try:
         return bytes(obj)
-    except Exception:
+    except Exception as e1:
         try:
             return bytes([x for x in obj])
-        except Exception:
+        except Exception as e2:
+            log(f"forward tools: bytes key conversion error {e1} {e2}")
             return b""
 
 # --- hooks ---
@@ -558,6 +559,19 @@ class ForwardToolsPlugin(BasePlugin):
             log(f"forward tools: author extraction error {e}")
         return "Unknown"
 
+    def _extract_text_safe(self, obj: Any) -> str:
+        # --- parse clean string out of textwithentities or fallback ---
+        if not obj:
+            return ""
+        cls_name = str(obj.__class__.__name__)
+        if "textWithEntities" in cls_name.lower():
+            try:
+                return str(getattr(obj, "text", obj))
+            except Exception as e:
+                log(f"forward tools: text entity parse error {e}")
+                return str(obj)
+        return str(obj)
+
     def _extract_poll(self, msg: Any) -> Optional[str]:
         # --- parse poll structure and render ascii bar chart ---
         try:
@@ -568,7 +582,9 @@ class ForwardToolsPlugin(BasePlugin):
             
             if not poll: return None
             
-            question = str(getattr(poll, "question", "Poll"))
+            question_obj = getattr(poll, "question", "Poll")
+            question = self._extract_text_safe(question_obj)
+            
             answers_list = getattr(poll, "answers", None)
             results_list = getattr(results, "results", None)
             total_voters = getattr(results, "total_voters", 0) or 0
@@ -580,23 +596,18 @@ class ForwardToolsPlugin(BasePlugin):
                     opt = getattr(r, "option", None)
                     cnt = getattr(r, "voters", 0)
                     if opt is not None:
-                        try:
-                            voters_map[_bytes_key(opt)] = cnt
-                        except Exception:
-                            pass
+                        voters_map[_bytes_key(opt)] = cnt
                             
             lines = [f"[📊 Poll: {question}]"]
             if answers_list:
                 for i in range(answers_list.size()):
                     ans = answers_list.get(i)
-                    text = str(getattr(ans, "text", ""))
+                    ans_text_obj = getattr(ans, "text", "")
+                    text = self._extract_text_safe(ans_text_obj)
                     opt = getattr(ans, "option", None)
                     voters = 0
                     if opt is not None:
-                        try:
-                            voters = voters_map.get(_bytes_key(opt), 0)
-                        except Exception:
-                            pass
+                        voters = voters_map.get(_bytes_key(opt), 0)
                             
                     percent = int((voters / total_voters) * 100) if total_voters > 0 else 0
                     filled = int(percent / 10)
@@ -609,7 +620,7 @@ class ForwardToolsPlugin(BasePlugin):
             return None
 
     def _extract_contact(self, msg: Any) -> Optional[str]:
-        # --- parse contact metadata ---
+        # --- parse contact metadata directly from media ---
         try:
             owner = getattr(msg, "messageOwner", None)
             media = getattr(owner, "media", None)
@@ -647,8 +658,13 @@ class ForwardToolsPlugin(BasePlugin):
         return None
 
     def _extract_file_name(self, msg: Any) -> str:
-        # --- parse document attributes for real file name or track info ---
+        # --- attempt to parse real file name using native message methods ---
         try:
+            if hasattr(msg, "getDocumentName"):
+                name = msg.getDocumentName()
+                if name and str(name).strip():
+                    return f": {name}"
+                    
             doc = getattr(msg, "getDocument", lambda: None)()
             if doc:
                 attrs = getattr(doc, "attributes", None)
@@ -672,19 +688,23 @@ class ForwardToolsPlugin(BasePlugin):
         return ""
 
     def _get_media_label(self, msg: Any) -> str:
-        # --- dynamically route to specific meta extractors or english fallbacks ---
+        # --- dynamically route to specific meta extractors identifying classes directly ---
         try:
-            if getattr(msg, "isPoll", lambda: False)():
+            owner = getattr(msg, "messageOwner", None)
+            media = getattr(owner, "media", None)
+            media_cls = str(media.getClass().getSimpleName()) if media else ""
+            
+            if getattr(msg, "isPoll", lambda: False)() or "Poll" in media_cls:
                 res = self._extract_poll(msg)
                 if res: return res
                 return "[📊 Poll]"
                 
-            if getattr(msg, "isContact", lambda: False)():
+            if getattr(msg, "isContact", lambda: False)() or "Contact" in media_cls:
                 res = self._extract_contact(msg)
                 if res: return res
                 return "[👤 Contact]"
                 
-            if getattr(msg, "isLocation", lambda: False)():
+            if getattr(msg, "isLocation", lambda: False)() or "Location" in media_cls or "Geo" in media_cls or "Venue" in media_cls:
                 res = self._extract_location(msg)
                 if res: return res
                 return "[📍 Location]"
@@ -723,8 +743,11 @@ class ForwardToolsPlugin(BasePlugin):
             if getattr(msg, "isGif", lambda: False)(): return f"[🎞 GIF{fname}]"
             
             if fname: return f"[📎 File{fname}]"
+            if media_cls: return f"[📎 Media: {media_cls}]"
+            
         except Exception as e:
             log(f"forward tools: media label error {e}")
+            
         return "[📎 Media]"
 
     def _raw_text(self, msg: Any) -> Any:

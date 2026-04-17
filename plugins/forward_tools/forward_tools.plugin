@@ -17,6 +17,7 @@ from org.telegram.tgnet import TLRPC, TLObject
 
 from com.exteragram.messenger.plugins import PluginsController
 from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
+from ui.alert import AlertDialogBuilder
 
 # --- метаданные ---
 __id__ = "forward_tools"
@@ -28,7 +29,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.0"
+__version__ = "2.2.1"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -180,7 +181,7 @@ class _ClipboardHook(MethodHook):
                 return
                 
             res = self.plugin._format(msgs)
-            if res.strip():
+            if res.length() > 0:
                 param.args[0] = res
         except Exception as e:
             log(f"ForwardTools: clipboard hook error {e}")
@@ -336,11 +337,28 @@ class ForwardToolsPlugin(BasePlugin):
             icon="msg_copy"
         ))
 
+        # --- register context menu for custom alias ---
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+            text="Set alias",
+            on_click=self._on_set_alias,
+            icon="msg_edit",
+            condition="message.getSenderId() != 0"
+        ))
+
+        # --- register profile menu for custom alias ---
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.PROFILE_ACTION_MENU,
+            text="Set alias for copying",
+            on_click=self._on_set_alias,
+            icon="msg_edit"
+        ))
+
         # --- register chat menu button to open native settings ---
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.CHAT_ACTION_MENU,
             text="Forward Tools Settings",
-            icon="msg_settings_hw",
+            icon="msg_settings",
             on_click=self._open_plugin_settings
         ))
 
@@ -408,9 +426,76 @@ class ForwardToolsPlugin(BasePlugin):
             log(f"ForwardTools: error opening settings {e}")
             BulletinHelper.show_error("Failed to open settings")
 
-    def _author(self, msg: Any) -> str:
-        # --- extract actual message sender prioritizing nested forward headers ---
+    def _on_set_alias(self, ctx: Dict[str, Any]) -> None:
+        # --- open dialog to set custom alias for user ---
         try:
+            target_id = None
+            user = ctx.get("user")
+            msg = ctx.get("message")
+            
+            if user:
+                target_id = user.id
+            elif msg:
+                target_id = msg.getSenderId()
+
+            if not target_id:
+                BulletinHelper.show_error("Could not determine user ID")
+                return
+
+            frag = get_last_fragment()
+            if not frag:
+                return
+            act = frag.getParentActivity()
+
+            EditText = find_class("android.widget.EditText")
+            if not EditText:
+                return
+            input_view = EditText(act)
+            
+            current_alias = self.get_setting(f"alias_{target_id}", "")
+            if current_alias:
+                input_view.setText(current_alias)
+                input_view.setSelection(len(current_alias))
+
+            bld = AlertDialogBuilder(act)
+            bld.set_title("Set Custom Alias")
+            bld.set_view(input_view)
+
+            def save_alias(bld: Any, which: int) -> None:
+                new_val = input_view.getText().toString().strip()
+                if new_val:
+                    self.set_setting(f"alias_{target_id}", new_val)
+                    BulletinHelper.show_success("Alias saved")
+                else:
+                    self.set_setting(f"alias_{target_id}", "")
+                    BulletinHelper.show_success("Alias cleared")
+                bld.dismiss()
+
+            def clear_alias(bld: Any, which: int) -> None:
+                self.set_setting(f"alias_{target_id}", "")
+                BulletinHelper.show_success("Alias cleared")
+                bld.dismiss()
+
+            bld.set_positive_button("Save", save_alias)
+            bld.set_negative_button("Clear", clear_alias)
+            bld.show()
+        except Exception as e:
+            log(f"ForwardTools: set alias error {e}")
+            BulletinHelper.show_error("Failed to open alias dialog")
+
+    def _author(self, msg: Any) -> str:
+        # --- extract actual message sender taking aliases into account ---
+        try:
+            my_id = UserConfig.getInstance(UserConfig.selectedAccount).getClientUserId()
+            sender_id = msg.getSenderId()
+            
+            if sender_id == my_id and self.get_setting("replace_me_with_i", False):
+                return "Я"
+                
+            alias = self.get_setting(f"alias_{sender_id}", "")
+            if alias:
+                return alias
+
             owner = getattr(msg, "messageOwner", None)
             if owner:
                 fwd = getattr(owner, "fwd_from", None)
@@ -426,6 +511,8 @@ class ForwardToolsPlugin(BasePlugin):
                         
                         uid = getattr(from_id, "user_id", 0)
                         if uid != 0:
+                            alias = self.get_setting(f"alias_{uid}", "")
+                            if alias: return alias
                             u = ctrl.getUser(uid)
                             if u:
                                 n = f"{u.first_name or ''} {u.last_name or ''}".strip()
@@ -444,32 +531,40 @@ class ForwardToolsPlugin(BasePlugin):
                                 return str(c.title).strip()
 
             # --- fallback to direct sender if not forwarded ---
-            sid = msg.getSenderId()
             ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
-            if sid > 0:
-                u = ctrl.getUser(sid)
+            if sender_id > 0:
+                u = ctrl.getUser(sender_id)
                 if u:
                     n = f"{u.first_name or ''} {u.last_name or ''}".strip()
                     if n: return n
-            elif sid < 0:
-                c = ctrl.getChat(-sid)
+            elif sender_id < 0:
+                c = ctrl.getChat(-sender_id)
                 if c and c.title:
                     return str(c.title).strip()
         except Exception:
             pass
         return "Unknown"
 
-    def _text(self, msg: Any) -> str:
-        # --- extract display text or caption ---
-        for f in ("messageText", "caption"):
-            v = getattr(msg, f, None)
-            if v:
-                return str(v)
+    def _raw_text(self, msg: Any) -> Any:
+        # --- extract native charsequence to preserve spans and premium emojis ---
+        message_text = getattr(msg, "messageText", None)
+        if message_text:
+            return message_text
+        caption = getattr(msg, "caption", None)
+        if caption:
+            return caption
         owner = getattr(msg, "messageOwner", None)
         if owner:
             raw = getattr(owner, "message", None)
             if raw:
-                return str(raw)
+                return raw
+        return None
+
+    def _text(self, msg: Any) -> str:
+        # --- fallback for plain string extraction in short quotes ---
+        raw = self._raw_text(msg)
+        if raw:
+            return raw.toString()
         return ""
 
     def _selected(self, fragment: Any) -> List[Any]:
@@ -493,14 +588,19 @@ class ForwardToolsPlugin(BasePlugin):
             log(f"ForwardTools: selected fetch error {e}")
             return []
 
-    def _format(self, msgs: List[Any]) -> str:
-        # --- strict formatting without unnecessary empty lines ---
+    def _format(self, msgs: List[Any]) -> Any:
+        # --- construct spannablestringbuilder to keep native formatting and emojis ---
+        SpannableStringBuilder = find_class("android.text.SpannableStringBuilder")
+        if not SpannableStringBuilder:
+            return ""
+            
+        builder = SpannableStringBuilder()
+
         ts_on: bool = self.get_setting("timestamps", False)
         dates_on: bool = self.get_setting("dates", False)
         prefix_on: bool = self.get_setting("with_label", False)
         replies_on: bool = self.get_setting("format_replies", True)
 
-        lines: List[str] = []
         cur_date: Optional[str] = None
         cur_author: Optional[str] = None
 
@@ -517,25 +617,24 @@ class ForwardToolsPlugin(BasePlugin):
             d_str: str = dt.strftime("%d.%m.%Y") if dt else ""
             t_str: str = dt.strftime("%H:%M") if dt else ""
             author: str = self._author(msg)
-            body: str = self._text(msg) or "[Media]"
 
             # --- insert date separator when day changes ---
             if dates_on and d_str and d_str != cur_date:
-                if lines:
-                    lines.append("") 
-                lines.append(f"--- {d_str} ---")
-                lines.append("") 
+                if builder.length() > 0:
+                    builder.append("\n\n")
+                builder.append(f"--- {d_str} ---\n\n")
                 cur_date = d_str
-                cur_author = None # --- reset author so it prints after date ---
+                cur_author = None 
 
             # --- insert author header when sender changes ---
             if author != cur_author:
-                # --- ensure single empty line between different authors ---
-                if lines and lines[-1] != "" and lines[-1] != f"--- {d_str} ---":
-                    lines.append("")
-                hdr = f"Forwarded from {author}:" if prefix_on else f"{author}:"
-                lines.append(hdr)
+                if builder.length() > 0 and not builder.toString().endswith("\n\n"):
+                    builder.append("\n\n")
+                hdr = f"Forwarded from {author}:\n" if prefix_on else f"{author}:\n"
+                builder.append(hdr)
                 cur_author = author
+            elif builder.length() > 0:
+                builder.append("\n")
 
             # --- format reply block if message is a reply ---
             if replies_on:
@@ -545,13 +644,19 @@ class ForwardToolsPlugin(BasePlugin):
                     reply_text = self._text(reply_obj) or "[Media]"
                     words = reply_text.split()
                     short_quote = " ".join(words[:5]) + ("..." if len(words) > 5 else "")
-                    body = f"> {reply_author}: {short_quote}\n{body}"
+                    builder.append(f"> {reply_author}: {short_quote}\n")
 
             # --- append message body with optional timestamp ---
-            line = f"[{t_str}] {body}" if ts_on and t_str else body
-            lines.append(line)
+            if ts_on and t_str:
+                builder.append(f"[{t_str}] ")
+                
+            raw_body = self._raw_text(msg)
+            if raw_body:
+                builder.append(raw_body)
+            else:
+                builder.append("[Media]")
 
-        return "\n".join(lines)
+        return builder
 
     def _on_copy(self, ctx: Dict[str, Any]) -> None:
         # --- explicit fallback copy for single message via long press ---
@@ -566,9 +671,9 @@ class ForwardToolsPlugin(BasePlugin):
                 BulletinHelper.show_error("No message available")
                 return
 
-            result: str = self._format(target)
+            result = self._format(target)
 
-            if not result.strip():
+            if result.length() == 0:
                 BulletinHelper.show_info("Nothing to copy")
                 return
 
@@ -616,6 +721,13 @@ class ForwardToolsPlugin(BasePlugin):
                 default=False,
                 subtext="Add 'Forwarded from' before author name",
                 icon="msg_forward"
+            ),
+            Switch(
+                key="replace_me_with_i",
+                text="Replace my name with 'Я'",
+                default=False,
+                subtext="Uses 'Я' instead of your profile name when copying your messages",
+                icon="msg_edit"
             ),
             Divider(),
             Header(text="Selection limit"),

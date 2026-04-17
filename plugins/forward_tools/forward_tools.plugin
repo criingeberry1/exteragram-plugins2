@@ -29,7 +29,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.7"
+__version__ = "2.2.8"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -575,8 +575,8 @@ class ForwardToolsPlugin(BasePlugin):
                 val = f.get(obj)
                 if val is not None:
                     return str(val)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"forward tools: text safe extraction fallback {e}")
         return str(obj)
 
     def _extract_poll(self, msg: Any) -> Optional[str]:
@@ -665,55 +665,87 @@ class ForwardToolsPlugin(BasePlugin):
         return None
 
     def _extract_todo_debug(self, media: Any) -> str:
-        # --- reflection dumper to uncover internal fields of the new todo list feature ---
-        lines = ["[📋 Task List (Debug Dump)]"]
+        # --- deep reflection dumper to uncover todo inner lists ---
+        lines = ["[📋 Task List (Deep Dump)]"]
         try:
-            fields = media.getClass().getFields()
-            for i in range(len(fields)):
-                f = fields[i]
-                f.setAccessible(True)
-                name = f.getName()
-                val = f.get(media)
-                val_str = str(val)
-                if val and hasattr(val, "size"):
-                    val_str = f"Array[size={val.size()}]"
-                lines.append(f" - {name} = {val_str}")
+            todo = getattr(media, "todo", None)
+            if todo:
+                lines.append(" --- todo object ---")
+                fields = todo.getClass().getFields()
+                for i in range(len(fields)):
+                    f = fields[i]
+                    f.setAccessible(True)
+                    val = f.get(todo)
+                    if val and hasattr(val, "size"):
+                        lines.append(f" - {f.getName()} = Array[size={val.size()}]")
+                        for j in range(val.size()):
+                            item = val.get(j)
+                            lines.append(f"   [{j}] = {item.getClass().getSimpleName()}")
+                            try:
+                                sub_fields = item.getClass().getFields()
+                                for k in range(len(sub_fields)):
+                                    sf = sub_fields[k]
+                                    sf.setAccessible(True)
+                                    lines.append(f"     {sf.getName()} = {sf.get(item)}")
+                            except Exception as e:
+                                log(f"forward tools: todo item dump error {e}")
+                    else:
+                        lines.append(f" - {f.getName()} = {val}")
+                        
+            completions = getattr(media, "completions", None)
+            if completions and hasattr(completions, "size"):
+                lines.append(" --- completions array ---")
+                lines.append(f" size = {completions.size()}")
+                for i in range(completions.size()):
+                    c = completions.get(i)
+                    lines.append(f"  [{i}] = {c.getClass().getSimpleName()}")
+                    try:
+                        c_fields = c.getClass().getFields()
+                        for k in range(len(c_fields)):
+                            cf = c_fields[k]
+                            cf.setAccessible(True)
+                            lines.append(f"    {cf.getName()} = {cf.get(c)}")
+                    except Exception as e:
+                        log(f"forward tools: completion dump error {e}")
         except Exception as e:
             lines.append(f" Error: {e}")
         return "\n".join(lines)
 
     def _extract_file_name(self, msg: Any) -> str:
-        # --- scan document attributes prioritizing audio metadata over raw filename ---
+        # --- attempt to parse real file name using native message methods ---
         try:
-            doc = getattr(msg, "getDocument", lambda: None)()
-            if doc:
-                attrs = getattr(doc, "attributes", None)
-                if attrs:
-                    fname_candidate = ""
-                    for i in range(attrs.size()):
-                        attr = attrs.get(i)
-                        name = str(attr.getClass().getSimpleName())
-                        if "DocumentAttributeAudio" in name:
-                            performer = str(getattr(attr, "performer", "") or "")
-                            title = str(getattr(attr, "title", "") or "")
-                            if performer and title:
-                                return f": {performer} - {title}"
-                            elif title:
-                                return f": {title}"
-                        elif "DocumentAttributeFilename" in name:
-                            fname = str(getattr(attr, "file_name", "") or "")
-                            if fname:
-                                fname_candidate = f": {fname}"
-                                
-                    if fname_candidate:
-                        return fname_candidate
-
             if hasattr(msg, "getDocumentName"):
                 name = msg.getDocumentName()
                 if name and str(name).strip():
                     return f": {name}"
+                    
+            doc = getattr(msg, "getDocument", lambda: None)()
+            if doc:
+                attrs = getattr(doc, "attributes", None)
+                if attrs:
+                    for i in range(attrs.size()):
+                        attr = attrs.get(i)
+                        name = str(attr.getClass().getSimpleName())
+                        if "DocumentAttributeFilename" in name:
+                            fname = getattr(attr, "file_name", None)
+                            if fname:
+                                return f": {fname}"
         except Exception as e:
             log(f"forward tools: file name extraction error {e}")
+        return ""
+        
+    def _extract_music(self, msg: Any) -> str:
+        # --- extract music metadata using native telegram methods ---
+        try:
+            title = str(getattr(msg, "getMusicTitle", lambda: "")() or "")
+            author = str(getattr(msg, "getMusicAuthor", lambda: "")() or "")
+            
+            if title and author:
+                return f": {author} - {title}"
+            elif title:
+                return f": {title}"
+        except Exception as e:
+            log(f"forward tools: music metadata error {e}")
         return ""
 
     def _get_media_label(self, msg: Any) -> str:
@@ -771,7 +803,10 @@ class ForwardToolsPlugin(BasePlugin):
             if getattr(msg, "isVoice", lambda: False)(): return "[🎤 Voice Message]"
             if getattr(msg, "isRoundVideo", lambda: False)(): return "[📹 Video Message]"
             if getattr(msg, "isVideo", lambda: False)(): return f"[🎬 Video{fname}]"
-            if getattr(msg, "isMusic", lambda: False)(): return f"[🎵 Music{fname}]"
+            if getattr(msg, "isMusic", lambda: False)(): 
+                music_meta = self._extract_music(msg)
+                if music_meta: return f"[🎵 Music{music_meta}]"
+                return f"[🎵 Music{fname}]"
             if getattr(msg, "isPhoto", lambda: False)(): return "[🖼 Photo]"
             if getattr(msg, "isGif", lambda: False)(): return f"[🎞 GIF{fname}]"
             

@@ -1,10 +1,11 @@
+import json
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
 from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy, MethodHook, MethodReplacement
 from ui.settings import Header, Switch, Divider, Text
 from ui.bulletin import BulletinHelper
-from android_utils import log
+from android_utils import log, run_on_ui_thread
 from hook_utils import find_class, get_private_field, set_private_field
 from client_utils import get_last_fragment, get_messages_controller
 
@@ -29,7 +30,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.9"
+__version__ = "2.2.10"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -44,6 +45,7 @@ except Exception as e:
     _NEW_BUTTONS = False
 
 _CA_CLASS = ChatActivity.getClass()
+_ALIASES_KEY: str = "aliases_map"
 
 # --- utility helpers ---
 def _al_to_list(java_al: Any) -> List[Any]:
@@ -182,7 +184,8 @@ class _ClipboardHook(MethodHook):
         self.plugin = plugin
 
     def before_hooked_method(self, param: Any) -> None:
-        # --- intercept native copy to format text and override clipboard string ---
+        # --- mark clipboard pipeline busy to prevent double formatting ---
+        self.plugin._clip_busy = True
         if not self.plugin.get_setting("override_native_copy", True):
             return
         try:
@@ -190,15 +193,46 @@ class _ClipboardHook(MethodHook):
             if not frag or not isinstance(frag, ChatActivity):
                 return
             msgs = self.plugin._selected(frag)
-            # --- if no messages are explicitly selected skip overriding ---
             if len(msgs) == 0:
                 return
-                
             res = self.plugin._format(msgs)
             if res.length() > 0:
                 param.args[0] = res
         except Exception as e:
             log(f"forward tools: clipboard hook error {e}")
+
+    def after_hooked_method(self, param: Any) -> None:
+        # --- release busy flag once original addtoclipboard finishes ---
+        self.plugin._clip_busy = False
+
+class _ClipboardManagerHook(MethodHook):
+    def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        # --- intercept native setprimaryclip for bulk copy path ---
+        if not self.plugin.get_setting("override_native_copy", True):
+            return
+        if self.plugin._clip_busy:
+            return
+        try:
+            frag = get_last_fragment()
+            if not frag or not isinstance(frag, ChatActivity):
+                return
+            msgs = self.plugin._selected(frag)
+            # --- bulk copy requires at least two selected messages ---
+            if len(msgs) < 2:
+                return
+            formatted = self.plugin._format(msgs)
+            if not formatted or formatted.length() == 0:
+                return
+            ClipDataCls = find_class("android.content.ClipData")
+            if not ClipDataCls:
+                return
+            new_clip = ClipDataCls.newPlainText("", formatted)
+            param.args[0] = new_clip
+        except Exception as e:
+            log(f"forward tools: clipboard manager hook error {e}")
 
 class _SelectorHook(MethodHook):
     def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
@@ -341,8 +375,69 @@ class ForwardToolsPlugin(BasePlugin):
     def __init__(self) -> None:
         super().__init__()
         self._sel_hook: Optional[_SelectorHook] = None
+        self._clip_busy: bool = False
+
+    def _load_aliases(self) -> Dict[str, str]:
+        # --- deserialize aliases from single json setting ---
+        raw = self.get_setting(_ALIASES_KEY, "{}")
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else {}
+            return data if isinstance(data, dict) else {}
+        except Exception as e:
+            log(f"forward tools: aliases load error {e}")
+            return {}
+
+    def _save_aliases(self, aliases: Dict[str, str]) -> None:
+        # --- serialize aliases map into single json setting ---
+        try:
+            self.set_setting(_ALIASES_KEY, json.dumps(aliases, ensure_ascii=False))
+        except Exception as e:
+            log(f"forward tools: aliases save error {e}")
+
+    def _get_alias(self, user_id: int) -> str:
+        # --- lookup alias by user id from json map ---
+        aliases = self._load_aliases()
+        return aliases.get(str(user_id), "")
+
+    def _set_alias(self, user_id: int, alias: str) -> None:
+        # --- write or clear alias for given user id ---
+        aliases = self._load_aliases()
+        key = str(user_id)
+        if alias:
+            aliases[key] = alias
+        else:
+            aliases.pop(key, None)
+        self._save_aliases(aliases)
+
+    def _migrate_aliases(self) -> None:
+        # --- move legacy alias_<id> keys into single json map once ---
+        try:
+            all_settings = self.export_settings()
+            if not isinstance(all_settings, dict):
+                return
+            aliases = self._load_aliases()
+            changed = False
+            for key, val in all_settings.items():
+                if not isinstance(key, str) or not key.startswith("alias_"):
+                    continue
+                if not isinstance(val, str) or not val.strip():
+                    continue
+                uid = key[len("alias_"):]
+                if uid and uid not in aliases:
+                    aliases[uid] = val.strip()
+                    changed = True
+                # --- blank legacy key so it never shadows json map again ---
+                self.set_setting(key, "")
+            if changed:
+                self._save_aliases(aliases)
+                log("forward tools: migrated legacy aliases to json map")
+        except Exception as e:
+            log(f"forward tools: aliases migration error {e}")
 
     def on_plugin_load(self) -> None:
+        # --- run one-time migration of alias keys into json map ---
+        self._migrate_aliases()
+        
         # --- register context menu for copy with authors ---
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
@@ -425,6 +520,15 @@ class ForwardToolsPlugin(BasePlugin):
             m_clip.setAccessible(True)
             self.hook_method(m_clip, _ClipboardHook(self))
 
+            ClipboardManagerCls = find_class("android.content.ClipboardManager")
+            ClipDataCls = find_class("android.content.ClipData")
+            if ClipboardManagerCls and ClipDataCls:
+                m_clip_mgr = ClipboardManagerCls.getDeclaredMethod(
+                    "setPrimaryClip", ClipDataCls
+                )
+                m_clip_mgr.setAccessible(True)
+                self.hook_method(m_clip_mgr, _ClipboardManagerHook(self))
+
             log("forward tools: hooks registered successfully")
         except Exception as e:
             log(f"forward tools: hooks init failed {e}")
@@ -466,7 +570,7 @@ class ForwardToolsPlugin(BasePlugin):
                 return
             input_view = EditText(act)
             
-            current_alias = self.get_setting(f"alias_{target_id}", "")
+            current_alias = self._get_alias(target_id)
             if current_alias:
                 input_view.setText(current_alias)
                 input_view.setSelection(len(current_alias))
@@ -477,16 +581,15 @@ class ForwardToolsPlugin(BasePlugin):
 
             def save_alias(bld: Any, which: int) -> None:
                 new_val = input_view.getText().toString().strip()
+                self._set_alias(target_id, new_val)
                 if new_val:
-                    self.set_setting(f"alias_{target_id}", new_val)
                     BulletinHelper.show_success("Alias saved")
                 else:
-                    self.set_setting(f"alias_{target_id}", "")
                     BulletinHelper.show_success("Alias cleared")
                 bld.dismiss()
 
             def clear_alias(bld: Any, which: int) -> None:
-                self.set_setting(f"alias_{target_id}", "")
+                self._set_alias(target_id, "")
                 BulletinHelper.show_success("Alias cleared")
                 bld.dismiss()
 
@@ -506,7 +609,7 @@ class ForwardToolsPlugin(BasePlugin):
             if sender_id == my_id and self.get_setting("replace_me_with_i", False):
                 return "Я"
                 
-            alias = self.get_setting(f"alias_{sender_id}", "")
+            alias = self._get_alias(sender_id)
             if alias:
                 return alias
 
@@ -525,7 +628,7 @@ class ForwardToolsPlugin(BasePlugin):
                         
                         uid = getattr(from_id, "user_id", 0)
                         if uid != 0:
-                            alias = self.get_setting(f"alias_{uid}", "")
+                            alias = self._get_alias(uid)
                             if alias: return alias
                             u = ctrl.getUser(uid)
                             if u:

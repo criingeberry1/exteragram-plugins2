@@ -1,4 +1,5 @@
 import json
+import time
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
@@ -30,7 +31,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.10"
+__version__ = "2.2.11"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -210,7 +211,7 @@ class _ClipboardManagerHook(MethodHook):
         self.plugin = plugin
 
     def before_hooked_method(self, param: Any) -> None:
-        # --- intercept native setprimaryclip for bulk copy path ---
+        # --- intercept native setprimaryclip using copy intent snapshot ---
         if not self.plugin.get_setting("override_native_copy", True):
             return
         if self.plugin._clip_busy:
@@ -219,16 +220,35 @@ class _ClipboardManagerHook(MethodHook):
             frag = get_last_fragment()
             if not frag or not isinstance(frag, ChatActivity):
                 return
-            msgs = self.plugin._selected(frag)
-            # --- bulk copy requires at least two selected messages ---
+
+            try:
+                current_dialog = get_private_field(frag, "dialog_id")
+            except Exception as e:
+                log(f"forward tools: dialog id fetch failed {e}")
+                current_dialog = None
+
+            sel = self.plugin._sel_hook
+            msgs: List[Any] = []
+            if sel:
+                msgs = sel.take_copy_intent(current_dialog)
+
+            # --- fallback to live selection if intent expired or empty ---
+            if len(msgs) < 2:
+                live = self.plugin._selected(frag)
+                if len(live) >= 2:
+                    msgs = live
+
             if len(msgs) < 2:
                 return
+
             formatted = self.plugin._format(msgs)
             if not formatted or formatted.length() == 0:
                 return
+
             ClipDataCls = find_class("android.content.ClipData")
             if not ClipDataCls:
                 return
+
             new_clip = ClipDataCls.newPlainText("", formatted)
             param.args[0] = new_clip
         except Exception as e:
@@ -241,6 +261,46 @@ class _SelectorHook(MethodHook):
         self._in_group: bool = False
         self._last_in_group: bool = False
         self._skip_after: bool = False
+        # --- copy intent snapshot fields ---
+        self._intent_msgs: List[Any] = []
+        self._intent_dialog: Optional[int] = None
+        self._intent_expire: float = 0.0
+
+    def set_copy_intent(self, msgs: List[Any], dialog_id: Optional[int]) -> None:
+        # --- preserve selection before it gets wiped by telegram ---
+        if not msgs:
+            return
+        self._intent_msgs = list(msgs)
+        self._intent_dialog = dialog_id
+        self._intent_expire = time.time() + 3.0
+
+    def take_copy_intent(self, expected_dialog_id: Optional[int]) -> List[Any]:
+        # --- consume snapshot with expiry and dialog id check ---
+        if time.time() > self._intent_expire:
+            return []
+        if expected_dialog_id is not None and self._intent_dialog is not None:
+            if self._intent_dialog != expected_dialog_id:
+                return []
+        msgs = list(self._intent_msgs)
+        self._intent_msgs = []
+        self._intent_dialog = None
+        self._intent_expire = 0.0
+        return msgs
+
+    def _snapshot_from_live(self, this_object: Any) -> None:
+        # --- capture current selected messages from chatactivity into intent ---
+        try:
+            msgs = self.plugin._selected(this_object)
+            if not msgs:
+                return
+            try:
+                dialog_id = get_private_field(this_object, "dialog_id")
+            except Exception as e:
+                log(f"forward tools: dialog id fetch failed {e}")
+                dialog_id = None
+            self.set_copy_intent(msgs, dialog_id)
+        except Exception as e:
+            log(f"forward tools: snapshot live error {e}")
 
     def before_hooked_method(self, param: Any) -> None:
         # --- replace sparse array to bypass cap ---
@@ -268,10 +328,13 @@ class _SelectorHook(MethodHook):
     def after_hooked_method(self, param: Any) -> None:
         # --- merge selection back from unlimited local store ---
         if not self.plugin.get_setting("no_forward_limit", True):
+            # --- still refresh intent snapshot for native limit path ---
+            self._snapshot_from_live(param.thisObject)
             return
 
         if self._skip_after:
             self._skip_after = False
+            self._snapshot_from_live(param.thisObject)
             return
 
         if self._in_group:
@@ -313,8 +376,11 @@ class _SelectorHook(MethodHook):
         _update_reply_btn(ca, len(self.store) == 1)
         _update_select_btn(ca)
 
+        # --- refresh intent snapshot right after each selection change ---
+        self._snapshot_from_live(ca)
+
     def clear(self) -> None:
-        # --- wipe local selection state ---
+        # --- wipe local selection state but preserve copy intent ---
         self.store.clear()
 
 class _ClearHook(MethodHook):
@@ -322,7 +388,11 @@ class _ClearHook(MethodHook):
         self._sel = sel
 
     def before_hooked_method(self, param: Any) -> None:
-        # --- clear store on action mode dismiss ---
+        # --- snapshot selection before action mode wipes selectedmessagesids ---
+        try:
+            self._sel._snapshot_from_live(param.thisObject)
+        except Exception as e:
+            log(f"forward tools: clear hook snapshot error {e}")
         self._sel.clear()
 
 class _MultiSelHook(MethodHook):

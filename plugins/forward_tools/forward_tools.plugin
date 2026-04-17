@@ -29,7 +29,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.6"
+__version__ = "2.2.7"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -560,16 +560,23 @@ class ForwardToolsPlugin(BasePlugin):
         return "Unknown"
 
     def _extract_text_safe(self, obj: Any) -> str:
-        # --- parse clean string out of textwithentities or fallback ---
+        # --- parse clean string out of textwithentities forcefully via reflection ---
         if not obj:
             return ""
-        cls_name = str(obj.__class__.__name__)
-        if "textWithEntities" in cls_name.lower():
-            try:
-                return str(getattr(obj, "text", obj))
-            except Exception as e:
-                log(f"forward tools: text entity parse error {e}")
-                return str(obj)
+        try:
+            if hasattr(obj, "text"):
+                val = getattr(obj, "text")
+                if val is not None:
+                    return str(val)
+                    
+            f = obj.getClass().getField("text")
+            if f:
+                f.setAccessible(True)
+                val = f.get(obj)
+                if val is not None:
+                    return str(val)
+        except Exception:
+            pass
         return str(obj)
 
     def _extract_poll(self, msg: Any) -> Optional[str]:
@@ -657,32 +664,54 @@ class ForwardToolsPlugin(BasePlugin):
             log(f"forward tools: location extraction error {e}")
         return None
 
-    def _extract_file_name(self, msg: Any) -> str:
-        # --- attempt to parse real file name using native message methods ---
+    def _extract_todo_debug(self, media: Any) -> str:
+        # --- reflection dumper to uncover internal fields of the new todo list feature ---
+        lines = ["[📋 Task List (Debug Dump)]"]
         try:
-            if hasattr(msg, "getDocumentName"):
-                name = msg.getDocumentName()
-                if name and str(name).strip():
-                    return f": {name}"
-                    
+            fields = media.getClass().getFields()
+            for i in range(len(fields)):
+                f = fields[i]
+                f.setAccessible(True)
+                name = f.getName()
+                val = f.get(media)
+                val_str = str(val)
+                if val and hasattr(val, "size"):
+                    val_str = f"Array[size={val.size()}]"
+                lines.append(f" - {name} = {val_str}")
+        except Exception as e:
+            lines.append(f" Error: {e}")
+        return "\n".join(lines)
+
+    def _extract_file_name(self, msg: Any) -> str:
+        # --- scan document attributes prioritizing audio metadata over raw filename ---
+        try:
             doc = getattr(msg, "getDocument", lambda: None)()
             if doc:
                 attrs = getattr(doc, "attributes", None)
                 if attrs:
+                    fname_candidate = ""
                     for i in range(attrs.size()):
                         attr = attrs.get(i)
                         name = str(attr.getClass().getSimpleName())
-                        if "DocumentAttributeFilename" in name:
-                            fname = getattr(attr, "file_name", None)
-                            if fname:
-                                return f": {fname}"
-                        elif "DocumentAttributeAudio" in name:
-                            performer = getattr(attr, "performer", "") or ""
-                            title = getattr(attr, "title", "") or ""
+                        if "DocumentAttributeAudio" in name:
+                            performer = str(getattr(attr, "performer", "") or "")
+                            title = str(getattr(attr, "title", "") or "")
                             if performer and title:
                                 return f": {performer} - {title}"
                             elif title:
                                 return f": {title}"
+                        elif "DocumentAttributeFilename" in name:
+                            fname = str(getattr(attr, "file_name", "") or "")
+                            if fname:
+                                fname_candidate = f": {fname}"
+                                
+                    if fname_candidate:
+                        return fname_candidate
+
+            if hasattr(msg, "getDocumentName"):
+                name = msg.getDocumentName()
+                if name and str(name).strip():
+                    return f": {name}"
         except Exception as e:
             log(f"forward tools: file name extraction error {e}")
         return ""
@@ -708,6 +737,10 @@ class ForwardToolsPlugin(BasePlugin):
                 res = self._extract_location(msg)
                 if res: return res
                 return "[📍 Location]"
+                
+            if "ToDo" in media_cls:
+                res = self._extract_todo_debug(media)
+                if res: return res
                 
             if getattr(msg, "isSticker", lambda: False)() or getattr(msg, "isAnimatedSticker", lambda: False)():
                 emoji = "👾"

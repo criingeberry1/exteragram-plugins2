@@ -4,7 +4,7 @@ from datetime import datetime
 from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy, MethodHook, MethodReplacement
 from ui.settings import Header, Switch, Divider, Text
 from ui.bulletin import BulletinHelper
-from android_utils import log, run_on_ui_thread
+from android_utils import log
 from hook_utils import find_class, get_private_field, set_private_field
 from client_utils import get_last_fragment, get_messages_controller
 
@@ -29,7 +29,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.1"
+__version__ = "2.2.2"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -39,7 +39,8 @@ try:
     from packaging.version import Version
     _client_ver = Version(BuildVars.BUILD_VERSION_STRING)
     _NEW_BUTTONS: bool = _client_ver >= Version("12.2.0")
-except Exception:
+except Exception as e:
+    log(f"forward tools: version detection error {e}")
     _NEW_BUTTONS = False
 
 _CA_CLASS = ChatActivity.getClass()
@@ -75,16 +76,18 @@ def _make_sparse(chat_activity: Any) -> Any:
     # --- create a fresh sparse array compatible with chatactivity ---
     try:
         return chat_activity.SparseArrayWithTouch()
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"forward tools: sparse array with touch instantiation failed {e}")
+        
     try:
         cls = find_class("org.telegram.ui.ChatActivity$SparseArrayWithTouch")
         if cls:
             con = cls.getDeclaredConstructors()[0]
             con.setAccessible(True)
             return con.newInstance(chat_activity)
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"forward tools: reflective sparse array instantiation failed {e}")
+        
     from android.util import SparseArray
     return SparseArray()
 
@@ -99,7 +102,7 @@ def _dec_counter(ca: Any, counter_field: str, button_field: str) -> None:
                 btn.setEnabled(True)
                 btn.setAlpha(1.0)
     except Exception as e:
-        log(f"ForwardTools: dec counter error {e}")
+        log(f"forward tools: dec counter error {e}")
 
 def _cancel_selection(ca: Any) -> None:
     # --- dismiss message selection action mode ---
@@ -111,7 +114,7 @@ def _cancel_selection(ca: Any) -> None:
         m2.setAccessible(True)
         m2.invoke(ca, [True])
     except Exception as e:
-        log(f"ForwardTools: cancel selection error {e}")
+        log(f"forward tools: cancel selection error {e}")
 
 def _update_reply_btn(ca: Any, show: bool) -> None:
     # --- toggle reply button visibility ---
@@ -125,7 +128,7 @@ def _update_reply_btn(ca: Any, show: bool) -> None:
             if btn:
                 btn.setVisibility(View.VISIBLE if show else View.GONE)
     except Exception as e:
-        log(f"ForwardTools: reply btn error {e}")
+        log(f"forward tools: reply btn error {e}")
 
 def _update_select_btn(ca: Any) -> None:
     # --- update select between button based on selection gaps ---
@@ -160,7 +163,7 @@ def _update_select_btn(ca: Any) -> None:
                 if btn.getVisibility() != vis:
                     btn.setVisibility(vis)
     except Exception as e:
-        log(f"ForwardTools: select btn error {e}")
+        log(f"forward tools: select btn error {e}")
 
 # --- hooks ---
 class _ClipboardHook(MethodHook):
@@ -184,7 +187,7 @@ class _ClipboardHook(MethodHook):
             if res.length() > 0:
                 param.args[0] = res
         except Exception as e:
-            log(f"ForwardTools: clipboard hook error {e}")
+            log(f"forward tools: clipboard hook error {e}")
 
 class _SelectorHook(MethodHook):
     def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
@@ -291,7 +294,7 @@ class _MultiSelHook(MethodHook):
             m = listener.getClass().getMethod("limitReached")
             self.plugin.hook_method(m, _LimitBypass())
         except Exception as e:
-            log(f"ForwardTools: multi sel hook error {e}")
+            log(f"forward tools: multi sel hook error {e}")
 
 class _LimitBypass(MethodReplacement):
     def replace_hooked_method(self, param: Any) -> bool:
@@ -411,9 +414,9 @@ class ForwardToolsPlugin(BasePlugin):
             m_clip.setAccessible(True)
             self.hook_method(m_clip, _ClipboardHook(self))
 
-            log("ForwardTools: hooks registered successfully")
+            log("forward tools: hooks registered successfully")
         except Exception as e:
-            log(f"ForwardTools: hooks init failed {e}")
+            log(f"forward tools: hooks init failed {e}")
 
     def _open_plugin_settings(self, context: Any = None) -> None:
         # --- open native plugin settings directly from chat ---
@@ -423,7 +426,7 @@ class ForwardToolsPlugin(BasePlugin):
             if last_fragment and java_plugin:
                 last_fragment.presentFragment(PluginSettingsActivity(java_plugin))
         except Exception as e:
-            log(f"ForwardTools: error opening settings {e}")
+            log(f"forward tools: error opening settings {e}")
             BulletinHelper.show_error("Failed to open settings")
 
     def _on_set_alias(self, ctx: Dict[str, Any]) -> None:
@@ -480,7 +483,7 @@ class ForwardToolsPlugin(BasePlugin):
             bld.set_negative_button("Clear", clear_alias)
             bld.show()
         except Exception as e:
-            log(f"ForwardTools: set alias error {e}")
+            log(f"forward tools: set alias error {e}")
             BulletinHelper.show_error("Failed to open alias dialog")
 
     def _author(self, msg: Any) -> str:
@@ -541,24 +544,63 @@ class ForwardToolsPlugin(BasePlugin):
                 c = ctrl.getChat(-sender_id)
                 if c and c.title:
                     return str(c.title).strip()
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"forward tools: author extraction error {e}")
         return "Unknown"
 
+    def _get_media_label(self, msg: Any) -> str:
+        # --- determine english media label strictly bypassing customized strings ---
+        try:
+            if getattr(msg, "isSticker", lambda: False)(): return "[Sticker]"
+            if getattr(msg, "isAnimatedSticker", lambda: False)(): return "[Animated Sticker]"
+            if getattr(msg, "isVoice", lambda: False)(): return "[Voice Message]"
+            if getattr(msg, "isRoundVideo", lambda: False)(): return "[Video Message]"
+            if getattr(msg, "isVideo", lambda: False)(): return "[Video]"
+            if getattr(msg, "isPhoto", lambda: False)(): return "[Photo]"
+            if getattr(msg, "isMusic", lambda: False)(): return "[Music]"
+            if getattr(msg, "isGif", lambda: False)(): return "[GIF]"
+            if getattr(msg, "isPoll", lambda: False)(): return "[Poll]"
+        except Exception as e:
+            log(f"forward tools: media label error {e}")
+        return "[Media]"
+
     def _raw_text(self, msg: Any) -> Any:
-        # --- extract native charsequence to preserve spans and premium emojis ---
-        message_text = getattr(msg, "messageText", None)
-        if message_text:
-            return message_text
-        caption = getattr(msg, "caption", None)
-        if caption:
-            return caption
-        owner = getattr(msg, "messageOwner", None)
-        if owner:
-            raw = getattr(owner, "message", None)
-            if raw:
-                return raw
-        return None
+        # --- extract native charsequence to preserve spans and handle english media labels ---
+        try:
+            m_type = getattr(msg, "type", 0)
+            
+            # --- type zero is purely text ---
+            if m_type == 0:
+                message_text = getattr(msg, "messageText", None)
+                if message_text:
+                    return message_text
+                owner = getattr(msg, "messageOwner", None)
+                if owner:
+                    raw = getattr(owner, "message", None)
+                    if raw:
+                        return raw
+                return None
+
+            # --- non zero type means media so we explicitly build the label ---
+            label = self._get_media_label(msg)
+            caption = getattr(msg, "caption", None)
+
+            SpannableStringBuilder = find_class("android.text.SpannableStringBuilder")
+            if not SpannableStringBuilder:
+                return caption if caption else label
+
+            builder = SpannableStringBuilder()
+            builder.append(label)
+            
+            if caption and caption.length() > 0:
+                builder.append("\n")
+                builder.append(caption)
+                
+            return builder
+            
+        except Exception as e:
+            log(f"forward tools: raw text extraction error {e}")
+            return None
 
     def _text(self, msg: Any) -> str:
         # --- fallback for plain string extraction in short quotes ---
@@ -585,7 +627,7 @@ class ForwardToolsPlugin(BasePlugin):
                 key=lambda m: getattr(getattr(m, "messageOwner", None), "date", 0)
             )
         except Exception as e:
-            log(f"ForwardTools: selected fetch error {e}")
+            log(f"forward tools: selected fetch error {e}")
             return []
 
     def _format(self, msgs: List[Any]) -> Any:
@@ -611,8 +653,8 @@ class ForwardToolsPlugin(BasePlugin):
             if stamp:
                 try:
                     dt = datetime.fromtimestamp(int(stamp))
-                except Exception:
-                    pass
+                except Exception as e:
+                    log(f"forward tools: time formatting error {e}")
 
             d_str: str = dt.strftime("%d.%m.%Y") if dt else ""
             t_str: str = dt.strftime("%H:%M") if dt else ""
@@ -680,7 +722,7 @@ class ForwardToolsPlugin(BasePlugin):
             AndroidUtilities.addToClipboard(result)
             BulletinHelper.show_copied_to_clipboard()
         except Exception as e:
-            log(f"ForwardTools: explicit copy error {e}")
+            log(f"forward tools: explicit copy error {e}")
             BulletinHelper.show_error("Copy failed")
 
     def create_settings(self) -> List[Any]:

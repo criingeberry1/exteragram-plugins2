@@ -29,7 +29,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.4"
+__version__ = "2.2.5"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -164,6 +164,16 @@ def _update_select_btn(ca: Any) -> None:
                     btn.setVisibility(vis)
     except Exception as e:
         log(f"forward tools: select btn error {e}")
+
+def _bytes_key(obj: Any) -> bytes:
+    # --- safely convert java byte array to python bytes for mapping ---
+    try:
+        return bytes(obj)
+    except Exception:
+        try:
+            return bytes([x for x in obj])
+        except Exception:
+            return b""
 
 # --- hooks ---
 class _ClipboardHook(MethodHook):
@@ -548,9 +558,137 @@ class ForwardToolsPlugin(BasePlugin):
             log(f"forward tools: author extraction error {e}")
         return "Unknown"
 
-    def _get_media_label(self, msg: Any) -> str:
-        # --- determine english media label dynamically fetching original sticker emoji ---
+    def _extract_poll(self, msg: Any) -> Optional[str]:
+        # --- parse poll structure and render ascii bar chart ---
         try:
+            owner = getattr(msg, "messageOwner", None)
+            media = getattr(owner, "media", None)
+            poll = getattr(media, "poll", None)
+            results = getattr(media, "results", None)
+            
+            if not poll: return None
+            
+            question = str(getattr(poll, "question", "Poll"))
+            answers_list = getattr(poll, "answers", None)
+            results_list = getattr(results, "results", None)
+            total_voters = getattr(results, "total_voters", 0) or 0
+            
+            voters_map = {}
+            if results_list:
+                for i in range(results_list.size()):
+                    r = results_list.get(i)
+                    opt = getattr(r, "option", None)
+                    cnt = getattr(r, "voters", 0)
+                    if opt is not None:
+                        try:
+                            voters_map[_bytes_key(opt)] = cnt
+                        except Exception:
+                            pass
+                            
+            lines = [f"[📊 Poll: {question}]"]
+            if answers_list:
+                for i in range(answers_list.size()):
+                    ans = answers_list.get(i)
+                    text = str(getattr(ans, "text", ""))
+                    opt = getattr(ans, "option", None)
+                    voters = 0
+                    if opt is not None:
+                        try:
+                            voters = voters_map.get(_bytes_key(opt), 0)
+                        except Exception:
+                            pass
+                            
+                    percent = int((voters / total_voters) * 100) if total_voters > 0 else 0
+                    filled = int(percent / 10)
+                    bar = "■" * filled + "□" * (10 - filled)
+                    lines.append(f"[{bar}] {percent}% — {text}")
+                    
+            return "\n".join(lines)
+        except Exception as e:
+            log(f"forward tools: poll extraction error {e}")
+            return None
+
+    def _extract_contact(self, msg: Any) -> Optional[str]:
+        # --- parse contact metadata ---
+        try:
+            owner = getattr(msg, "messageOwner", None)
+            media = getattr(owner, "media", None)
+            if not media: return None
+            
+            first = str(getattr(media, "first_name", "") or "")
+            last = str(getattr(media, "last_name", "") or "")
+            phone = str(getattr(media, "phone_number", "") or "")
+            
+            name = f"{first} {last}".strip()
+            if name and phone:
+                return f"[👤 Contact: {name}, {phone}]"
+            elif name:
+                return f"[👤 Contact: {name}]"
+        except Exception as e:
+            log(f"forward tools: contact extraction error {e}")
+        return None
+
+    def _extract_location(self, msg: Any) -> Optional[str]:
+        # --- parse location and venue metadata ---
+        try:
+            owner = getattr(msg, "messageOwner", None)
+            media = getattr(owner, "media", None)
+            if not media: return None
+            
+            title = str(getattr(media, "title", "") or "")
+            addr = str(getattr(media, "address", "") or "")
+            
+            if title and addr:
+                return f"[📍 Venue: {title}, {addr}]"
+            elif title:
+                return f"[📍 Venue: {title}]"
+        except Exception as e:
+            log(f"forward tools: location extraction error {e}")
+        return None
+
+    def _extract_file_name(self, msg: Any) -> str:
+        # --- parse document attributes for real file name or track info ---
+        try:
+            doc = getattr(msg, "getDocument", lambda: None)()
+            if doc:
+                attrs = getattr(doc, "attributes", None)
+                if attrs:
+                    for i in range(attrs.size()):
+                        attr = attrs.get(i)
+                        name = str(attr.getClass().getSimpleName())
+                        if "DocumentAttributeFilename" in name:
+                            fname = getattr(attr, "file_name", None)
+                            if fname:
+                                return f": {fname}"
+                        elif "DocumentAttributeAudio" in name:
+                            performer = getattr(attr, "performer", "") or ""
+                            title = getattr(attr, "title", "") or ""
+                            if performer and title:
+                                return f": {performer} - {title}"
+                            elif title:
+                                return f": {title}"
+        except Exception as e:
+            log(f"forward tools: file name extraction error {e}")
+        return ""
+
+    def _get_media_label(self, msg: Any) -> str:
+        # --- dynamically route to specific meta extractors or english fallbacks ---
+        try:
+            if getattr(msg, "isPoll", lambda: False)():
+                res = self._extract_poll(msg)
+                if res: return res
+                return "[📊 Poll]"
+                
+            if getattr(msg, "isContact", lambda: False)():
+                res = self._extract_contact(msg)
+                if res: return res
+                return "[👤 Contact]"
+                
+            if getattr(msg, "isLocation", lambda: False)():
+                res = self._extract_location(msg)
+                if res: return res
+                return "[📍 Location]"
+                
             if getattr(msg, "isSticker", lambda: False)() or getattr(msg, "isAnimatedSticker", lambda: False)():
                 emoji = "👾"
                 try:
@@ -576,19 +714,21 @@ class ForwardToolsPlugin(BasePlugin):
                 kind = "Animated Sticker" if getattr(msg, "isAnimatedSticker", lambda: False)() else "Sticker"
                 return f"[{emoji} {kind}]"
 
+            fname = self._extract_file_name(msg)
             if getattr(msg, "isVoice", lambda: False)(): return "[🎤 Voice Message]"
             if getattr(msg, "isRoundVideo", lambda: False)(): return "[📹 Video Message]"
-            if getattr(msg, "isVideo", lambda: False)(): return "[🎬 Video]"
+            if getattr(msg, "isVideo", lambda: False)(): return f"[🎬 Video{fname}]"
+            if getattr(msg, "isMusic", lambda: False)(): return f"[🎵 Music{fname}]"
             if getattr(msg, "isPhoto", lambda: False)(): return "[🖼 Photo]"
-            if getattr(msg, "isMusic", lambda: False)(): return "[🎵 Music]"
-            if getattr(msg, "isGif", lambda: False)(): return "[🎞 GIF]"
-            if getattr(msg, "isPoll", lambda: False)(): return "[📊 Poll]"
+            if getattr(msg, "isGif", lambda: False)(): return f"[🎞 GIF{fname}]"
+            
+            if fname: return f"[📎 File{fname}]"
         except Exception as e:
             log(f"forward tools: media label error {e}")
         return "[📎 Media]"
 
     def _raw_text(self, msg: Any) -> Any:
-        # --- extract native charsequence to preserve spans and handle english media labels ---
+        # --- extract native charsequence to preserve spans and handle complex labels ---
         try:
             m_type = getattr(msg, "type", 0)
             

@@ -29,7 +29,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.2"
+__version__ = "2.2.3"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -549,20 +549,20 @@ class ForwardToolsPlugin(BasePlugin):
         return "Unknown"
 
     def _get_media_label(self, msg: Any) -> str:
-        # --- determine english media label strictly bypassing customized strings ---
+        # --- determine english media label with emoji prefix ---
         try:
-            if getattr(msg, "isSticker", lambda: False)(): return "[Sticker]"
-            if getattr(msg, "isAnimatedSticker", lambda: False)(): return "[Animated Sticker]"
-            if getattr(msg, "isVoice", lambda: False)(): return "[Voice Message]"
-            if getattr(msg, "isRoundVideo", lambda: False)(): return "[Video Message]"
-            if getattr(msg, "isVideo", lambda: False)(): return "[Video]"
-            if getattr(msg, "isPhoto", lambda: False)(): return "[Photo]"
-            if getattr(msg, "isMusic", lambda: False)(): return "[Music]"
-            if getattr(msg, "isGif", lambda: False)(): return "[GIF]"
-            if getattr(msg, "isPoll", lambda: False)(): return "[Poll]"
+            if getattr(msg, "isSticker", lambda: False)(): return "[👾 Sticker]"
+            if getattr(msg, "isAnimatedSticker", lambda: False)(): return "[✨ Animated Sticker]"
+            if getattr(msg, "isVoice", lambda: False)(): return "[🎤 Voice Message]"
+            if getattr(msg, "isRoundVideo", lambda: False)(): return "[📹 Video Message]"
+            if getattr(msg, "isVideo", lambda: False)(): return "[🎬 Video]"
+            if getattr(msg, "isPhoto", lambda: False)(): return "[🖼 Photo]"
+            if getattr(msg, "isMusic", lambda: False)(): return "[🎵 Music]"
+            if getattr(msg, "isGif", lambda: False)(): return "[🎞 GIF]"
+            if getattr(msg, "isPoll", lambda: False)(): return "[📊 Poll]"
         except Exception as e:
             log(f"forward tools: media label error {e}")
-        return "[Media]"
+        return "[📎 Media]"
 
     def _raw_text(self, msg: Any) -> Any:
         # --- extract native charsequence to preserve spans and handle english media labels ---

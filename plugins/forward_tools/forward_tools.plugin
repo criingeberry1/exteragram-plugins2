@@ -29,7 +29,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.3"
+__version__ = "2.2.4"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -549,10 +549,33 @@ class ForwardToolsPlugin(BasePlugin):
         return "Unknown"
 
     def _get_media_label(self, msg: Any) -> str:
-        # --- determine english media label with emoji prefix ---
+        # --- determine english media label dynamically fetching original sticker emoji ---
         try:
-            if getattr(msg, "isSticker", lambda: False)(): return "[👾 Sticker]"
-            if getattr(msg, "isAnimatedSticker", lambda: False)(): return "[✨ Animated Sticker]"
+            if getattr(msg, "isSticker", lambda: False)() or getattr(msg, "isAnimatedSticker", lambda: False)():
+                emoji = "👾"
+                try:
+                    if hasattr(msg, "getStickerEmoji"):
+                        val = msg.getStickerEmoji()
+                        if val:
+                            emoji = str(val)
+                    else:
+                        doc = getattr(msg, "getDocument", lambda: None)()
+                        if doc:
+                            attrs = getattr(doc, "attributes", None)
+                            if attrs:
+                                for i in range(attrs.size()):
+                                    attr = attrs.get(i)
+                                    if "documentAttributeSticker" in str(attr.getClass().getSimpleName()):
+                                        alt = getattr(attr, "alt", None)
+                                        if alt:
+                                            emoji = str(alt)
+                                            break
+                except Exception as e:
+                    log(f"forward tools: sticker emoji error {e}")
+                    
+                kind = "Animated Sticker" if getattr(msg, "isAnimatedSticker", lambda: False)() else "Sticker"
+                return f"[{emoji} {kind}]"
+
             if getattr(msg, "isVoice", lambda: False)(): return "[🎤 Voice Message]"
             if getattr(msg, "isRoundVideo", lambda: False)(): return "[📹 Video Message]"
             if getattr(msg, "isVideo", lambda: False)(): return "[🎬 Video]"

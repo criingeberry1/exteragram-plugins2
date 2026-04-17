@@ -29,7 +29,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.8"
+__version__ = "2.2.9"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -664,52 +664,45 @@ class ForwardToolsPlugin(BasePlugin):
             log(f"forward tools: location extraction error {e}")
         return None
 
-    def _extract_todo_debug(self, media: Any) -> str:
-        # --- deep reflection dumper to uncover todo inner lists ---
-        lines = ["[📋 Task List (Deep Dump)]"]
+    def _extract_todo(self, msg: Any) -> Optional[str]:
+        # --- extract native telegram task list rendering checkboxes ---
         try:
+            owner = getattr(msg, "messageOwner", None)
+            media = getattr(owner, "media", None)
+            if not media: return None
+
             todo = getattr(media, "todo", None)
-            if todo:
-                lines.append(" --- todo object ---")
-                fields = todo.getClass().getFields()
-                for i in range(len(fields)):
-                    f = fields[i]
-                    f.setAccessible(True)
-                    val = f.get(todo)
-                    if val and hasattr(val, "size"):
-                        lines.append(f" - {f.getName()} = Array[size={val.size()}]")
-                        for j in range(val.size()):
-                            item = val.get(j)
-                            lines.append(f"   [{j}] = {item.getClass().getSimpleName()}")
-                            try:
-                                sub_fields = item.getClass().getFields()
-                                for k in range(len(sub_fields)):
-                                    sf = sub_fields[k]
-                                    sf.setAccessible(True)
-                                    lines.append(f"     {sf.getName()} = {sf.get(item)}")
-                            except Exception as e:
-                                log(f"forward tools: todo item dump error {e}")
-                    else:
-                        lines.append(f" - {f.getName()} = {val}")
-                        
+            if not todo: return None
+
+            title_obj = getattr(todo, "title", "Task List")
+            title = self._extract_text_safe(title_obj)
+
+            lines = [f"[📋 Task List: {title}]"]
+
+            completed_ids = set()
             completions = getattr(media, "completions", None)
             if completions and hasattr(completions, "size"):
-                lines.append(" --- completions array ---")
-                lines.append(f" size = {completions.size()}")
                 for i in range(completions.size()):
                     c = completions.get(i)
-                    lines.append(f"  [{i}] = {c.getClass().getSimpleName()}")
-                    try:
-                        c_fields = c.getClass().getFields()
-                        for k in range(len(c_fields)):
-                            cf = c_fields[k]
-                            cf.setAccessible(True)
-                            lines.append(f"    {cf.getName()} = {cf.get(c)}")
-                    except Exception as e:
-                        log(f"forward tools: completion dump error {e}")
+                    cid = getattr(c, "id", None)
+                    if cid is not None:
+                        completed_ids.add(cid)
+
+            todo_list = getattr(todo, "list", None)
+            if todo_list and hasattr(todo_list, "size"):
+                for i in range(todo_list.size()):
+                    item = todo_list.get(i)
+                    item_id = getattr(item, "id", None)
+                    item_title_obj = getattr(item, "title", "")
+                    item_text = self._extract_text_safe(item_title_obj)
+
+                    checkbox = "☑" if item_id in completed_ids else "☐"
+                    lines.append(f"{checkbox} {item_text}")
+
+            return "\n".join(lines)
         except Exception as e:
-            lines.append(f" Error: {e}")
-        return "\n".join(lines)
+            log(f"forward tools: todo extraction error {e}")
+            return None
 
     def _extract_file_name(self, msg: Any) -> str:
         # --- attempt to parse real file name using native message methods ---
@@ -771,7 +764,7 @@ class ForwardToolsPlugin(BasePlugin):
                 return "[📍 Location]"
                 
             if "ToDo" in media_cls:
-                res = self._extract_todo_debug(media)
+                res = self._extract_todo(msg)
                 if res: return res
                 
             if getattr(msg, "isSticker", lambda: False)() or getattr(msg, "isAnimatedSticker", lambda: False)():

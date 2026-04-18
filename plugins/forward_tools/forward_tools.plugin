@@ -4,7 +4,7 @@ from datetime import datetime
 from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy, MethodHook, MethodReplacement, hook_filters, HookFilter
 from ui.settings import Header, Switch, Divider, Text
 from ui.bulletin import BulletinHelper
-from android_utils import log
+from android_utils import log, run_on_ui_thread
 from hook_utils import find_class, get_private_field, set_private_field
 from client_utils import get_last_fragment, get_messages_controller
 
@@ -25,7 +25,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.3.2"
+__version__ = "2.3.3"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -34,101 +34,94 @@ __min_version__ = "11.12.0"
 def _al_to_list(java_al: Any) -> List[Any]:
     # --- convert java arraylist to python list safely ---
     if not java_al: return []
-    return [java_al.get(i) for i in range(java_al.size())]
+    try:
+        return [java_al.get(i) for i in range(java_al.size())]
+    except:
+        return []
 
-def _list_to_al(py_list: List[Any]) -> Any:
-    # --- convert python list to java arraylist for methods ---
-    result = ArrayList()
-    for item in py_list:
-        result.add(item)
-    return result
-
-# --- hooks for clipboard manipulation ---
-class _CopyMessagesHook(MethodHook):
+# --- main hooks logic ---
+class _GlobalCopyInterceptor(MethodHook):
     def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
         self.plugin = plugin
+        self.is_processing = False
 
     def before_hooked_method(self, param: Any) -> None:
-        # --- intercept copy event directly in chatactivity ---
-        if not self.plugin.get_setting("override_native_copy", True):
-            return
-
+        # --- logic for copyMessages overloads ---
+        # --- telegram can have copyMessages(ArrayList) or copyMessages(ArrayList, String) etc ---
+        if self.is_processing: return
+        
         try:
-            # --- arg 0 is arraylist of messageobjects ---
             messages_al = param.args[0]
-            if not messages_al or messages_al.isEmpty():
+            if not isinstance(messages_al, ArrayList) or messages_al.isEmpty():
                 return
 
-            messages = _al_to_list(messages_al)
-            # --- sort by date to ensure logical flow ---
-            messages.sort(key=lambda m: getattr(getattr(m, "messageOwner", None), "date", 0))
+            self.is_processing = True
+            msgs = _al_to_list(messages_al)
+            # --- sort messages by date for chronological order ---
+            msgs.sort(key=lambda m: getattr(getattr(m, "messageOwner", None), "date", 0))
 
-            formatted_text = self.plugin._format_batch(messages)
-            if formatted_text and formatted_text.length() > 0:
-                # --- put formatted text to clipboard and skip original logic ---
-                AndroidUtilities.addToClipboard(formatted_text)
+            formatted = self.plugin._format_batch(msgs)
+            if formatted and formatted.length() > 0:
+                # --- manually push to clipboard and cancel original method ---
+                AndroidUtilities.addToClipboard(formatted)
                 BulletinHelper.show_copied_to_clipboard()
                 param.setResult(None)
         except Exception as e:
-            log(f"forward tools: copy hook error {e}")
+            log(f"forward tools: copy interceptor error {e}")
+        finally:
+            self.is_processing = False
 
-# --- hooks for selection limit bypass ---
-class _SelectorHook(MethodHook):
+class _ClipboardGuard(MethodHook):
     def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
         self.plugin = plugin
-        self.store: Dict[int, Any] = {}
 
     def before_hooked_method(self, param: Any) -> None:
-        # --- prevent ui lock by replacing sparsearray ---
+        # --- extra guard for native single message copy ---
+        if not self.plugin.get_setting("override_native_copy", True):
+            return
+        # --- here we could potentially re-format raw text if needed ---
+        pass
+
+class _SelectorLimitHook(MethodHook):
+    def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
+        self.plugin = plugin
+
+    def before_hooked_method(self, param: Any) -> None:
+        # --- bypass 100 messages selection limit ---
         if not self.plugin.get_setting("no_forward_limit", True):
             return
         ca = param.thisObject
-        sp = get_private_field(ca, "selectedMessagesIds")
-        # --- replace with fresh one to bypass fixed size or proxy checks ---
-        idx = 0 if param.args[0].getDialogId() == get_private_field(ca, "dialog_id") else 1
         try:
-            sp[idx] = ca.SparseArrayWithTouch()
-            set_private_field(ca, "selectedMessagesIds", sp)
+            sp = get_private_field(ca, "selectedMessagesIds")
+            msg = param.args[0]
+            idx = 0 if msg.getDialogId() == get_private_field(ca, "dialog_id") else 1
+            # --- replace sparsearray with native type that bypasses proxy checks ---
+            if sp[idx] is not None and "SparseArrayWithTouch" not in str(sp[idx].getClass().getName()):
+                try:
+                    sp[idx] = ca.SparseArrayWithTouch()
+                    set_private_field(ca, "selectedMessagesIds", sp)
+                except:
+                    pass
         except:
             pass
 
-    def after_hooked_method(self, param: Any) -> None:
-        # --- persist selection in local python store ---
-        if not self.plugin.get_setting("no_forward_limit", True):
-            return
-        ca = param.thisObject
-        idx = 0 if param.args[0].getDialogId() == get_private_field(ca, "dialog_id") else 1
-        sp = get_private_field(ca, "selectedMessagesIds")
-        sel = sp[idx]
-        
-        # --- sync selection state ---
-        mid = param.args[0].getId()
-        if sel.indexOfKey(mid) >= 0:
-            self.store[mid] = param.args[0]
-        else:
-            self.store.pop(mid, None)
-
-    def clear(self) -> None:
-        # --- wipe state on hide ---
-        self.store.clear()
-
-class _BypassLimit(MethodReplacement):
+class _LimitBypass(MethodReplacement):
     def replace_hooked_method(self, param: Any) -> bool:
-        # --- always allow selecting more ---
+        # --- always return false for limitReached check ---
         return False
 
-# --- main plugin implementation ---
+# --- main plugin class ---
 class ForwardToolsPlugin(BasePlugin):
     def __init__(self) -> None:
         super().__init__()
-        self._sel_handler = _SelectorHook(self)
+        self._copy_handler = _GlobalCopyInterceptor(self)
 
     def on_plugin_load(self) -> None:
-        # --- setup menu items ---
+        # --- context menu items ---
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
-            text="Copy with author",
-            on_click=self._on_single_copy,
+            text="Copy with author (forced)",
+            on_click=self._on_forced_copy,
             icon="msg_copy"
         ))
         
@@ -140,41 +133,40 @@ class ForwardToolsPlugin(BasePlugin):
             condition="message.getSenderId() != 0"
         ))
 
-        self._setup_hooks()
+        self._init_xposed_hooks()
 
-    def _setup_hooks(self) -> None:
-        # --- register xposed hooks ---
+    def _init_xposed_hooks(self) -> None:
+        # --- register all necessary hooks ---
         try:
             ca_cl = ChatActivity.getClass()
             
-            # --- copy interception ---
-            m_copy = ca_cl.getDeclaredMethod("copyMessages", ArrayList, find_class("java.lang.String"))
-            m_copy.setAccessible(True)
-            self.hook_method(m_copy, _CopyMessagesHook(self))
+            # --- hook all overloads of copyMessages to be safe ---
+            self.hook_all_methods(ca_cl, "copyMessages", self._copy_handler)
 
-            # --- selection limit bypass hooks ---
+            # --- limit removal hooks ---
             m_sel = ca_cl.getDeclaredMethod("addToSelectedMessages", MessageObject, Boolean.TYPE, Boolean.TYPE)
             m_sel.setAccessible(True)
-            self.hook_method(m_sel, self._sel_handler)
+            self.hook_method(m_sel, _SelectorLimitHook(self))
 
-            m_hide = ca_cl.getDeclaredMethod("hideActionMode")
-            m_hide.setAccessible(True)
-            self.hook_method(m_hide, MethodHook(before_hooked_method=lambda p: self._sel_handler.clear()))
-
-            # --- global limit bypass ---
+            # --- hook internal selection listener ---
             try:
                 ms_cl = find_class("org.telegram.ui.ChatActivity$MultiSelectionListener")
                 if ms_cl:
-                    m_lim = ms_cl.getDeclaredMethod("limitReached")
-                    self.hook_method(m_lim, _BypassLimit())
+                    self.hook_all_methods(ms_cl, "limitReached", _LimitBypass())
             except:
                 pass
 
+            # --- clipboard guard ---
+            m_clip = AndroidUtilities.getClass().getDeclaredMethod("addToClipboard", find_class("java.lang.CharSequence"))
+            m_clip.setAccessible(True)
+            self.hook_method(m_clip, _ClipboardGuard(self))
+
+            log("forward tools: all hooks initialized")
         except Exception as e:
-            log(f"forward tools: hook setup failed {e}")
+            log(f"forward tools: critical hook failure {e}")
 
     def _get_author_name(self, msg: Any) -> str:
-        # --- resolve author name with alias support ---
+        # --- extract name or alias ---
         try:
             sid = msg.getSenderId()
             my_id = UserConfig.getInstance(UserConfig.selectedAccount).getClientUserId()
@@ -185,11 +177,12 @@ class ForwardToolsPlugin(BasePlugin):
             alias = self.get_setting(f"alias_{sid}", "")
             if alias: return alias
 
-            # --- standard telegram name resolution ---
             ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
             if sid > 0:
                 u = ctrl.getUser(sid)
-                if u: return f"{u.first_name or ''} {u.last_name or ''}".strip() or "User"
+                if u:
+                    name = f"{u.first_name or ''} {u.last_name or ''}".strip()
+                    return name if name else "User"
             else:
                 c = ctrl.getChat(-sid)
                 if c: return c.title or "Chat"
@@ -197,14 +190,14 @@ class ForwardToolsPlugin(BasePlugin):
             pass
         return "Unknown"
 
-    def _get_msg_body(self, msg: Any) -> Any:
-        # --- extract content while preserving formatting ---
+    def _get_clean_text(self, msg: Any) -> Any:
+        # --- resolve message body or media label ---
         try:
             if msg.type == 0:
-                return msg.messageText or "[Text]"
+                return msg.messageText if msg.messageText else ""
             
-            # --- handle media labels ---
-            label = "[Media]"
+            # --- define media labels ---
+            label = "Media"
             if msg.isPhoto(): label = "🖼 Photo"
             elif msg.isVideo(): label = "🎬 Video"
             elif msg.isVoice(): label = "🎤 Voice Message"
@@ -224,7 +217,7 @@ class ForwardToolsPlugin(BasePlugin):
             return "[Content]"
 
     def _format_batch(self, messages: List[Any]) -> Any:
-        # --- build formatted string for clipboard ---
+        # --- actual formatting logic ---
         ssb = find_class("android.text.SpannableStringBuilder")()
         
         curr_author = None
@@ -237,18 +230,18 @@ class ForwardToolsPlugin(BasePlugin):
         for m in messages:
             author = self._get_author_name(m)
             owner = getattr(m, "messageOwner", None)
-            date_val = datetime.fromtimestamp(owner.date) if owner else None
+            dt = datetime.fromtimestamp(owner.date) if owner else None
             
-            # --- date header ---
-            if show_date and date_val:
-                ds = date_val.strftime("%d.%m.%Y")
+            # --- date header logic ---
+            if show_date and dt:
+                ds = dt.strftime("%d.%m.%Y")
                 if ds != curr_date:
                     if ssb.length() > 0: ssb.append("\n\n")
                     ssb.append(f"--- {ds} ---\n")
                     curr_date = ds
                     curr_author = None
 
-            # --- author header ---
+            # --- author header logic ---
             if author != curr_author:
                 if ssb.length() > 0: ssb.append("\n\n")
                 prefix = "Forwarded from " if show_label else ""
@@ -257,53 +250,57 @@ class ForwardToolsPlugin(BasePlugin):
             else:
                 ssb.append("\n")
 
-            # --- message content ---
-            if show_time and date_val:
-                ssb.append(f"[{date_val.strftime('%H:%M')}] ")
+            # --- body and time ---
+            if show_time and dt:
+                ssb.append(f"[{dt.strftime('%H:%M')}] ")
             
-            ssb.append(self._get_msg_body(m))
+            ssb.append(self._get_clean_text(m))
 
         return ssb
 
-    def _on_single_copy(self, ctx: Dict[str, Any]) -> None:
-        # --- handle context menu copy action ---
+    def _on_forced_copy(self, ctx: Dict[str, Any]) -> None:
+        # --- manually trigger copy for context menu ---
         msg = ctx.get("message")
         if not msg: return
-        res = self._format_batch([msg])
-        AndroidUtilities.addToClipboard(res)
-        BulletinHelper.show_copied_to_clipboard()
+        try:
+            res = self._format_batch([msg])
+            AndroidUtilities.addToClipboard(res)
+            BulletinHelper.show_copied_to_clipboard()
+        except Exception as e:
+            log(f"forward tools: manual copy error {e}")
 
     def _on_set_alias(self, ctx: Dict[str, Any]) -> None:
-        # --- alias configuration dialog ---
+        # --- open alias entry dialog ---
         msg = ctx.get("message")
         user = ctx.get("user")
-        target_id = user.id if user else (msg.getSenderId() if msg else None)
-        if not target_id: return
+        tid = user.id if user else (msg.getSenderId() if msg else None)
+        if not tid: return
 
         frag = get_last_fragment()
         act = frag.getParentActivity() if frag else None
         if not act: return
 
         et = find_class("android.widget.EditText")(act)
-        et.setText(self.get_setting(f"alias_{target_id}", ""))
+        et.setText(self.get_setting(f"alias_{tid}", ""))
         
         def save(b, w):
-            self.set_setting(f"alias_{target_id}", et.getText().toString().strip())
+            self.set_setting(f"alias_{tid}", et.getText().toString().strip())
             BulletinHelper.show_success("Alias updated")
             b.dismiss()
 
+        from ui.alert import AlertDialogBuilder
         AlertDialogBuilder(act).set_title("Copy Alias").set_view(et).set_positive_button("Save", save).show()
 
     def create_settings(self) -> List[Any]:
-        # --- plugin configuration layout ---
+        # --- plugin configuration screen ---
         return [
             Header(text="Clipboard formatting"),
-            Switch(key="override_native_copy", text="Enhance multi-copy", default=True, subtext="Use custom formatting for batch copying"),
-            Switch(key="show_time", text="Show timestamps", default=False, icon="msg_calendar"),
+            Switch(key="override_native_copy", text="Override native copy", default=True, subtext="Apply custom format to all copy actions in chats"),
+            Switch(key="show_time", text="Show timestamps", default=True, icon="msg_calendar"),
             Switch(key="show_date", text="Show date headers", default=False, icon="msg_calendar2"),
             Switch(key="show_label", text="Add 'Forwarded from' prefix", default=False),
             Switch(key="replace_me", text="Replace my name with 'Я'", default=False),
             Divider(),
-            Header(text="Limits"),
-            Switch(key="no_forward_limit", text="No selection limit", default=True, subtext="Select and copy more than 100 messages")
+            Header(text="Selection limits"),
+            Switch(key="no_forward_limit", text="No 100 message limit", default=True, subtext="Select and batch-copy as many messages as you want")
         ]

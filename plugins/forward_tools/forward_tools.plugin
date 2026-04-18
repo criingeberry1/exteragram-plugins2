@@ -9,7 +9,6 @@ from ui.bulletin import BulletinHelper
 from android_utils import log
 from hook_utils import find_class, get_private_field, set_private_field
 from client_utils import get_last_fragment, get_messages_controller
-from file_utils import get_documents_dir # --- using documents or downloads via path ---
 
 from java.util import ArrayList
 from java.lang import Boolean, Integer, Long
@@ -32,7 +31,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "4.0.0"
+__version__ = "4.0.1"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -43,7 +42,7 @@ try:
     _client_ver = Version(BuildVars.BUILD_VERSION_STRING)
     _NEW_BUTTONS: bool = _client_ver >= Version("12.2.0")
 except Exception as e:
-    log(f"forward tools debug: version detection error {e}")
+    log(f"forward tools: version detection error {e}")
     _NEW_BUTTONS = False
 
 _CA_CLASS = ChatActivity.getClass()
@@ -186,33 +185,21 @@ class _ClipboardHook(MethodHook):
 
     def before_hooked_method(self, param: Any) -> None:
         # --- intercept native copy to format text and override clipboard string ---
-        self.plugin.debug_log(">>> _ClipboardHook triggered")
         if not self.plugin.get_setting("override_native_copy", True):
-            self.plugin.debug_log("override_native_copy is OFF, skipping")
             return
         try:
             frag = get_last_fragment()
-            self.plugin.debug_log(f"Current fragment: {frag.getClass().getSimpleName() if frag else 'None'}")
-            
             if not frag or not isinstance(frag, ChatActivity):
-                self.plugin.debug_log("Fragment is not ChatActivity, skipping")
                 return
-                
             msgs = self.plugin._selected(frag)
-            self.plugin.debug_log(f"Selected messages count: {len(msgs)}")
-            
             if len(msgs) == 0:
-                self.plugin.debug_log("No messages selected in sparse array, skipping override")
                 return
                 
             res = self.plugin._format(msgs)
-            self.plugin.debug_log(f"Formatted text length: {res.length() if hasattr(res, 'length') else 'N/A'}")
-            
             if res.length() > 0:
-                self.plugin.debug_log("Applying formatted result to clipboard args")
                 param.args[0] = res
         except Exception as e:
-            self.plugin.debug_log(f"CRITICAL: clipboard hook error\n{traceback.format_exc()}")
+            log(f"forward tools: clipboard hook error {e}")
 
 class _SelectorHook(MethodHook):
     def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
@@ -355,20 +342,9 @@ class ForwardToolsPlugin(BasePlugin):
     def __init__(self) -> None:
         super().__init__()
         self._sel_hook: Optional[_SelectorHook] = None
-        self._log_path: str = os.path.join("/sdcard/Download", "ForwardTools_Debug.txt")
-
-    def debug_log(self, text: str) -> None:
-        # --- helper to write detailed logs to external file ---
-        try:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(self._log_path, "a", encoding="utf-8") as f:
-                f.write(f"[{now}] {text}\n")
-        except Exception as e:
-            log(f"forward tools debug: could not write to file {e}")
 
     def on_plugin_load(self) -> None:
-        # --- register context menu for copy with authors ---
-        self.debug_log("=== Plugin Loaded ===")
+        # --- register context menu items ---
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
             text="Copy with authors",
@@ -376,7 +352,6 @@ class ForwardToolsPlugin(BasePlugin):
             icon="msg_copy"
         ))
 
-        # --- register context menu for custom alias ---
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
             text="Set alias",
@@ -385,7 +360,6 @@ class ForwardToolsPlugin(BasePlugin):
             condition="message.getSenderId() != 0"
         ))
 
-        # --- register profile menu for custom alias ---
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.PROFILE_ACTION_MENU,
             text="Set alias for copying",
@@ -393,7 +367,6 @@ class ForwardToolsPlugin(BasePlugin):
             icon="msg_edit"
         ))
 
-        # --- register chat menu button to open native settings ---
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.CHAT_ACTION_MENU,
             text="Forward Tools Settings",
@@ -404,19 +377,8 @@ class ForwardToolsPlugin(BasePlugin):
         self.add_hook("TL_messages_forwardMessages")
         self._init_hooks()
 
-    def on_plugin_unload(self) -> None:
-        # --- clear selection state ---
-        if self._sel_hook:
-            self._sel_hook.clear()
-
-    def pre_request_hook(self, name: str, account: int, req: Any) -> HookResult:
-        # --- clear selection store on forward dispatch ---
-        if name == "TL_messages_forwardMessages" and self._sel_hook:
-            self._sel_hook.clear()
-        return HookResult()
-
     def _init_hooks(self) -> None:
-        # --- register all xposed hooks safely ---
+        # --- initialize all hooks safely ---
         try:
             self._sel_hook = _SelectorHook(self)
 
@@ -449,78 +411,8 @@ class ForwardToolsPlugin(BasePlugin):
             )
             m_clip.setAccessible(True)
             self.hook_method(m_clip, _ClipboardHook(self))
-
-            log("forward tools: hooks registered successfully")
         except Exception as e:
-            log(f"forward tools: hooks init failed {e}")
-
-    def _open_plugin_settings(self, context: Any = None) -> None:
-        # --- open native plugin settings directly from chat ---
-        try:
-            java_plugin = PluginsController.getInstance().plugins.get(self.id)
-            last_fragment = get_last_fragment()
-            if last_fragment and java_plugin:
-                last_fragment.presentFragment(PluginSettingsActivity(java_plugin))
-        except Exception as e:
-            log(f"forward tools: error opening settings {e}")
-            BulletinHelper.show_error("Failed to open settings")
-
-    def _on_set_alias(self, ctx: Dict[str, Any]) -> None:
-        # --- open dialog to set custom alias for user ---
-        try:
-            target_id = None
-            user = ctx.get("user")
-            msg = ctx.get("message")
-            
-            if user:
-                target_id = user.id
-            elif msg:
-                target_id = msg.getSenderId()
-
-            if not target_id:
-                BulletinHelper.show_error("Could not determine user ID")
-                return
-
-            frag = get_last_fragment()
-            if not frag:
-                return
-            act = frag.getParentActivity()
-
-            EditText = find_class("android.widget.EditText")
-            if not EditText:
-                return
-            input_view = EditText(act)
-            
-            current_alias = self.get_setting(f"alias_{target_id}", "")
-            if current_alias:
-                input_view.setText(current_alias)
-                input_view.setSelection(len(current_alias))
-
-            bld = AlertDialogBuilder(act)
-            bld.set_title("Set Custom Alias")
-            bld.set_view(input_view)
-
-            def save_alias(bld: Any, which: int) -> None:
-                new_val = input_view.getText().toString().strip()
-                if new_val:
-                    self.set_setting(f"alias_{target_id}", new_val)
-                    BulletinHelper.show_success("Alias saved")
-                else:
-                    self.set_setting(f"alias_{target_id}", "")
-                    BulletinHelper.show_success("Alias cleared")
-                bld.dismiss()
-
-            def clear_alias(bld: Any, which: int) -> None:
-                self.set_setting(f"alias_{target_id}", "")
-                BulletinHelper.show_success("Alias cleared")
-                bld.dismiss()
-
-            bld.set_positive_button("Save", save_alias)
-            bld.set_negative_button("Clear", clear_alias)
-            bld.show()
-        except Exception as e:
-            log(f"forward tools: set alias error {e}")
-            BulletinHelper.show_error("Failed to open alias dialog")
+            log(f"forward tools: init hooks error {e}")
 
     def _author(self, msg: Any) -> str:
         # --- extract actual message sender taking aliases into account ---
@@ -546,27 +438,18 @@ class ForwardToolsPlugin(BasePlugin):
                     from_id = getattr(fwd, "from_id", None)
                     if from_id:
                         ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
-                        
                         uid = getattr(from_id, "user_id", 0)
                         if uid != 0:
-                            alias = self.get_setting(f"alias_{uid}", "")
-                            if alias: return alias
+                            al = self.get_setting(f"alias_{uid}", "")
+                            if al: return al
                             u = ctrl.getUser(uid)
                             if u:
                                 n = f"{u.first_name or ''} {u.last_name or ''}".strip()
                                 if n: return n
-                                
                         cid = getattr(from_id, "channel_id", 0)
                         if cid != 0:
                             c = ctrl.getChat(cid)
-                            if c and c.title:
-                                return str(c.title).strip()
-                                
-                        chatid = getattr(from_id, "chat_id", 0)
-                        if chatid != 0:
-                            c = ctrl.getChat(chatid)
-                            if c and c.title:
-                                return str(c.title).strip()
+                            if c and c.title: return str(c.title).strip()
 
             ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
             if sender_id > 0:
@@ -576,277 +459,36 @@ class ForwardToolsPlugin(BasePlugin):
                     if n: return n
             elif sender_id < 0:
                 c = ctrl.getChat(-sender_id)
-                if c and c.title:
-                    return str(c.title).strip()
-        except Exception as e:
-            log(f"forward tools: author extraction error {e}")
+                if c and c.title: return str(c.title).strip()
+        except:
+            pass
         return "Unknown"
 
     def _extract_text_safe(self, obj: Any) -> str:
-        # --- parse clean string out of textwithentities forcefully via reflection ---
-        if not obj:
-            return ""
+        # --- parse clean string out of textwithentities forcefully ---
+        if not obj: return ""
         try:
-            if hasattr(obj, "text"):
-                val = getattr(obj, "text")
-                if val is not None:
-                    return str(val)
-                    
+            if hasattr(obj, "text") and obj.text is not None:
+                return str(obj.text)
             f = obj.getClass().getField("text")
             if f:
                 f.setAccessible(True)
                 val = f.get(obj)
-                if val is not None:
-                    return str(val)
-        except Exception as e:
-            log(f"forward tools: text safe extraction fallback {e}")
+                if val is not None: return str(val)
+        except:
+            pass
         return str(obj)
 
-    def _extract_poll(self, msg: Any) -> Optional[str]:
-        # --- parse poll structure and render ascii bar chart ---
-        try:
-            owner = getattr(msg, "messageOwner", None)
-            media = getattr(owner, "media", None)
-            poll = getattr(media, "poll", None)
-            results = getattr(media, "results", None)
-            
-            if not poll: return None
-            
-            question_obj = getattr(poll, "question", "Poll")
-            question = self._extract_text_safe(question_obj)
-            
-            answers_list = getattr(poll, "answers", None)
-            results_list = getattr(results, "results", None)
-            total_voters = getattr(results, "total_voters", 0) or 0
-            
-            voters_map = {}
-            if results_list:
-                for i in range(results_list.size()):
-                    r = results_list.get(i)
-                    opt = getattr(r, "option", None)
-                    cnt = getattr(r, "voters", 0)
-                    if opt is not None:
-                        voters_map[_bytes_key(opt)] = cnt
-                            
-            lines = [f"[📊 Poll: {question}]"]
-            if answers_list:
-                for i in range(answers_list.size()):
-                    ans = answers_list.get(i)
-                    ans_text_obj = getattr(ans, "text", "")
-                    text = self._extract_text_safe(ans_text_obj)
-                    opt = getattr(ans, "option", None)
-                    voters = 0
-                    if opt is not None:
-                        voters = voters_map.get(_bytes_key(opt), 0)
-                            
-                    percent = int((voters / total_voters) * 100) if total_voters > 0 else 0
-                    filled = int(percent / 10)
-                    bar = "■" * filled + "□" * (10 - filled)
-                    lines.append(f"[{bar}] {percent}% — {text}")
-                    
-            return "\n".join(lines)
-        except Exception as e:
-            log(f"forward tools: poll extraction error {e}")
-            return None
-
-    def _extract_contact(self, msg: Any) -> Optional[str]:
-        # --- parse contact metadata directly from media ---
-        try:
-            owner = getattr(msg, "messageOwner", None)
-            media = getattr(owner, "media", None)
-            if not media: return None
-            
-            first = str(getattr(media, "first_name", "") or "")
-            last = str(getattr(media, "last_name", "") or "")
-            phone = str(getattr(media, "phone_number", "") or "")
-            
-            name = f"{first} {last}".strip()
-            if name and phone:
-                return f"[👤 Contact: {name}, {phone}]"
-            elif name:
-                return f"[👤 Contact: {name}]"
-        except Exception as e:
-            log(f"forward tools: contact extraction error {e}")
-        return None
-
-    def _extract_location(self, msg: Any) -> Optional[str]:
-        # --- parse location and venue metadata ---
-        try:
-            owner = getattr(msg, "messageOwner", None)
-            media = getattr(owner, "media", None)
-            if not media: return None
-            
-            title = str(getattr(media, "title", "") or "")
-            addr = str(getattr(media, "address", "") or "")
-            
-            if title and addr:
-                return f"[📍 Venue: {title}, {addr}]"
-            elif title:
-                return f"[📍 Venue: {title}]"
-        except Exception as e:
-            log(f"forward tools: location extraction error {e}")
-        return None
-
-    def _extract_todo(self, msg: Any) -> Optional[str]:
-        # --- extract native telegram task list rendering checkboxes ---
-        try:
-            owner = getattr(msg, "messageOwner", None)
-            media = getattr(owner, "media", None)
-            if not media: return None
-
-            todo = getattr(media, "todo", None)
-            if not todo: return None
-
-            title_obj = getattr(todo, "title", "Task List")
-            title = self._extract_text_safe(title_obj)
-
-            lines = [f"[📋 Task List: {title}]"]
-
-            completed_ids = set()
-            completions = getattr(media, "completions", None)
-            if completions and hasattr(completions, "size"):
-                for i in range(completions.size()):
-                    c = completions.get(i)
-                    cid = getattr(c, "id", None)
-                    if cid is not None:
-                        completed_ids.add(cid)
-
-            todo_list = getattr(todo, "list", None)
-            if todo_list and hasattr(todo_list, "size"):
-                for i in range(todo_list.size()):
-                    item = todo_list.get(i)
-                    item_id = getattr(item, "id", None)
-                    item_title_obj = getattr(item, "title", "")
-                    item_text = self._extract_text_safe(item_title_obj)
-
-                    checkbox = "☑" if item_id in completed_ids else "☐"
-                    lines.append(f"{checkbox} {item_text}")
-
-            return "\n".join(lines)
-        except Exception as e:
-            log(f"forward tools: todo extraction error {e}")
-            return None
-
-    def _extract_file_name(self, msg: Any) -> str:
-        # --- attempt to parse real file name using native message methods ---
-        try:
-            if hasattr(msg, "getDocumentName"):
-                name = msg.getDocumentName()
-                if name and str(name).strip():
-                    return f": {name}"
-                    
-            doc = getattr(msg, "getDocument", lambda: None)()
-            if doc:
-                attrs = getattr(doc, "attributes", None)
-                if attrs:
-                    for i in range(attrs.size()):
-                        attr = attrs.get(i)
-                        name = str(attr.getClass().getSimpleName())
-                        if "DocumentAttributeFilename" in name:
-                            fname = getattr(attr, "file_name", None)
-                            if fname:
-                                return f": {fname}"
-        except Exception as e:
-            log(f"forward tools: file name extraction error {e}")
-        return ""
-        
-    def _extract_music(self, msg: Any) -> str:
-        # --- extract music metadata using native telegram methods ---
-        try:
-            title = str(getattr(msg, "getMusicTitle", lambda: "")() or "")
-            author = str(getattr(msg, "getMusicAuthor", lambda: "")() or "")
-            
-            if title and author:
-                return f": {author} - {title}"
-            elif title:
-                return f": {title}"
-        except Exception as e:
-            log(f"forward tools: music metadata error {e}")
-        return ""
-
-    def _get_media_label(self, msg: Any) -> str:
-        # --- dynamically route to specific meta extractors identifying classes directly ---
-        try:
-            owner = getattr(msg, "messageOwner", None)
-            media = getattr(owner, "media", None)
-            media_cls = str(media.getClass().getSimpleName()) if media else ""
-            
-            if getattr(msg, "isPoll", lambda: False)() or "Poll" in media_cls:
-                res = self._extract_poll(msg)
-                if res: return res
-                return "[📊 Poll]"
-                
-            if getattr(msg, "isContact", lambda: False)() or "Contact" in media_cls:
-                res = self._extract_contact(msg)
-                if res: return res
-                return "[👤 Contact]"
-                
-            if getattr(msg, "isLocation", lambda: False)() or "Location" in media_cls or "Geo" in media_cls or "Venue" in media_cls:
-                res = self._extract_location(msg)
-                if res: return res
-                return "[📍 Location]"
-                
-            if "ToDo" in media_cls:
-                res = self._extract_todo(msg)
-                if res: return res
-                
-            if getattr(msg, "isSticker", lambda: False)() or getattr(msg, "isAnimatedSticker", lambda: False)():
-                emoji = "👾"
-                try:
-                    if hasattr(msg, "getStickerEmoji"):
-                        val = msg.getStickerEmoji()
-                        if val:
-                            emoji = str(val)
-                    else:
-                        doc = getattr(msg, "getDocument", lambda: None)()
-                        if doc:
-                            attrs = getattr(doc, "attributes", None)
-                            if attrs:
-                                for i in range(attrs.size()):
-                                    attr = attrs.get(i)
-                                    if "documentAttributeSticker" in str(attr.getClass().getSimpleName()):
-                                        alt = getattr(attr, "alt", None)
-                                        if alt:
-                                            emoji = str(alt)
-                                            break
-                except Exception as e:
-                    log(f"forward tools: sticker emoji error {e}")
-                    
-                kind = "Animated Sticker" if getattr(msg, "isAnimatedSticker", lambda: False)() else "Sticker"
-                return f"[{emoji} {kind}]"
-
-            fname = self._extract_file_name(msg)
-            if getattr(msg, "isVoice", lambda: False)(): return "[🎤 Voice Message]"
-            if getattr(msg, "isRoundVideo", lambda: False)(): return "[📹 Video Message]"
-            if getattr(msg, "isVideo", lambda: False)(): return f"[🎬 Video{fname}]"
-            if getattr(msg, "isMusic", lambda: False)(): 
-                music_meta = self._extract_music(msg)
-                if music_meta: return f"[🎵 Music{music_meta}]"
-                return f"[🎵 Music{fname}]"
-            if getattr(msg, "isPhoto", lambda: False)(): return "[🖼 Photo]"
-            if getattr(msg, "isGif", lambda: False)(): return f"[🎞 GIF{fname}]"
-            
-            if fname: return f"[📎 File{fname}]"
-            if media_cls: return f"[📎 Media: {media_cls}]"
-            
-        except Exception as e:
-            log(f"forward tools: media label error {e}")
-            
-        return "[📎 Media]"
-
     def _raw_text(self, msg: Any) -> Any:
-        # --- extract native charsequence to preserve spans and handle complex labels ---
+        # --- extract charsequence preserving spans where possible ---
         try:
             m_type = getattr(msg, "type", 0)
             if m_type == 0:
-                message_text = getattr(msg, "messageText", None)
-                if message_text:
-                    return message_text
+                mt = getattr(msg, "messageText", None)
+                if mt: return mt
                 owner = getattr(msg, "messageOwner", None)
-                if owner:
-                    raw = getattr(owner, "message", None)
-                    if raw:
-                        return raw
+                if owner and getattr(owner, "message", None):
+                    return owner.message
                 return None
 
             label = self._get_media_label(msg)
@@ -858,212 +500,152 @@ class ForwardToolsPlugin(BasePlugin):
 
             builder = SpannableStringBuilder()
             builder.append(label)
-            
             if caption and caption.length() > 0:
                 builder.append("\n")
                 builder.append(caption)
-                
             return builder
-            
-        except Exception as e:
-            log(f"forward tools: raw text extraction error {e}")
+        except:
             return None
 
     def _text(self, msg: Any) -> str:
-        # --- fallback for plain string extraction in short quotes ---
+        # --- safe conversion to string for both py and java types ---
         raw = self._raw_text(msg)
-        if raw:
-            return raw.toString()
-        return ""
+        if raw is None: return ""
+        if isinstance(raw, str): return raw
+        return str(raw.toString())
+
+    def _get_media_label(self, msg: Any) -> str:
+        # --- generate placeholder label for media types ---
+        try:
+            if getattr(msg, "isPoll", lambda: False)(): return "[📊 Poll]"
+            if getattr(msg, "isContact", lambda: False)(): return "[👤 Contact]"
+            if getattr(msg, "isLocation", lambda: False)(): return "[📍 Location]"
+            if getattr(msg, "isSticker", lambda: False)(): return "[👾 Sticker]"
+            if getattr(msg, "isVoice", lambda: False)(): return "[🎤 Voice Message]"
+            if getattr(msg, "isRoundVideo", lambda: False)(): return "[📹 Video Message]"
+            if getattr(msg, "isVideo", lambda: False)(): return "[🎬 Video]"
+            if getattr(msg, "isMusic", lambda: False)(): return "[🎵 Music]"
+            if getattr(msg, "isPhoto", lambda: False)(): return "[🖼 Photo]"
+            if getattr(msg, "isGif", lambda: False)(): return "[🎞 GIF]"
+        except:
+            pass
+        return "[📎 Media]"
 
     def _selected(self, fragment: Any) -> List[Any]:
-        # --- gather all selected messages sorted by date with debug info ---
+        # --- fetch sorted selected messages ---
         try:
             sp = get_private_field(fragment, "selectedMessagesIds")
-            if not sp:
-                self.debug_log("selectedMessagesIds is NULL")
-                return []
-            
-            self.debug_log(f"Selected sparse index 0 size: {sp[0].size() if sp[0] else 'None'}")
-            self.debug_log(f"Selected sparse index 1 size: {sp[1].size() if sp[1] else 'None'}")
-                
+            if not sp: return []
             bag: Dict[int, Any] = {}
             for idx in range(2): 
                 s = sp[idx]
-                if s is None:
-                    continue
+                if s is None: continue
                 for i in range(s.size()):
-                    m_val = s.valueAt(i)
-                    m_id = s.keyAt(i)
-                    bag[m_id] = m_val
-            
-            res = sorted(
+                    bag[s.keyAt(i)] = s.valueAt(i)
+            return sorted(
                 bag.values(),
                 key=lambda m: getattr(getattr(m, "messageOwner", None), "date", 0)
             )
-            self.debug_log(f"Final bag size: {len(bag)}")
-            return res
-        except Exception as e:
-            self.debug_log(f"ERROR in _selected: {e}")
+        except:
             return []
 
     def _format(self, msgs: List[Any]) -> Any:
-        # --- construct spannablestringbuilder to keep native formatting and emojis ---
-        self.debug_log(f"--- Starting format for {len(msgs)} messages ---")
-        SpannableStringBuilder = find_class("android.text.SpannableStringBuilder")
-        if not SpannableStringBuilder:
-            self.debug_log("SpannableStringBuilder class not found!")
-            return ""
-            
-        builder = SpannableStringBuilder()
+        # --- build formatted text with survival logic ---
+        SSB = find_class("android.text.SpannableStringBuilder")
+        if not SSB: return ""
+        builder = SSB()
 
-        ts_on: bool = self.get_setting("timestamps", False)
-        dates_on: bool = self.get_setting("dates", False)
-        prefix_on: bool = self.get_setting("with_label", False)
-        replies_on: bool = self.get_setting("format_replies", True)
+        ts_on = self.get_setting("timestamps", False)
+        dates_on = self.get_setting("dates", False)
+        prefix_on = self.get_setting("with_label", False)
+        replies_on = self.get_setting("format_replies", True)
 
-        cur_date: Optional[str] = None
-        cur_author: Optional[str] = None
+        cur_date, cur_author = None, None
 
-        for idx, msg in enumerate(msgs):
+        for msg in msgs:
             try:
                 owner = getattr(msg, "messageOwner", None)
-                msg_id = getattr(msg, "getId", lambda: 0)()
                 stamp = getattr(owner, "date", 0) if owner else 0
-                dt = None
-                if stamp:
-                    dt = datetime.fromtimestamp(int(stamp))
-
-                d_str: str = dt.strftime("%d.%m.%Y") if dt else ""
-                t_str: str = dt.strftime("%H:%M") if dt else ""
-                author: str = self._author(msg)
-                
-                self.debug_log(f"Processing msg[{idx}] ID:{msg_id} Author:{author} Time:{t_str}")
+                dt = datetime.fromtimestamp(int(stamp)) if stamp else None
+                d_str = dt.strftime("%d.%m.%Y") if dt else ""
+                t_str = dt.strftime("%H:%M") if dt else ""
+                author = self._author(msg)
 
                 if dates_on and d_str and d_str != cur_date:
-                    if builder.length() > 0:
-                        builder.append("\n\n")
+                    if builder.length() > 0: builder.append("\n\n")
                     builder.append(f"--- {d_str} ---\n\n")
-                    cur_date = d_str
-                    cur_author = None 
+                    cur_date, cur_author = d_str, None
 
                 if author != cur_author:
                     if builder.length() > 0 and not builder.toString().endswith("\n\n"):
                         builder.append("\n\n")
-                    hdr = f"Forwarded from {author}:\n" if prefix_on else f"{author}:\n"
-                    builder.append(hdr)
+                    builder.append(f"Forwarded from {author}:\n" if prefix_on else f"{author}:\n")
                     cur_author = author
                 elif builder.length() > 0:
                     builder.append("\n")
 
                 if replies_on:
-                    reply_obj = getattr(msg, "replyMessageObject", None)
-                    if reply_obj:
-                        reply_author = self._author(reply_obj)
-                        reply_text = self._text(reply_obj) or "[Media]"
-                        words = reply_text.split()
-                        short_quote = " ".join(words[:5]) + ("..." if len(words) > 5 else "")
-                        builder.append(f"> {reply_author}: {short_quote}\n")
+                    robj = getattr(msg, "replyMessageObject", None)
+                    if robj:
+                        rt = self._text(robj) or "[Media]"
+                        builder.append(f"> {self._author(robj)}: {' '.join(rt.split()[:5])}...\n")
 
-                if ts_on and t_str:
-                    builder.append(f"[{t_str}] ")
-                    
-                raw_body = self._raw_text(msg)
-                if raw_body:
-                    builder.append(raw_body)
-                else:
-                    builder.append("[Media]")
-            except Exception as loop_e:
-                self.debug_log(f"ERROR processing message index {idx}: {loop_e}")
-
-        self.debug_log(f"--- Format finished. Total builder length: {builder.length()} ---")
-        BulletinHelper.show_info("Debug: Log updated in Downloads")
+                if ts_on and t_str: builder.append(f"[{t_str}] ")
+                
+                body = self._raw_text(msg)
+                builder.append(body if body else "[Media]")
+            except:
+                continue
         return builder
 
     def _on_copy(self, ctx: Dict[str, Any]) -> None:
-        # --- explicit fallback copy for single message via long press ---
-        self.debug_log(">>> _on_copy manually triggered via menu")
+        # --- manual copy trigger with feedback ---
         try:
-            fragment = ctx.get("fragment")
-            single = ctx.get("message")
-            batch = self._selected(fragment) if fragment else []
-
-            target: List[Any] = batch if len(batch) > 1 else ([single] if single else [])
-
-            if not target:
-                BulletinHelper.show_error("No message available")
-                return
-
-            result = self._format(target)
-
-            if result.length() == 0:
-                BulletinHelper.show_info("Nothing to copy")
-                return
-
-            AndroidUtilities.addToClipboard(result)
-            BulletinHelper.show_copied_to_clipboard()
-        except Exception as e:
-            self.debug_log(f"CRITICAL: _on_copy error\n{traceback.format_exc()}")
+            res = self._format(self._selected(ctx.get("fragment")) or [ctx.get("message")])
+            if res and res.length() > 0:
+                AndroidUtilities.addToClipboard(res)
+                BulletinHelper.show_copied_to_clipboard()
+        except:
             BulletinHelper.show_error("Copy failed")
 
+    def _open_plugin_settings(self, context: Any = None) -> None:
+        # --- open native settings activity ---
+        try:
+            jp = PluginsController.getInstance().plugins.get(self.id)
+            get_last_fragment().presentFragment(PluginSettingsActivity(jp))
+        except:
+            pass
+
+    def _on_set_alias(self, ctx: Dict[str, Any]) -> None:
+        # --- show dialog to customize author alias ---
+        try:
+            target_id = ctx.get("user").id if ctx.get("user") else ctx.get("message").getSenderId()
+            if not target_id: return
+            frag = get_last_fragment()
+            act = frag.getParentActivity()
+            et = find_class("android.widget.EditText")(act)
+            cur = self.get_setting(f"alias_{target_id}", "")
+            et.setText(cur)
+            bld = AlertDialogBuilder(act)
+            bld.set_title("Set Alias")
+            bld.set_view(et)
+            bld.set_positive_button("Save", lambda b, w: (self.set_setting(f"alias_{target_id}", et.getText().toString().strip()), b.dismiss(), BulletinHelper.show_success("Saved")))
+            bld.set_negative_button("Clear", lambda b, w: (self.set_setting(f"alias_{target_id}", ""), b.dismiss(), BulletinHelper.show_success("Cleared")))
+            bld.show()
+        except:
+            pass
+
     def create_settings(self) -> List[Any]:
-        # --- native plugin settings screen ---
+        # --- defined plugin settings layout ---
         return [
             Header(text="Copy formatting"),
-            Switch(
-                key="override_native_copy",
-                text="Override native copy",
-                default=True,
-                subtext="Automatically format text when using the standard Telegram copy button for multiple messages",
-                icon="msg_copy"
-            ),
-            Switch(
-                key="format_replies",
-                text="Format replies",
-                default=True,
-                subtext="Add '> Name: text...' for replied-to messages",
-                icon="msg_reply"
-            ),
-            Switch(
-                key="timestamps",
-                text="Timestamps [hh:mm]",
-                default=False,
-                subtext="Prefix each message with its send time",
-                icon="msg_calendar"
-            ),
-            Switch(
-                key="dates",
-                text="Date headers",
-                default=False,
-                subtext="Insert --- dd.mm.yyyy --- when date changes",
-                icon="msg_calendar2"
-            ),
-            Switch(
-                key="with_label",
-                text="'Forwarded from' prefix",
-                default=False,
-                subtext="Add 'Forwarded from' before author name",
-                icon="msg_forward"
-            ),
-            Switch(
-                key="replace_me_with_i",
-                text="Replace my name with 'Я'",
-                default=False,
-                subtext="Uses 'Я' instead of your profile name when copying your messages",
-                icon="msg_edit"
-            ),
+            Switch(key="override_native_copy", text="Override native copy", default=True),
+            Switch(key="format_replies", text="Format replies", default=True),
+            Switch(key="timestamps", text="Timestamps [hh:mm]", default=False),
+            Switch(key="dates", text="Date headers", default=False),
+            Switch(key="with_label", text="'Forwarded from' prefix", default=False),
+            Switch(key="replace_me_with_i", text="Replace my name with 'Я'", default=False),
             Divider(),
             Header(text="Selection limit"),
-            Switch(
-                key="no_forward_limit",
-                text="Remove 100 message limit",
-                default=True,
-                subtext="Select, forward and delete more than 100 messages at once",
-                icon="msg_forward_replace"
-            ),
-            Divider(text="No forward limit based on code by @zwylair"),
-            Text(
-                text="@zwylair — NoForwardLimit",
-                icon="msg_link"
-            ),
+            Switch(key="no_forward_limit", text="Remove 100 message limit", default=True),
         ]

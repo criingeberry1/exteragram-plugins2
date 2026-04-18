@@ -1,7 +1,7 @@
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
-from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy, MethodHook, MethodReplacement
+from base_plugin import BasePlugin, MenuItemData, MenuItemType, HookResult, HookStrategy, MethodHook, MethodReplacement, hook_filters, HookFilter
 from ui.settings import Header, Switch, Divider, Text
 from ui.bulletin import BulletinHelper
 from android_utils import log
@@ -15,10 +15,6 @@ from org.telegram.messenger import MessageObject, BuildVars, UserConfig, Message
 from org.telegram.ui import ChatActivity
 from org.telegram.tgnet import TLRPC, TLObject
 
-from com.exteragram.messenger.plugins import PluginsController
-from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
-from ui.alert import AlertDialogBuilder
-
 # --- метаданные ---
 __id__ = "forward_tools"
 __name__ = "Forward Tools"
@@ -29,1007 +25,285 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.3.1"
+__version__ = "2.3.2"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
 
-# --- version detection for ui layout compatibility ---
-try:
-    from packaging.version import Version
-    _client_ver = Version(BuildVars.BUILD_VERSION_STRING)
-    _NEW_BUTTONS: bool = _client_ver >= Version("12.2.0")
-except Exception as e:
-    log(f"forward tools: version detection error {e}")
-    _NEW_BUTTONS = False
-
-_CA_CLASS = ChatActivity.getClass()
-
-# --- utility helpers ---
+# --- helpers for collection conversion ---
 def _al_to_list(java_al: Any) -> List[Any]:
-    # --- convert java arraylist to python list ---
+    # --- convert java arraylist to python list safely ---
+    if not java_al: return []
     return [java_al.get(i) for i in range(java_al.size())]
 
 def _list_to_al(py_list: List[Any]) -> Any:
-    # --- convert python list to java arraylist ---
+    # --- convert python list to java arraylist for methods ---
     result = ArrayList()
     for item in py_list:
         result.add(item)
     return result
 
-def _sparse_keys(sparse: Any) -> List[int]:
-    # --- extract keys from android sparsearray ---
-    if sparse is None:
-        return []
-    return [sparse.keyAt(i) for i in range(sparse.size())]
-
-def _chunks(lst: List[Any], size: int) -> List[List[Any]]:
-    # --- split list into fixed size chunks ---
-    return [lst[i:i + size] for i in range(0, len(lst), size)]
-
-def _sel_index(param: Any) -> int:
-    # --- resolve which sparsearray index applies to the message ---
-    dialog_id = get_private_field(param.thisObject, "dialog_id")
-    return int(param.args[0].getDialogId() != dialog_id)
-
-def _make_sparse(chat_activity: Any) -> Any:
-    # --- create a fresh sparse array compatible with chatactivity ---
-    try:
-        return chat_activity.SparseArrayWithTouch()
-    except Exception as e:
-        log(f"forward tools: sparse array with touch instantiation failed {e}")
-        
-    try:
-        cls = find_class("org.telegram.ui.ChatActivity$SparseArrayWithTouch")
-        if cls:
-            con = cls.getDeclaredConstructors()[0]
-            con.setAccessible(True)
-            return con.newInstance(chat_activity)
-    except Exception as e:
-        log(f"forward tools: reflective sparse array instantiation failed {e}")
-        
-    from android.util import SparseArray
-    return SparseArray()
-
-def _dec_counter(ca: Any, counter_field: str, button_field: str) -> None:
-    # --- decrement selection counter and reenable button at zero ---
-    try:
-        val: int = get_private_field(ca, counter_field) - 2
-        set_private_field(ca, counter_field, Integer(val))
-        if val == 0:
-            btn = get_private_field(ca, button_field)
-            if btn:
-                btn.setEnabled(True)
-                btn.setAlpha(1.0)
-    except Exception as e:
-        log(f"forward tools: dec counter error {e}")
-
-def _cancel_selection(ca: Any) -> None:
-    # --- dismiss message selection action mode ---
-    try:
-        m1 = _CA_CLASS.getDeclaredMethod("hideActionMode")
-        m1.setAccessible(True)
-        m1.invoke(ca)
-        m2 = _CA_CLASS.getDeclaredMethod("updatePinnedMessageView", Boolean.TYPE)
-        m2.setAccessible(True)
-        m2.invoke(ca, [True])
-    except Exception as e:
-        log(f"forward tools: cancel selection error {e}")
-
-def _update_reply_btn(ca: Any, show: bool) -> None:
-    # --- toggle reply button visibility ---
-    try:
-        if _NEW_BUTTONS:
-            layout = get_private_field(ca, "actionsButtonsLayout")
-            if layout:
-                layout.showReplyButton(show, True)
-        else:
-            btn = get_private_field(ca, "replyButton")
-            if btn:
-                btn.setVisibility(View.VISIBLE if show else View.GONE)
-    except Exception as e:
-        log(f"forward tools: reply btn error {e}")
-
-def _update_select_btn(ca: Any) -> None:
-    # --- update select between button based on selection gaps ---
-    try:
-        sp = get_private_field(ca, "selectedMessagesIds")
-        msgs = get_private_field(ca, "messages")
-        if not sp or not msgs:
-            return
-
-        main = sp[0]
-        show = False
-
-        if main.size() > 1:
-            ids = sorted(_sparse_keys(main) + _sparse_keys(sp[1]))
-            if ids:
-                lo, hi = ids[0], ids[-1]
-                for i in range(msgs.size()):
-                    m = msgs.get(i)
-                    mid = m.getId()
-                    if lo < mid < hi and main.indexOfKey(mid) < 0 and m.contentType == 0:
-                        show = True
-                        break
-
-        if _NEW_BUTTONS:
-            layout = get_private_field(ca, "actionsButtonsLayout")
-            if layout:
-                layout.showSelectButton(show, True)
-        else:
-            btn = get_private_field(ca, "selectButton")
-            if btn:
-                vis = View.VISIBLE if show else View.GONE
-                if btn.getVisibility() != vis:
-                    btn.setVisibility(vis)
-    except Exception as e:
-        log(f"forward tools: select btn error {e}")
-
-def _bytes_key(obj: Any) -> bytes:
-    # --- safely convert java byte array to python bytes for mapping ---
-    try:
-        return bytes(obj)
-    except Exception as e1:
-        try:
-            return bytes([x for x in obj])
-        except Exception as e2:
-            log(f"forward tools: bytes key conversion error {e1} {e2}")
-            return b""
-
-# --- hooks ---
-class _ClipboardHook(MethodHook):
+# --- hooks for clipboard manipulation ---
+class _CopyMessagesHook(MethodHook):
     def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
         self.plugin = plugin
 
     def before_hooked_method(self, param: Any) -> None:
-        # --- intercept native copy to format text and override clipboard string ---
+        # --- intercept copy event directly in chatactivity ---
         if not self.plugin.get_setting("override_native_copy", True):
             return
-        try:
-            frag = get_last_fragment()
-            if not frag or not isinstance(frag, ChatActivity):
-                return
-            msgs = self.plugin._selected(frag)
-            # --- if no messages are explicitly selected skip overriding ---
-            if len(msgs) == 0:
-                return
-                
-            res = self.plugin._format(msgs)
-            if res.length() > 0:
-                param.args[0] = res
-        except Exception as e:
-            log(f"forward tools: clipboard hook error {e}")
 
+        try:
+            # --- arg 0 is arraylist of messageobjects ---
+            messages_al = param.args[0]
+            if not messages_al or messages_al.isEmpty():
+                return
+
+            messages = _al_to_list(messages_al)
+            # --- sort by date to ensure logical flow ---
+            messages.sort(key=lambda m: getattr(getattr(m, "messageOwner", None), "date", 0))
+
+            formatted_text = self.plugin._format_batch(messages)
+            if formatted_text and formatted_text.length() > 0:
+                # --- put formatted text to clipboard and skip original logic ---
+                AndroidUtilities.addToClipboard(formatted_text)
+                BulletinHelper.show_copied_to_clipboard()
+                param.setResult(None)
+        except Exception as e:
+            log(f"forward tools: copy hook error {e}")
+
+# --- hooks for selection limit bypass ---
 class _SelectorHook(MethodHook):
     def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
         self.plugin = plugin
         self.store: Dict[int, Any] = {}
-        self._in_group: bool = False
-        self._last_in_group: bool = False
-        self._skip_after: bool = False
 
     def before_hooked_method(self, param: Any) -> None:
-        # --- replace sparse array to bypass cap ---
+        # --- prevent ui lock by replacing sparsearray ---
         if not self.plugin.get_setting("no_forward_limit", True):
             return
-
         ca = param.thisObject
-        msg_obj = param.args[0]
-        tapped_outside: bool = param.args[1]
-        is_last: bool = param.args[2]
-        grouped: bool = msg_obj.getGroupId() != 0
-
-        if self._in_group:
-            self._last_in_group = is_last
-            return
-
-        if tapped_outside and is_last and grouped:
-            self._in_group = True
-
-        idx = _sel_index(param)
         sp = get_private_field(ca, "selectedMessagesIds")
-        sp[idx] = _make_sparse(ca)
-        set_private_field(ca, "selectedMessagesIds", sp)
+        # --- replace with fresh one to bypass fixed size or proxy checks ---
+        idx = 0 if param.args[0].getDialogId() == get_private_field(ca, "dialog_id") else 1
+        try:
+            sp[idx] = ca.SparseArrayWithTouch()
+            set_private_field(ca, "selectedMessagesIds", sp)
+        except:
+            pass
 
     def after_hooked_method(self, param: Any) -> None:
-        # --- merge selection back from unlimited local store ---
+        # --- persist selection in local python store ---
         if not self.plugin.get_setting("no_forward_limit", True):
             return
-
-        if self._skip_after:
-            self._skip_after = False
-            return
-
-        if self._in_group:
-            if not self._last_in_group:
-                return
-            self._in_group = False
-            self._last_in_group = False
-            self._skip_after = True
-
         ca = param.thisObject
-        idx = _sel_index(param)
+        idx = 0 if param.args[0].getDialogId() == get_private_field(ca, "dialog_id") else 1
         sp = get_private_field(ca, "selectedMessagesIds")
         sel = sp[idx]
-
-        chat_mode = get_private_field(ca, "chatMode")
-        cur_chat = get_private_field(ca, "currentChat")
-        is_sched: bool = chat_mode == 1
-
-        for i in reversed(range(sel.size())):
-            mid: int = sel.keyAt(i)
-            mobj = sel.get(mid)
-            if mid in self.store:
-                if not mobj.canForwardMessage():
-                    _dec_counter(ca, "cantForwardMessagesCount", "forwardButton")
-                if not mobj.canDeleteMessage(is_sched, cur_chat):
-                    _dec_counter(ca, "cantDeleteMessagesCount", "deleteItem")
-                self.store.pop(mid)
-            else:
-                self.store[mid] = mobj
-
-        sel.clear()
-        for k, v in self.store.items():
-            sel.put(k, v)
-
-        if not self.store:
-            _cancel_selection(ca)
-            return
-
-        _update_reply_btn(ca, len(self.store) == 1)
-        _update_select_btn(ca)
+        
+        # --- sync selection state ---
+        mid = param.args[0].getId()
+        if sel.indexOfKey(mid) >= 0:
+            self.store[mid] = param.args[0]
+        else:
+            self.store.pop(mid, None)
 
     def clear(self) -> None:
-        # --- wipe local selection state ---
+        # --- wipe state on hide ---
         self.store.clear()
 
-class _ClearHook(MethodHook):
-    def __init__(self, sel: _SelectorHook) -> None:
-        self._sel = sel
-
-    def before_hooked_method(self, param: Any) -> None:
-        # --- clear store on action mode dismiss ---
-        self._sel.clear()
-
-class _MultiSelHook(MethodHook):
-    def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
-        self.plugin = plugin
-
-    def after_hooked_method(self, param: Any) -> None:
-        # --- patch limitreached to always return false ---
-        if not self.plugin.get_setting("no_forward_limit", True):
-            return
-        try:
-            lv = get_private_field(param.thisObject, "chatListView")
-            listener = get_private_field(lv, "multiSelectionListener")
-            m = listener.getClass().getMethod("limitReached")
-            self.plugin.hook_method(m, _LimitBypass())
-        except Exception as e:
-            log(f"forward tools: multi sel hook error {e}")
-
-class _LimitBypass(MethodReplacement):
+class _BypassLimit(MethodReplacement):
     def replace_hooked_method(self, param: Any) -> bool:
-        # --- never report limit reached ---
+        # --- always allow selecting more ---
         return False
 
-class _ChunkedDelete(MethodHook):
-    _SIZE: int = 100
-
-    def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
-        self.plugin = plugin
-
-    def before_hooked_method(self, param: Any) -> None:
-        # --- split large deletes into batches ---
-        if not self.plugin.get_setting("no_forward_limit", True):
-            return
-
-        a0, a1 = param.args[0], param.args[1]
-        arr, idx = (a0, 0) if a0.size() > 0 else (a1, 1)
-        ids: List[int] = _al_to_list(arr)
-
-        if len(ids) <= self._SIZE:
-            return
-
-        for i, chunk in enumerate(_chunks(ids, self._SIZE)):
-            param.args[idx] = _list_to_al(chunk)
-            if i < len(_chunks(ids, self._SIZE)) - 1:
-                param.method.invoke(param.thisObject, param.args)
-
-# --- main plugin class ---
+# --- main plugin implementation ---
 class ForwardToolsPlugin(BasePlugin):
-
     def __init__(self) -> None:
         super().__init__()
-        self._sel_hook: Optional[_SelectorHook] = None
+        self._sel_handler = _SelectorHook(self)
 
     def on_plugin_load(self) -> None:
-        # --- register context menu for copy with authors ---
+        # --- setup menu items ---
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
-            text="Copy with authors",
-            on_click=self._on_copy,
+            text="Copy with author",
+            on_click=self._on_single_copy,
             icon="msg_copy"
         ))
-
-        # --- register context menu for custom alias ---
+        
         self.add_menu_item(MenuItemData(
             menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
-            text="Set alias",
+            text="Set copy alias",
             on_click=self._on_set_alias,
             icon="msg_edit",
             condition="message.getSenderId() != 0"
         ))
 
-        # --- register profile menu for custom alias ---
-        self.add_menu_item(MenuItemData(
-            menu_type=MenuItemType.PROFILE_ACTION_MENU,
-            text="Set alias for copying",
-            on_click=self._on_set_alias,
-            icon="msg_edit"
-        ))
+        self._setup_hooks()
 
-        # --- register chat menu button to open native settings ---
-        self.add_menu_item(MenuItemData(
-            menu_type=MenuItemType.CHAT_ACTION_MENU,
-            text="Forward Tools Settings",
-            icon="msg_settings",
-            on_click=self._open_plugin_settings
-        ))
-
-        self.add_hook("TL_messages_forwardMessages")
-        self._init_hooks()
-
-    def on_plugin_unload(self) -> None:
-        # --- clear selection state ---
-        if self._sel_hook:
-            self._sel_hook.clear()
-
-    def pre_request_hook(self, name: str, account: int, req: Any) -> HookResult:
-        # --- clear selection store on forward dispatch ---
-        if name == "TL_messages_forwardMessages" and self._sel_hook:
-            self._sel_hook.clear()
-        return HookResult()
-
-    def _init_hooks(self) -> None:
-        # --- register all xposed hooks safely ---
+    def _setup_hooks(self) -> None:
+        # --- register xposed hooks ---
         try:
-            self._sel_hook = _SelectorHook(self)
-
-            m = _CA_CLASS.getDeclaredMethod(
-                "addToSelectedMessages", MessageObject, Boolean.TYPE, Boolean.TYPE
-            )
-            m.setAccessible(True)
-            self.hook_method(m, self._sel_hook)
-
-            m2 = _CA_CLASS.getDeclaredMethod("hideActionMode")
-            m2.setAccessible(True)
-            self.hook_method(m2, _ClearHook(self._sel_hook))
-
-            m3 = _CA_CLASS.getDeclaredMethod("startMultiselect", Integer.TYPE)
-            m3.setAccessible(True)
-            self.hook_method(m3, _MultiSelHook(self))
-
-            ctrl = get_messages_controller()
-            m4 = ctrl.getClass().getDeclaredMethod(
-                "deleteMessages",
-                ArrayList, ArrayList, TLRPC.EncryptedChat,
-                Long.TYPE, Boolean.TYPE, Integer.TYPE,
-                Boolean.TYPE, Long.TYPE, TLObject,
-                Integer.TYPE, Boolean.TYPE, Integer.TYPE
-            )
-            self.hook_method(m4, _ChunkedDelete(self))
-
-            m_clip = AndroidUtilities.getClass().getDeclaredMethod(
-                "addToClipboard", find_class("java.lang.CharSequence")
-            )
-            m_clip.setAccessible(True)
-            self.hook_method(m_clip, _ClipboardHook(self))
-
-            log("forward tools: hooks registered successfully")
-        except Exception as e:
-            log(f"forward tools: hooks init failed {e}")
-
-    def _open_plugin_settings(self, context: Any = None) -> None:
-        # --- open native plugin settings directly from chat ---
-        try:
-            java_plugin = PluginsController.getInstance().plugins.get(self.id)
-            last_fragment = get_last_fragment()
-            if last_fragment and java_plugin:
-                last_fragment.presentFragment(PluginSettingsActivity(java_plugin))
-        except Exception as e:
-            log(f"forward tools: error opening settings {e}")
-            BulletinHelper.show_error("Failed to open settings")
-
-    def _on_set_alias(self, ctx: Dict[str, Any]) -> None:
-        # --- open dialog to set custom alias for user ---
-        try:
-            target_id = None
-            user = ctx.get("user")
-            msg = ctx.get("message")
+            ca_cl = ChatActivity.getClass()
             
-            if user:
-                target_id = user.id
-            elif msg:
-                target_id = msg.getSenderId()
+            # --- copy interception ---
+            m_copy = ca_cl.getDeclaredMethod("copyMessages", ArrayList, find_class("java.lang.String"))
+            m_copy.setAccessible(True)
+            self.hook_method(m_copy, _CopyMessagesHook(self))
 
-            if not target_id:
-                BulletinHelper.show_error("Could not determine user ID")
-                return
+            # --- selection limit bypass hooks ---
+            m_sel = ca_cl.getDeclaredMethod("addToSelectedMessages", MessageObject, Boolean.TYPE, Boolean.TYPE)
+            m_sel.setAccessible(True)
+            self.hook_method(m_sel, self._sel_handler)
 
-            frag = get_last_fragment()
-            if not frag:
-                return
-            act = frag.getParentActivity()
+            m_hide = ca_cl.getDeclaredMethod("hideActionMode")
+            m_hide.setAccessible(True)
+            self.hook_method(m_hide, MethodHook(before_hooked_method=lambda p: self._sel_handler.clear()))
 
-            EditText = find_class("android.widget.EditText")
-            if not EditText:
-                return
-            input_view = EditText(act)
-            
-            current_alias = self.get_setting(f"alias_{target_id}", "")
-            if current_alias:
-                input_view.setText(current_alias)
-                input_view.setSelection(len(current_alias))
+            # --- global limit bypass ---
+            try:
+                ms_cl = find_class("org.telegram.ui.ChatActivity$MultiSelectionListener")
+                if ms_cl:
+                    m_lim = ms_cl.getDeclaredMethod("limitReached")
+                    self.hook_method(m_lim, _BypassLimit())
+            except:
+                pass
 
-            bld = AlertDialogBuilder(act)
-            bld.set_title("Set Custom Alias")
-            bld.set_view(input_view)
-
-            def save_alias(bld: Any, which: int) -> None:
-                new_val = input_view.getText().toString().strip()
-                if new_val:
-                    self.set_setting(f"alias_{target_id}", new_val)
-                    BulletinHelper.show_success("Alias saved")
-                else:
-                    self.set_setting(f"alias_{target_id}", "")
-                    BulletinHelper.show_success("Alias cleared")
-                bld.dismiss()
-
-            def clear_alias(bld: Any, which: int) -> None:
-                self.set_setting(f"alias_{target_id}", "")
-                BulletinHelper.show_success("Alias cleared")
-                bld.dismiss()
-
-            bld.set_positive_button("Save", save_alias)
-            bld.set_negative_button("Clear", clear_alias)
-            bld.show()
         except Exception as e:
-            log(f"forward tools: set alias error {e}")
-            BulletinHelper.show_error("Failed to open alias dialog")
+            log(f"forward tools: hook setup failed {e}")
 
-    def _author(self, msg: Any) -> str:
-        # --- extract actual message sender taking aliases into account ---
+    def _get_author_name(self, msg: Any) -> str:
+        # --- resolve author name with alias support ---
         try:
+            sid = msg.getSenderId()
             my_id = UserConfig.getInstance(UserConfig.selectedAccount).getClientUserId()
-            sender_id = msg.getSenderId()
             
-            if sender_id == my_id and self.get_setting("replace_me_with_i", False):
+            if sid == my_id and self.get_setting("replace_me", False):
                 return "Я"
-                
-            alias = self.get_setting(f"alias_{sender_id}", "")
-            if alias:
-                return alias
+            
+            alias = self.get_setting(f"alias_{sid}", "")
+            if alias: return alias
 
-            owner = getattr(msg, "messageOwner", None)
-            if owner:
-                fwd = getattr(owner, "fwd_from", None)
-                if fwd:
-                    # --- hidden sender stores name directly in fwd_from ---
-                    raw_name = getattr(fwd, "from_name", None)
-                    if raw_name and str(raw_name).strip():
-                        return str(raw_name).strip()
-
-                    from_id = getattr(fwd, "from_id", None)
-                    if from_id:
-                        ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
-                        
-                        uid = getattr(from_id, "user_id", 0)
-                        if uid != 0:
-                            alias = self.get_setting(f"alias_{uid}", "")
-                            if alias: return alias
-                            u = ctrl.getUser(uid)
-                            if u:
-                                n = f"{u.first_name or ''} {u.last_name or ''}".strip()
-                                if n: return n
-                                
-                        cid = getattr(from_id, "channel_id", 0)
-                        if cid != 0:
-                            c = ctrl.getChat(cid)
-                            if c and c.title:
-                                return str(c.title).strip()
-                                
-                        chatid = getattr(from_id, "chat_id", 0)
-                        if chatid != 0:
-                            c = ctrl.getChat(chatid)
-                            if c and c.title:
-                                return str(c.title).strip()
-
-            # --- fallback to direct sender if not forwarded ---
+            # --- standard telegram name resolution ---
             ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
-            if sender_id > 0:
-                u = ctrl.getUser(sender_id)
-                if u:
-                    n = f"{u.first_name or ''} {u.last_name or ''}".strip()
-                    if n: return n
-            elif sender_id < 0:
-                c = ctrl.getChat(-sender_id)
-                if c and c.title:
-                    return str(c.title).strip()
-        except Exception as e:
-            log(f"forward tools: author extraction error {e}")
+            if sid > 0:
+                u = ctrl.getUser(sid)
+                if u: return f"{u.first_name or ''} {u.last_name or ''}".strip() or "User"
+            else:
+                c = ctrl.getChat(-sid)
+                if c: return c.title or "Chat"
+        except:
+            pass
         return "Unknown"
 
-    def _extract_text_safe(self, obj: Any) -> str:
-        # --- parse clean string out of textwithentities forcefully via reflection ---
-        if not obj:
-            return ""
+    def _get_msg_body(self, msg: Any) -> Any:
+        # --- extract content while preserving formatting ---
         try:
-            if hasattr(obj, "text"):
-                val = getattr(obj, "text")
-                if val is not None:
-                    return str(val)
-                    
-            f = obj.getClass().getField("text")
-            if f:
-                f.setAccessible(True)
-                val = f.get(obj)
-                if val is not None:
-                    return str(val)
-        except Exception as e:
-            log(f"forward tools: text safe extraction fallback {e}")
-        return str(obj)
-
-    def _extract_poll(self, msg: Any) -> Optional[str]:
-        # --- parse poll structure and render ascii bar chart ---
-        try:
-            owner = getattr(msg, "messageOwner", None)
-            media = getattr(owner, "media", None)
-            poll = getattr(media, "poll", None)
-            results = getattr(media, "results", None)
+            if msg.type == 0:
+                return msg.messageText or "[Text]"
             
-            if not poll: return None
+            # --- handle media labels ---
+            label = "[Media]"
+            if msg.isPhoto(): label = "🖼 Photo"
+            elif msg.isVideo(): label = "🎬 Video"
+            elif msg.isVoice(): label = "🎤 Voice Message"
+            elif msg.isRoundVideo(): label = "📹 Video Message"
+            elif msg.isSticker(): label = f"👾 Sticker {msg.getStickerEmoji() or ''}"
+            elif msg.isGif(): label = "🎞 GIF"
+            elif msg.isMusic(): label = f"🎵 {msg.getMusicAuthor()} - {msg.getMusicTitle()}"
             
-            question_obj = getattr(poll, "question", "Poll")
-            question = self._extract_text_safe(question_obj)
-            
-            answers_list = getattr(poll, "answers", None)
-            results_list = getattr(results, "results", None)
-            total_voters = getattr(results, "total_voters", 0) or 0
-            
-            voters_map = {}
-            if results_list:
-                for i in range(results_list.size()):
-                    r = results_list.get(i)
-                    opt = getattr(r, "option", None)
-                    cnt = getattr(r, "voters", 0)
-                    if opt is not None:
-                        voters_map[_bytes_key(opt)] = cnt
-                            
-            lines = [f"[📊 Poll: {question}]"]
-            if answers_list:
-                for i in range(answers_list.size()):
-                    ans = answers_list.get(i)
-                    ans_text_obj = getattr(ans, "text", "")
-                    text = self._extract_text_safe(ans_text_obj)
-                    opt = getattr(ans, "option", None)
-                    voters = 0
-                    if opt is not None:
-                        voters = voters_map.get(_bytes_key(opt), 0)
-                            
-                    percent = int((voters / total_voters) * 100) if total_voters > 0 else 0
-                    filled = int(percent / 10)
-                    bar = "■" * filled + "□" * (10 - filled)
-                    lines.append(f"[{bar}] {percent}% — {text}")
-                    
-            return "\n".join(lines)
-        except Exception as e:
-            log(f"forward tools: poll extraction error {e}")
-            return None
-
-    def _extract_contact(self, msg: Any) -> Optional[str]:
-        # --- parse contact metadata directly from media ---
-        try:
-            owner = getattr(msg, "messageOwner", None)
-            media = getattr(owner, "media", None)
-            if not media: return None
-            
-            first = str(getattr(media, "first_name", "") or "")
-            last = str(getattr(media, "last_name", "") or "")
-            phone = str(getattr(media, "phone_number", "") or "")
-            
-            name = f"{first} {last}".strip()
-            if name and phone:
-                return f"[👤 Contact: {name}, {phone}]"
-            elif name:
-                return f"[👤 Contact: {name}]"
-        except Exception as e:
-            log(f"forward tools: contact extraction error {e}")
-        return None
-
-    def _extract_location(self, msg: Any) -> Optional[str]:
-        # --- parse location and venue metadata ---
-        try:
-            owner = getattr(msg, "messageOwner", None)
-            media = getattr(owner, "media", None)
-            if not media: return None
-            
-            title = str(getattr(media, "title", "") or "")
-            addr = str(getattr(media, "address", "") or "")
-            
-            if title and addr:
-                return f"[📍 Venue: {title}, {addr}]"
-            elif title:
-                return f"[📍 Venue: {title}]"
-        except Exception as e:
-            log(f"forward tools: location extraction error {e}")
-        return None
-
-    def _extract_todo(self, msg: Any) -> Optional[str]:
-        # --- extract native telegram task list rendering checkboxes ---
-        try:
-            owner = getattr(msg, "messageOwner", None)
-            media = getattr(owner, "media", None)
-            if not media: return None
-
-            todo = getattr(media, "todo", None)
-            if not todo: return None
-
-            title_obj = getattr(todo, "title", "Task List")
-            title = self._extract_text_safe(title_obj)
-
-            lines = [f"[📋 Task List: {title}]"]
-
-            completed_ids = set()
-            completions = getattr(media, "completions", None)
-            if completions and hasattr(completions, "size"):
-                for i in range(completions.size()):
-                    c = completions.get(i)
-                    cid = getattr(c, "id", None)
-                    if cid is not None:
-                        completed_ids.add(cid)
-
-            todo_list = getattr(todo, "list", None)
-            if todo_list and hasattr(todo_list, "size"):
-                for i in range(todo_list.size()):
-                    item = todo_list.get(i)
-                    item_id = getattr(item, "id", None)
-                    item_title_obj = getattr(item, "title", "")
-                    item_text = self._extract_text_safe(item_title_obj)
-
-                    checkbox = "☑" if item_id in completed_ids else "☐"
-                    lines.append(f"{checkbox} {item_text}")
-
-            return "\n".join(lines)
-        except Exception as e:
-            log(f"forward tools: todo extraction error {e}")
-            return None
-
-    def _extract_file_name(self, msg: Any) -> str:
-        # --- attempt to parse real file name using native message methods ---
-        try:
-            if hasattr(msg, "getDocumentName"):
-                name = msg.getDocumentName()
-                if name and str(name).strip():
-                    return f": {name}"
-                    
-            doc = getattr(msg, "getDocument", lambda: None)()
-            if doc:
-                attrs = getattr(doc, "attributes", None)
-                if attrs:
-                    for i in range(attrs.size()):
-                        attr = attrs.get(i)
-                        name = str(attr.getClass().getSimpleName())
-                        if "DocumentAttributeFilename" in name:
-                            fname = getattr(attr, "file_name", None)
-                            if fname:
-                                return f": {fname}"
-        except Exception as e:
-            log(f"forward tools: file name extraction error {e}")
-        return ""
-        
-    def _extract_music(self, msg: Any) -> str:
-        # --- extract music metadata using native telegram methods ---
-        try:
-            title = str(getattr(msg, "getMusicTitle", lambda: "")() or "")
-            author = str(getattr(msg, "getMusicAuthor", lambda: "")() or "")
-            
-            if title and author:
-                return f": {author} - {title}"
-            elif title:
-                return f": {title}"
-        except Exception as e:
-            log(f"forward tools: music metadata error {e}")
-        return ""
-
-    def _get_media_label(self, msg: Any) -> str:
-        # --- dynamically route to specific meta extractors identifying classes directly ---
-        try:
-            owner = getattr(msg, "messageOwner", None)
-            media = getattr(owner, "media", None)
-            media_cls = str(media.getClass().getSimpleName()) if media else ""
-            
-            if getattr(msg, "isPoll", lambda: False)() or "Poll" in media_cls:
-                res = self._extract_poll(msg)
-                if res: return res
-                return "[📊 Poll]"
-                
-            if getattr(msg, "isContact", lambda: False)() or "Contact" in media_cls:
-                res = self._extract_contact(msg)
-                if res: return res
-                return "[👤 Contact]"
-                
-            if getattr(msg, "isLocation", lambda: False)() or "Location" in media_cls or "Geo" in media_cls or "Venue" in media_cls:
-                res = self._extract_location(msg)
-                if res: return res
-                return "[📍 Location]"
-                
-            if "ToDo" in media_cls:
-                res = self._extract_todo(msg)
-                if res: return res
-                
-            if getattr(msg, "isSticker", lambda: False)() or getattr(msg, "isAnimatedSticker", lambda: False)():
-                emoji = "👾"
-                try:
-                    if hasattr(msg, "getStickerEmoji"):
-                        val = msg.getStickerEmoji()
-                        if val:
-                            emoji = str(val)
-                    else:
-                        doc = getattr(msg, "getDocument", lambda: None)()
-                        if doc:
-                            attrs = getattr(doc, "attributes", None)
-                            if attrs:
-                                for i in range(attrs.size()):
-                                    attr = attrs.get(i)
-                                    if "documentAttributeSticker" in str(attr.getClass().getSimpleName()):
-                                        alt = getattr(attr, "alt", None)
-                                        if alt:
-                                            emoji = str(alt)
-                                            break
-                except Exception as e:
-                    log(f"forward tools: sticker emoji error {e}")
-                    
-                kind = "Animated Sticker" if getattr(msg, "isAnimatedSticker", lambda: False)() else "Sticker"
-                return f"[{emoji} {kind}]"
-
-            fname = self._extract_file_name(msg)
-            if getattr(msg, "isVoice", lambda: False)(): return "[🎤 Voice Message]"
-            if getattr(msg, "isRoundVideo", lambda: False)(): return "[📹 Video Message]"
-            if getattr(msg, "isVideo", lambda: False)(): return f"[🎬 Video{fname}]"
-            if getattr(msg, "isMusic", lambda: False)(): 
-                music_meta = self._extract_music(msg)
-                if music_meta: return f"[🎵 Music{music_meta}]"
-                return f"[🎵 Music{fname}]"
-            if getattr(msg, "isPhoto", lambda: False)(): return "[🖼 Photo]"
-            if getattr(msg, "isGif", lambda: False)(): return f"[🎞 GIF{fname}]"
-            
-            if fname: return f"[📎 File{fname}]"
-            if media_cls: return f"[📎 Media: {media_cls}]"
-            
-        except Exception as e:
-            log(f"forward tools: media label error {e}")
-            
-        return "[📎 Media]"
-
-    def _raw_text(self, msg: Any) -> Any:
-        # --- extract native charsequence to preserve spans and handle complex labels ---
-        try:
-            m_type = getattr(msg, "type", 0)
-            
-            # --- type zero is purely text ---
-            if m_type == 0:
-                message_text = getattr(msg, "messageText", None)
-                if message_text:
-                    return message_text
-                owner = getattr(msg, "messageOwner", None)
-                if owner:
-                    raw = getattr(owner, "message", None)
-                    if raw:
-                        return raw
-                return None
-
-            # --- non zero type means media so we explicitly build the label ---
-            label = self._get_media_label(msg)
-            caption = getattr(msg, "caption", None)
-
-            SpannableStringBuilder = find_class("android.text.SpannableStringBuilder")
-            if not SpannableStringBuilder:
-                return caption if caption else label
-
-            builder = SpannableStringBuilder()
-            builder.append(label)
-            
+            caption = msg.caption
             if caption and caption.length() > 0:
-                builder.append("\n")
-                builder.append(caption)
-                
-            return builder
+                ssb = find_class("android.text.SpannableStringBuilder")()
+                ssb.append(f"[{label}]\n")
+                ssb.append(caption)
+                return ssb
+            return f"[{label}]"
+        except:
+            return "[Content]"
+
+    def _format_batch(self, messages: List[Any]) -> Any:
+        # --- build formatted string for clipboard ---
+        ssb = find_class("android.text.SpannableStringBuilder")()
+        
+        curr_author = None
+        curr_date = None
+        
+        show_time = self.get_setting("show_time", False)
+        show_date = self.get_setting("show_date", False)
+        show_label = self.get_setting("show_label", False)
+
+        for m in messages:
+            author = self._get_author_name(m)
+            owner = getattr(m, "messageOwner", None)
+            date_val = datetime.fromtimestamp(owner.date) if owner else None
             
-        except Exception as e:
-            log(f"forward tools: raw text extraction error {e}")
-            return None
+            # --- date header ---
+            if show_date and date_val:
+                ds = date_val.strftime("%d.%m.%Y")
+                if ds != curr_date:
+                    if ssb.length() > 0: ssb.append("\n\n")
+                    ssb.append(f"--- {ds} ---\n")
+                    curr_date = ds
+                    curr_author = None
 
-    def _text(self, msg: Any) -> str:
-        # --- fallback for plain string extraction in short quotes ---
-        raw = self._raw_text(msg)
-        if raw:
-            return raw.toString()
-        return ""
-
-    def _selected(self, fragment: Any) -> List[Any]:
-        # --- gather all selected messages sorted by date ---
-        try:
-            sp = get_private_field(fragment, "selectedMessagesIds")
-            if not sp:
-                return []
-            bag: Dict[int, Any] = {}
-            for idx in range(2): 
-                s = sp[idx]
-                if s is None:
-                    continue
-                for i in range(s.size()):
-                    bag[s.keyAt(i)] = s.valueAt(i)
-            return sorted(
-                bag.values(),
-                key=lambda m: getattr(getattr(m, "messageOwner", None), "date", 0)
-            )
-        except Exception as e:
-            log(f"forward tools: selected fetch error {e}")
-            return []
-
-    def _format(self, msgs: List[Any]) -> Any:
-        # --- construct spannablestringbuilder to keep native formatting and emojis ---
-        SpannableStringBuilder = find_class("android.text.SpannableStringBuilder")
-        if not SpannableStringBuilder:
-            return ""
-            
-        builder = SpannableStringBuilder()
-
-        ts_on: bool = self.get_setting("timestamps", False)
-        dates_on: bool = self.get_setting("dates", False)
-        prefix_on: bool = self.get_setting("with_label", False)
-        replies_on: bool = self.get_setting("format_replies", True)
-
-        cur_date: Optional[str] = None
-        cur_author: Optional[str] = None
-
-        for msg in msgs:
-            owner = getattr(msg, "messageOwner", None)
-            stamp = getattr(owner, "date", 0) if owner else 0
-            dt = None
-            if stamp:
-                try:
-                    dt = datetime.fromtimestamp(int(stamp))
-                except Exception as e:
-                    log(f"forward tools: time formatting error {e}")
-
-            d_str: str = dt.strftime("%d.%m.%Y") if dt else ""
-            t_str: str = dt.strftime("%H:%M") if dt else ""
-            author: str = self._author(msg)
-
-            # --- insert date separator when day changes ---
-            if dates_on and d_str and d_str != cur_date:
-                if builder.length() > 0:
-                    builder.append("\n\n")
-                builder.append(f"--- {d_str} ---\n\n")
-                cur_date = d_str
-                cur_author = None 
-
-            # --- insert author header when sender changes ---
-            if author != cur_author:
-                if builder.length() > 0 and not builder.toString().endswith("\n\n"):
-                    builder.append("\n\n")
-                hdr = f"Forwarded from {author}:\n" if prefix_on else f"{author}:\n"
-                builder.append(hdr)
-                cur_author = author
-            elif builder.length() > 0:
-                builder.append("\n")
-
-            # --- format reply block if message is a reply ---
-            if replies_on:
-                reply_obj = getattr(msg, "replyMessageObject", None)
-                if reply_obj:
-                    reply_author = self._author(reply_obj)
-                    reply_text = self._text(reply_obj) or "[Media]"
-                    words = reply_text.split()
-                    short_quote = " ".join(words[:5]) + ("..." if len(words) > 5 else "")
-                    builder.append(f"> {reply_author}: {short_quote}\n")
-
-            # --- append message body with optional timestamp ---
-            if ts_on and t_str:
-                builder.append(f"[{t_str}] ")
-                
-            raw_body = self._raw_text(msg)
-            if raw_body:
-                builder.append(raw_body)
+            # --- author header ---
+            if author != curr_author:
+                if ssb.length() > 0: ssb.append("\n\n")
+                prefix = "Forwarded from " if show_label else ""
+                ssb.append(f"{prefix}{author}:\n")
+                curr_author = author
             else:
-                builder.append("[Media]")
+                ssb.append("\n")
 
-        return builder
+            # --- message content ---
+            if show_time and date_val:
+                ssb.append(f"[{date_val.strftime('%H:%M')}] ")
+            
+            ssb.append(self._get_msg_body(m))
 
-    def _on_copy(self, ctx: Dict[str, Any]) -> None:
-        # --- explicit fallback copy for single message via long press ---
-        try:
-            fragment = ctx.get("fragment")
-            single = ctx.get("message")
-            batch = self._selected(fragment) if fragment else []
+        return ssb
 
-            target: List[Any] = batch if len(batch) > 1 else ([single] if single else [])
+    def _on_single_copy(self, ctx: Dict[str, Any]) -> None:
+        # --- handle context menu copy action ---
+        msg = ctx.get("message")
+        if not msg: return
+        res = self._format_batch([msg])
+        AndroidUtilities.addToClipboard(res)
+        BulletinHelper.show_copied_to_clipboard()
 
-            if not target:
-                BulletinHelper.show_error("No message available")
-                return
+    def _on_set_alias(self, ctx: Dict[str, Any]) -> None:
+        # --- alias configuration dialog ---
+        msg = ctx.get("message")
+        user = ctx.get("user")
+        target_id = user.id if user else (msg.getSenderId() if msg else None)
+        if not target_id: return
 
-            result = self._format(target)
+        frag = get_last_fragment()
+        act = frag.getParentActivity() if frag else None
+        if not act: return
 
-            if result.length() == 0:
-                BulletinHelper.show_info("Nothing to copy")
-                return
+        et = find_class("android.widget.EditText")(act)
+        et.setText(self.get_setting(f"alias_{target_id}", ""))
+        
+        def save(b, w):
+            self.set_setting(f"alias_{target_id}", et.getText().toString().strip())
+            BulletinHelper.show_success("Alias updated")
+            b.dismiss()
 
-            AndroidUtilities.addToClipboard(result)
-            BulletinHelper.show_copied_to_clipboard()
-        except Exception as e:
-            log(f"forward tools: explicit copy error {e}")
-            BulletinHelper.show_error("Copy failed")
+        AlertDialogBuilder(act).set_title("Copy Alias").set_view(et).set_positive_button("Save", save).show()
 
     def create_settings(self) -> List[Any]:
-        # --- native plugin settings screen ---
+        # --- plugin configuration layout ---
         return [
-            Header(text="Copy formatting"),
-            Switch(
-                key="override_native_copy",
-                text="Override native copy",
-                default=True,
-                subtext="Automatically format text when using the standard Telegram copy button for multiple messages",
-                icon="msg_copy"
-            ),
-            Switch(
-                key="format_replies",
-                text="Format replies",
-                default=True,
-                subtext="Add '> Name: text...' for replied-to messages",
-                icon="msg_reply"
-            ),
-            Switch(
-                key="timestamps",
-                text="Timestamps [hh:mm]",
-                default=False,
-                subtext="Prefix each message with its send time",
-                icon="msg_calendar"
-            ),
-            Switch(
-                key="dates",
-                text="Date headers",
-                default=False,
-                subtext="Insert --- dd.mm.yyyy --- when date changes",
-                icon="msg_calendar2"
-            ),
-            Switch(
-                key="with_label",
-                text="'Forwarded from' prefix",
-                default=False,
-                subtext="Add 'Forwarded from' before author name",
-                icon="msg_forward"
-            ),
-            Switch(
-                key="replace_me_with_i",
-                text="Replace my name with 'Я'",
-                default=False,
-                subtext="Uses 'Я' instead of your profile name when copying your messages",
-                icon="msg_edit"
-            ),
+            Header(text="Clipboard formatting"),
+            Switch(key="override_native_copy", text="Enhance multi-copy", default=True, subtext="Use custom formatting for batch copying"),
+            Switch(key="show_time", text="Show timestamps", default=False, icon="msg_calendar"),
+            Switch(key="show_date", text="Show date headers", default=False, icon="msg_calendar2"),
+            Switch(key="show_label", text="Add 'Forwarded from' prefix", default=False),
+            Switch(key="replace_me", text="Replace my name with 'Я'", default=False),
             Divider(),
-            Header(text="Selection limit"),
-            Switch(
-                key="no_forward_limit",
-                text="Remove 100 message limit",
-                default=True,
-                subtext="Select, forward and delete more than 100 messages at once",
-                icon="msg_forward_replace"
-            ),
-            Divider(text="No forward limit based on code by @zwylair"),
-            Text(
-                text="@zwylair — NoForwardLimit",
-                icon="msg_link"
-            ),
+            Header(text="Limits"),
+            Switch(key="no_forward_limit", text="No selection limit", default=True, subtext="Select and copy more than 100 messages")
         ]

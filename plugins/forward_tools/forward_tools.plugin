@@ -31,7 +31,7 @@ __description__ = """
 ★ | убирает лимит выделения в 100 сообщений и позволяет копировать текст с сохранением оригинальных авторов и форматированием. частично вдохновлено @zwylair.
 """
 __author__ = "@insonniiia | @zwylair (автор NoForwardLimit)"
-__version__ = "2.2.11"
+__version__ = "2.2.12"
 __icon__ = "hsrgustinex/8"
 __min_version__ = "11.12.0"
 
@@ -185,74 +185,49 @@ class _ClipboardHook(MethodHook):
         self.plugin = plugin
 
     def before_hooked_method(self, param: Any) -> None:
-        # --- mark clipboard pipeline busy to prevent double formatting ---
-        self.plugin._clip_busy = True
+        # --- intercept copy utilizing snapshot to survive action mode dismissal ---
         if not self.plugin.get_setting("override_native_copy", True):
             return
-        try:
-            frag = get_last_fragment()
-            if not frag or not isinstance(frag, ChatActivity):
-                return
-            msgs = self.plugin._selected(frag)
-            if len(msgs) == 0:
-                return
-            res = self.plugin._format(msgs)
-            if res.length() > 0:
-                param.args[0] = res
-        except Exception as e:
-            log(f"forward tools: clipboard hook error {e}")
-
-    def after_hooked_method(self, param: Any) -> None:
-        # --- release busy flag once original addtoclipboard finishes ---
-        self.plugin._clip_busy = False
-
-class _ClipboardManagerHook(MethodHook):
-    def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
-        self.plugin = plugin
-
-    def before_hooked_method(self, param: Any) -> None:
-        # --- intercept native setprimaryclip using copy intent snapshot ---
-        if not self.plugin.get_setting("override_native_copy", True):
-            return
+            
+        # --- prevent infinite loops if formatting process calls clipboard natively ---
         if self.plugin._clip_busy:
             return
+            
         try:
+            self.plugin._clip_busy = True
+            
             frag = get_last_fragment()
             if not frag or not isinstance(frag, ChatActivity):
                 return
-
+                
             try:
                 current_dialog = get_private_field(frag, "dialog_id")
-            except Exception as e:
-                log(f"forward tools: dialog id fetch failed {e}")
+            except Exception:
                 current_dialog = None
 
-            sel = self.plugin._sel_hook
-            msgs: List[Any] = []
-            if sel:
-                msgs = sel.take_copy_intent(current_dialog)
+            msgs = []
+            
+            # --- read from saved snapshot first because native ui clears live selection instantly ---
+            if self.plugin._sel_hook:
+                msgs = self.plugin._sel_hook.take_copy_intent(current_dialog)
+                
+            # --- fallback to live selection if snapshot is unavailable ---
+            if not msgs:
+                msgs = self.plugin._selected(frag)
 
-            # --- fallback to live selection if intent expired or empty ---
-            if len(msgs) < 2:
-                live = self.plugin._selected(frag)
-                if len(live) >= 2:
-                    msgs = live
-
-            if len(msgs) < 2:
+            # --- if no messages found we abort to let native text copy work ---
+            if not msgs:
                 return
 
-            formatted = self.plugin._format(msgs)
-            if not formatted or formatted.length() == 0:
-                return
-
-            ClipDataCls = find_class("android.content.ClipData")
-            if not ClipDataCls:
-                return
-
-            new_clip = ClipDataCls.newPlainText("", formatted)
-            param.args[0] = new_clip
+            res = self.plugin._format(msgs)
+            if res and res.length() > 0:
+                param.args[0] = res
+                
         except Exception as e:
-            log(f"forward tools: clipboard manager hook error {e}")
+            log(f"forward tools: clipboard hook error {e}")
+        finally:
+            # --- always release lock ---
+            self.plugin._clip_busy = False
 
 class _SelectorHook(MethodHook):
     def __init__(self, plugin: 'ForwardToolsPlugin') -> None:
@@ -275,17 +250,13 @@ class _SelectorHook(MethodHook):
         self._intent_expire = time.time() + 3.0
 
     def take_copy_intent(self, expected_dialog_id: Optional[int]) -> List[Any]:
-        # --- consume snapshot with expiry and dialog id check ---
+        # --- read snapshot but do not wipe it to survive multiple rapid clipboard calls ---
         if time.time() > self._intent_expire:
             return []
         if expected_dialog_id is not None and self._intent_dialog is not None:
             if self._intent_dialog != expected_dialog_id:
                 return []
-        msgs = list(self._intent_msgs)
-        self._intent_msgs = []
-        self._intent_dialog = None
-        self._intent_expire = 0.0
-        return msgs
+        return self._intent_msgs
 
     def _snapshot_from_live(self, this_object: Any) -> None:
         # --- capture current selected messages from chatactivity into intent ---
@@ -480,7 +451,7 @@ class ForwardToolsPlugin(BasePlugin):
         self._save_aliases(aliases)
 
     def _migrate_aliases(self) -> None:
-        # --- move legacy alias_<id> keys into single json map once ---
+        # --- move legacy alias keys into single json map once ---
         try:
             all_settings = self.export_settings()
             if not isinstance(all_settings, dict):
@@ -505,7 +476,7 @@ class ForwardToolsPlugin(BasePlugin):
             log(f"forward tools: aliases migration error {e}")
 
     def on_plugin_load(self) -> None:
-        # --- run one-time migration of alias keys into json map ---
+        # --- run one time migration of alias keys into json map ---
         self._migrate_aliases()
         
         # --- register context menu for copy with authors ---
@@ -589,15 +560,6 @@ class ForwardToolsPlugin(BasePlugin):
             )
             m_clip.setAccessible(True)
             self.hook_method(m_clip, _ClipboardHook(self))
-
-            ClipboardManagerCls = find_class("android.content.ClipboardManager")
-            ClipDataCls = find_class("android.content.ClipData")
-            if ClipboardManagerCls and ClipDataCls:
-                m_clip_mgr = ClipboardManagerCls.getDeclaredMethod(
-                    "setPrimaryClip", ClipDataCls
-                )
-                m_clip_mgr.setAccessible(True)
-                self.hook_method(m_clip_mgr, _ClipboardManagerHook(self))
 
             log("forward tools: hooks registered successfully")
         except Exception as e:
@@ -1206,3 +1168,4 @@ class ForwardToolsPlugin(BasePlugin):
                 icon="msg_link"
             ),
         ]
+

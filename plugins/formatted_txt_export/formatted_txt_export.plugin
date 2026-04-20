@@ -2,7 +2,7 @@
 Плагин для быстрого экспорта чата в TXT с сохранением форматирования, 
 метаданных (медиа, опросы, контакты) и реплаев.
 Автоматически отправляет результат в Избранное (Saved Messages).
-С окном логов, промежуточным прогрессом и автодетектом версии БД.
+С блочным форматированием пересланных сообщений (<переслано>).
 """
 
 import os
@@ -33,9 +33,9 @@ from android.graphics import Color
 # --- метаданные ---
 __id__ = "formatted_txt_export"
 __name__ = "Formatted TXT Export"
-__description__ = "Экспорт в TXT с улучшенным парсером медиа (стикеры, гиф, подписи, опросы)."
+__description__ = "Быстрый экспорт в TXT с блоками <переслано> и логами."
 __author__ = "Personal Use"
-__version__ = "1.6.1"
+__version__ = "1.7.1"
 __icon__ = "hsrgustinex/49"
 __min_version__ = "11.12.0"
 
@@ -90,10 +90,10 @@ class FormattedTxtExportPlugin(BasePlugin):
     def create_settings(self):
         return [
             Header(text="Стиль экспорта"),
+            Switch(key="fwd_blocks", text="Блоки <переслано>", default=True, subtext="Группировать пересланные сообщения в специальные блоки", icon="msg_forward"),
             Switch(key="format_replies", text="Форматировать реплаи", default=True, subtext="Добавлять '> Имя: текст...' для ответов", icon="msg_reply"),
             Switch(key="timestamps", text="Таймштампы [hh:mm]", default=True, subtext="Добавлять время перед каждым сообщением", icon="msg_calendar"),
             Switch(key="dates", text="Разделители дат", default=True, subtext="Вставлять --- dd.mm.yyyy --- при смене дня", icon="msg_calendar2"),
-            Switch(key="with_label", text="Префикс 'Forwarded from'", default=False, subtext="Писать 'Forwarded from' перед именем автора", icon="msg_forward"),
             Switch(key="replace_me_with_i", text="Заменять свое имя на 'Я'", default=False, subtext="Использовать 'Я' вместо имени профиля", icon="msg_edit"),
             Divider()
         ]
@@ -235,38 +235,67 @@ class FormattedTxtExportPlugin(BasePlugin):
             self._messages_table = "messages"
         return self._messages_table
 
-    # --- RAW EXTRACTORS ---
-    def _resolve_author(self, account_id, msg):
+    # --- SENDER & AUTHOR EXTRACTORS ---
+    def _get_real_sender(self, account_id, msg, dialog_id):
+        """Определяет того, кто физически отправил сообщение в этот чат"""
         try:
             my_id = UserConfig.getInstance(account_id).getClientUserId()
-            from_id_obj = None
-            fwd_name = ""
+            uid = None
+            cid = None
             
-            if hasattr(msg, "fwd_from") and msg.fwd_from:
-                from_id_obj = getattr(msg.fwd_from, "from_id", None)
-                fwd_name = str(getattr(msg.fwd_from, "from_name", "") or "")
-                if fwd_name: return fwd_name
-            elif hasattr(msg, "from_id"):
-                from_id_obj = msg.from_id
+            if hasattr(msg, "from_id") and msg.from_id:
+                peer = msg.from_id
+                if getattr(peer, "user_id", 0): uid = peer.user_id
+                elif getattr(peer, "channel_id", 0): cid = peer.channel_id
+                elif getattr(peer, "chat_id", 0): cid = peer.chat_id
                 
-            if from_id_obj:
-                uid = getattr(from_id_obj, "user_id", 0)
-                if uid != 0:
-                    if uid == my_id and self.get_setting("replace_me_with_i", False): return "Я"
-                    from org.telegram.messenger import MessagesController
-                    user = MessagesController.getInstance(account_id).getUser(uid)
-                    if user: return f"{user.first_name or ''} {user.last_name or ''}".strip()
-                    return f"User_{uid}"
+            if not uid and not cid:
+                if getattr(msg, "out", False): uid = my_id
+                else:
+                    if dialog_id > 0: uid = dialog_id
+                    else: cid = -dialog_id
                     
-                cid = getattr(from_id_obj, "channel_id", 0)
-                if cid != 0:
-                    from org.telegram.messenger import MessagesController
-                    chat = MessagesController.getInstance(account_id).getChat(cid)
-                    if chat: return str(chat.title)
-                    return f"Channel_{cid}"
+            if uid:
+                if uid == my_id and self.get_setting("replace_me_with_i", False): return "Я"
+                from org.telegram.messenger import MessagesController
+                user = MessagesController.getInstance(account_id).getUser(uid)
+                if user: return f"{user.first_name or ''} {user.last_name or ''}".strip()
+                return f"User_{uid}"
+                
+            if cid:
+                from org.telegram.messenger import MessagesController
+                chat = MessagesController.getInstance(account_id).getChat(cid)
+                if chat: return str(chat.title)
+                return f"Channel_{cid}"
         except Exception as e:
-            self._add_log(f"Ошибка определения автора: {e}")
+            self._add_log(f"Ошибка sender: {e}")
         return "Unknown"
+
+    def _get_fwd_author(self, account_id, msg):
+        """Определяет оригинального автора, если сообщение переслано"""
+        try:
+            if hasattr(msg, "fwd_from") and msg.fwd_from:
+                fwd = msg.fwd_from
+                name = str(getattr(fwd, "from_name", "") or "")
+                if name: return name
+                
+                peer = getattr(fwd, "from_id", None)
+                if peer:
+                    uid = getattr(peer, "user_id", 0)
+                    cid = getattr(peer, "channel_id", 0) or getattr(peer, "chat_id", 0)
+                    if uid:
+                        from org.telegram.messenger import MessagesController
+                        user = MessagesController.getInstance(account_id).getUser(uid)
+                        if user: return f"{user.first_name or ''} {user.last_name or ''}".strip()
+                        return f"User_{uid}"
+                    if cid:
+                        from org.telegram.messenger import MessagesController
+                        chat = MessagesController.getInstance(account_id).getChat(cid)
+                        if chat: return str(chat.title)
+                        return f"Channel_{cid}"
+        except Exception as e:
+            self._add_log(f"Ошибка fwd_author: {e}")
+        return None
 
     def _get_reply_info(self, db, dialog_id, account_id, reply_id):
         try:
@@ -280,7 +309,8 @@ class FormattedTxtExportPlugin(BasePlugin):
                     buffer.reuse()
                     cur.dispose()
                     if rep_msg:
-                        author = self._resolve_author(account_id, rep_msg)
+                        fwd = self._get_fwd_author(account_id, rep_msg)
+                        author = fwd if fwd else self._get_real_sender(account_id, rep_msg, dialog_id)
                         text = self._extract_raw_text(rep_msg)
                         return author, text
             cur.dispose()
@@ -371,7 +401,6 @@ class FormattedTxtExportPlugin(BasePlugin):
             
             media_label = self._get_media_label(msg)
             
-            # Если есть и текст(подпись), и медиа (но не просто сообщение)
             if text and media_label != "[Message]":
                 return f"{media_label} {text}"
             elif text:
@@ -482,13 +511,15 @@ class FormattedTxtExportPlugin(BasePlugin):
             if not export_dir.exists(): export_dir.mkdirs()
             file_path = os.path.join(export_dir.getAbsolutePath(), f"formatted_export_{dialog_id}_{int(time.time())}.txt")
 
+            fwd_blocks_on = self.get_setting("fwd_blocks", True)
             ts_on = self.get_setting("timestamps", True)
             dates_on = self.get_setting("dates", True)
-            prefix_on = self.get_setting("with_label", False)
             replies_on = self.get_setting("format_replies", True)
 
             cur_date = None
-            cur_author = None
+            cur_sender = None
+            cur_fwd_author = None
+            in_fwd_block = False
             msg_count = 0
 
             self._add_log(f"Чтение данных и запись в файл: {file_path}")
@@ -508,19 +539,52 @@ class FormattedTxtExportPlugin(BasePlugin):
                             d_str = dt.strftime("%d.%m.%Y")
                             t_str = dt.strftime("%H:%M")
 
+                            sender = self._get_real_sender(account_id, msg, dialog_id)
+                            fwd_author = self._get_fwd_author(account_id, msg)
+
+                            # 1. Смена даты
                             if dates_on and d_str != cur_date:
-                                f.write(f"\n--- {d_str} ---\n\n")
-                                cur_date = d_str
-                                cur_author = None
-
-                            author = self._resolve_author(account_id, msg)
-
-                            if author != cur_author:
-                                prefix = "Forwarded from " if prefix_on and getattr(msg, "fwd_from", None) else ""
+                                if in_fwd_block:
+                                    f.write("</переслано>\n")
+                                    in_fwd_block = False
                                 if msg_count > 0: f.write("\n")
-                                f.write(f"{prefix}{author}:\n")
-                                cur_author = author
+                                f.write(f"--- {d_str} ---\n\n")
+                                cur_date = d_str
+                                cur_sender = None
+                                cur_fwd_author = None
 
+                            # 2. Смена текущего говорящего
+                            if sender != cur_sender:
+                                if in_fwd_block:
+                                    f.write("</переслано>\n")
+                                    in_fwd_block = False
+                                
+                                if msg_count > 0 and cur_sender is not None:
+                                    f.write("\n")
+                                    
+                                f.write(f"{sender}:\n")
+                                cur_sender = sender
+                                cur_fwd_author = None
+
+                            # 3. Блоки пересылки
+                            if fwd_blocks_on and fwd_author:
+                                if not in_fwd_block:
+                                    f.write("<переслано>\n")
+                                    in_fwd_block = True
+                                    
+                                if fwd_author != cur_fwd_author:
+                                    if cur_fwd_author is not None:
+                                        f.write("\n") # Отступ между разными пересланными авторами
+                                    f.write(f"{fwd_author}:\n")
+                                    cur_fwd_author = fwd_author
+                            else:
+                                if in_fwd_block:
+                                    f.write("</переслано>\n\n")
+                                    in_fwd_block = False
+                                    cur_fwd_author = None
+                                    f.write(f"{sender}:\n") # Возвращаем имя говорящего
+
+                            # 4. Реплаи
                             if replies_on and hasattr(msg, "reply_to") and msg.reply_to:
                                 rep_id = getattr(msg.reply_to, "reply_to_msg_id", 0)
                                 if rep_id != 0:
@@ -529,12 +593,11 @@ class FormattedTxtExportPlugin(BasePlugin):
                                     short_quote = " ".join(words[:5]) + ("..." if len(words) > 5 else "")
                                     f.write(f"> {rep_author}: {short_quote}\n")
 
+                            # 5. Текст
                             line = ""
                             if ts_on: line += f"[{t_str}] "
+                            line += self._extract_raw_text(msg)
                             
-                            text = self._extract_raw_text(msg)
-                            
-                            line += text
                             f.write(line + "\n")
                             msg_count += 1
 
@@ -544,6 +607,10 @@ class FormattedTxtExportPlugin(BasePlugin):
                             
                     except Exception as e:
                         self._add_log(f"Ошибка парсинга сообщения: {e}")
+
+                # Закрываем блок в самом конце файла, если он остался открыт
+                if in_fwd_block:
+                    f.write("</переслано>\n")
 
             cursor.dispose()
             self._add_log(f"Чтение завершено. Итого сообщений: {msg_count}")

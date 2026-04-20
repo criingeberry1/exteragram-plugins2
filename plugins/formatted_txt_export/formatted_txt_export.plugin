@@ -2,6 +2,7 @@
 Плагин для быстрого экспорта чата в TXT с сохранением форматирования, 
 метаданных (медиа, опросы, контакты) и реплаев.
 Автоматически отправляет результат в Избранное (Saved Messages).
+С окном логов и промежуточным прогрессом.
 """
 
 import os
@@ -13,7 +14,7 @@ from java.io import File
 from android.content import Intent
 from androidx.core.content import FileProvider
 
-from org.telegram.messenger import ApplicationLoader, MessagesStorage, UserConfig
+from org.telegram.messenger import ApplicationLoader, MessagesStorage, UserConfig, AndroidUtilities
 from org.telegram.tgnet import TLRPC
 from android_utils import run_on_ui_thread, log
 from base_plugin import BasePlugin, MenuItemData, MenuItemType
@@ -23,27 +24,39 @@ from ui.bulletin import BulletinHelper
 from ui.settings import Header, Switch, Divider
 from android.text import InputType
 from org.telegram.ui.Components import EditTextBoldCursor
-from android.widget import LinearLayout, TextView
+from android.widget import LinearLayout, TextView, ScrollView
 from android.util import TypedValue
 from android.graphics import Color
 
 # --- метаданные ---
 __id__ = "formatted_txt_export"
 __name__ = "Formatted TXT Export"
-__description__ = "Быстрый экспорт в TXT с отправкой в Избранное (Saved Messages)."
+__description__ = "Быстрый экспорт в TXT с логами и отправкой в Избранное."
 __author__ = "Personal Use"
-__version__ = "1.1.1"
+__version__ = "1.2.1"
 __icon__ = "hsrgustinex/49"
 __min_version__ = "11.12.0"
 
 
 class FormattedTxtExportPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.export_logs = []
+
+    def _add_log(self, text):
+        dt = datetime.now().strftime("%H:%M:%S")
+        msg = f"[{dt}] {text}"
+        self.export_logs.append(msg)
+        if len(self.export_logs) > 500:
+            self.export_logs.pop(0)
+        log(f"FmtExport: {text}")
+
     def on_plugin_load(self):
         self.menu_item_id = self.add_menu_item(
             MenuItemData(
                 menu_type=MenuItemType.CHAT_ACTION_MENU,
                 item_id="fmt_txt_export_btn",
-                text="Форматированный TXT Экспорт",
+                text="Форматированный Экспорт",
                 icon="msg_download",
                 on_click=self._handle_export_click,
             )
@@ -57,51 +70,29 @@ class FormattedTxtExportPlugin(BasePlugin):
                 on_click=self._open_settings,
             )
         )
+        self.logs_item_id = self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                item_id="fmt_txt_logs_btn",
+                text="Логи Экспорта",
+                icon="msg_info",
+                on_click=self._show_logs_dialog,
+            )
+        )
 
     def on_plugin_unload(self):
-        if hasattr(self, 'menu_item_id') and self.menu_item_id:
-            self.remove_menu_item(self.menu_item_id)
-        if hasattr(self, 'settings_item_id') and self.settings_item_id:
-            self.remove_menu_item(self.settings_item_id)
+        for item_id in ['menu_item_id', 'settings_item_id', 'logs_item_id']:
+            if hasattr(self, item_id) and getattr(self, item_id):
+                self.remove_menu_item(getattr(self, item_id))
 
     def create_settings(self):
         return [
             Header(text="Стиль экспорта"),
-            Switch(
-                key="format_replies",
-                text="Форматировать реплаи",
-                default=True,
-                subtext="Добавлять '> Имя: текст...' для ответов",
-                icon="msg_reply"
-            ),
-            Switch(
-                key="timestamps",
-                text="Таймштампы [hh:mm]",
-                default=True,
-                subtext="Добавлять время перед каждым сообщением",
-                icon="msg_calendar"
-            ),
-            Switch(
-                key="dates",
-                text="Разделители дат",
-                default=True,
-                subtext="Вставлять --- dd.mm.yyyy --- при смене дня",
-                icon="msg_calendar2"
-            ),
-            Switch(
-                key="with_label",
-                text="Префикс 'Forwarded from'",
-                default=False,
-                subtext="Писать 'Forwarded from' перед именем автора",
-                icon="msg_forward"
-            ),
-            Switch(
-                key="replace_me_with_i",
-                text="Заменять свое имя на 'Я'",
-                default=False,
-                subtext="Использовать 'Я' вместо имени профиля",
-                icon="msg_edit"
-            ),
+            Switch(key="format_replies", text="Форматировать реплаи", default=True, subtext="Добавлять '> Имя: текст...' для ответов", icon="msg_reply"),
+            Switch(key="timestamps", text="Таймштампы [hh:mm]", default=True, subtext="Добавлять время перед каждым сообщением", icon="msg_calendar"),
+            Switch(key="dates", text="Разделители дат", default=True, subtext="Вставлять --- dd.mm.yyyy --- при смене дня", icon="msg_calendar2"),
+            Switch(key="with_label", text="Префикс 'Forwarded from'", default=False, subtext="Писать 'Forwarded from' перед именем автора", icon="msg_forward"),
+            Switch(key="replace_me_with_i", text="Заменять свое имя на 'Я'", default=False, subtext="Использовать 'Я' вместо имени профиля", icon="msg_edit"),
             Divider()
         ]
 
@@ -114,7 +105,44 @@ class FormattedTxtExportPlugin(BasePlugin):
             if last_fragment and java_plugin:
                 last_fragment.presentFragment(PluginSettingsActivity(java_plugin))
         except Exception as e:
-            log(f"Settings error: {e}")
+            self._add_log(f"Ошибка открытия настроек: {e}")
+
+    def _show_logs_dialog(self, context=None):
+        fragment = get_last_fragment()
+        if not fragment: return
+        act = fragment.getParentActivity()
+        if not act: return
+
+        scroll = ScrollView(act)
+        tv = TextView(act)
+        
+        logs_text = "\n".join(self.export_logs) if self.export_logs else "Логи пусты. Запустите экспорт."
+        tv.setText(logs_text)
+        tv.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 12)
+        
+        # Подстраиваем цвет текста под тему (если темная/светлая)
+        try:
+            from org.telegram.ui.ActionBar import Theme
+            tv.setTextColor(Theme.getColor(Theme.key_dialogTextBlack))
+        except:
+            tv.setTextColor(Color.BLACK)
+
+        tv.setPadding(40, 40, 40, 40)
+        scroll.addView(tv)
+
+        builder = AlertDialogBuilder(act, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+        builder.set_title("📋 Логи экспорта")
+        builder.set_view(scroll)
+        
+        def copy_logs(b, w):
+            if self.export_logs:
+                AndroidUtilities.addToClipboard("\n".join(self.export_logs))
+                BulletinHelper.show_success("Логи скопированы!")
+            b.dismiss()
+
+        builder.set_neutral_button("Скопировать", copy_logs)
+        builder.set_positive_button("Закрыть", lambda b, w: b.dismiss())
+        builder.show()
 
     def _handle_export_click(self, context):
         dialog_id = self._resolve_dialog_id(context)
@@ -159,7 +187,11 @@ class FormattedTxtExportPlugin(BasePlugin):
             user_input = str(input_field.getText())
             builder.dismiss()
             start_ts, end_ts = self._parse_time_input(user_input)
+            
+            self.export_logs.clear() # Очищаем старые логи перед новым запуском
+            self._add_log(f"Запуск экспорта для ID: {dialog_id}")
             BulletinHelper.show_info("Экспорт начат (в фоне)...")
+            
             threading.Thread(target=self._run_export, args=(dialog_id, account_id, start_ts, end_ts), daemon=True).start()
 
         builder = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
@@ -194,7 +226,6 @@ class FormattedTxtExportPlugin(BasePlugin):
     def _resolve_author(self, account_id, msg):
         try:
             my_id = UserConfig.getInstance(account_id).getClientUserId()
-            
             from_id_obj = None
             fwd_name = ""
             
@@ -208,8 +239,7 @@ class FormattedTxtExportPlugin(BasePlugin):
             if from_id_obj:
                 uid = getattr(from_id_obj, "user_id", 0)
                 if uid != 0:
-                    if uid == my_id and self.get_setting("replace_me_with_i", False):
-                        return "Я"
+                    if uid == my_id and self.get_setting("replace_me_with_i", False): return "Я"
                     from org.telegram.messenger import MessagesController
                     user = MessagesController.getInstance(account_id).getUser(uid)
                     if user: return f"{user.first_name or ''} {user.last_name or ''}".strip()
@@ -222,7 +252,7 @@ class FormattedTxtExportPlugin(BasePlugin):
                     if chat: return str(chat.title)
                     return f"Channel_{cid}"
         except Exception as e:
-            log(f"resolve_author error: {e}")
+            self._add_log(f"Ошибка определения автора: {e}")
         return "Unknown"
 
     def _get_reply_info(self, db, dialog_id, account_id, reply_id):
@@ -241,7 +271,7 @@ class FormattedTxtExportPlugin(BasePlugin):
                         return author, text
             cur.dispose()
         except Exception as e:
-            log(f"reply_info error: {e}")
+            self._add_log(f"Ошибка чтения реплая: {e}")
         return "Unknown", "[Message]"
 
     def _get_media_label(self, msg):
@@ -275,8 +305,7 @@ class FormattedTxtExportPlugin(BasePlugin):
                     for i in range(doc.attributes.size()):
                         attr = doc.attributes.get(i)
                         a_type = attr.getClass().getSimpleName()
-                        if "Filename" in a_type: 
-                            fname = str(getattr(attr, "file_name", ""))
+                        if "Filename" in a_type: fname = str(getattr(attr, "file_name", ""))
                         elif "Audio" in a_type:
                             if getattr(attr, "voice", False): is_voice = True
                             else:
@@ -298,9 +327,8 @@ class FormattedTxtExportPlugin(BasePlugin):
                         return f"[🎵 Music: {fname}]" if fname else "[🎵 Music]"
                     if is_sticker: return f"[{emoji} Sticker]" if emoji else "[👾 Sticker]"
                     if fname: return f"[📎 File: {fname}]"
-        except Exception as e:
-            log(f"media_label error: {e}")
-            
+        except Exception:
+            pass
         return f"[📎 Media: {m_type}]"
 
     def _extract_raw_text(self, msg):
@@ -313,12 +341,12 @@ class FormattedTxtExportPlugin(BasePlugin):
     # --- EXPORT TO SAVED MESSAGES ---
     def _send_to_saved_messages(self, file_path, account_id):
         try:
+            self._add_log("Попытка отправки в Избранное...")
             from org.telegram.messenger import SendMessagesHelper
             my_id = UserConfig.getInstance(account_id).getClientUserId()
             helper = SendMessagesHelper.getInstance(account_id)
             
             sent = False
-            # Перебираем методы, чтобы подстроиться под разные версии Telegram (11.x, 12.x и т.д.)
             for m in helper.getClass().getMethods():
                 if m.getName() == "prepareSendingDocument":
                     types = m.getParameterTypes()
@@ -326,32 +354,28 @@ class FormattedTxtExportPlugin(BasePlugin):
                         args = []
                         for i, t in enumerate(types):
                             t_name = t.getName()
-                            if i == 0 or i == 1:
-                                args.append(file_path) # absolutePath, originalPath
-                            elif t_name == "long":
-                                args.append(my_id) # dialog_id (отправляем себе в избранное)
-                            elif t_name == "int":
-                                args.append(0)
-                            elif t_name == "boolean":
-                                args.append(False)
-                            else:
-                                args.append(None)
+                            if i == 0 or i == 1: args.append(file_path)
+                            elif t_name == "long": args.append(my_id)
+                            elif t_name == "int": args.append(0)
+                            elif t_name == "boolean": args.append(False)
+                            else: args.append(None)
                         m.invoke(helper, args)
                         sent = True
                         break
                         
             if sent:
+                self._add_log("Успешно отправлено в Избранное.")
                 run_on_ui_thread(lambda: BulletinHelper.show_success("TXT отправлен в Избранное!"))
             else:
-                run_on_ui_thread(lambda: BulletinHelper.show_error("Не удалось отправить. Открываю меню..."))
+                self._add_log("Метод отправки не сработал. Вызываю системное меню Share...")
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Открываю системное меню..."))
                 run_on_ui_thread(lambda: self._share_file_fallback(file_path))
                 
         except Exception as e:
-            log(f"Auto-send error: {e}")
+            self._add_log(f"Ошибка авто-отправки: {e}")
             run_on_ui_thread(lambda: self._share_file_fallback(file_path))
 
     def _share_file_fallback(self, file_path):
-        # На всякий случай (если отправка в Избранное даст сбой)
         try:
             fragment = get_last_fragment()
             if not fragment: return
@@ -370,14 +394,17 @@ class FormattedTxtExportPlugin(BasePlugin):
             chooser = Intent.createChooser(intent, "Сохранить экспорт")
             context.startActivity(chooser)
         except Exception as e:
+            self._add_log(f"Ошибка fallback-шаринга: {e}")
             BulletinHelper.show_error(f"Ошибка шаринга: {e}")
 
     # --- CORE EXPORT LOOP ---
     def _run_export(self, dialog_id, account_id, start_ts, end_ts):
         try:
+            self._add_log("Получение доступа к SQLite...")
             storage = MessagesStorage.getInstance(account_id)
             db = storage.getDatabase()
             if not db:
+                self._add_log("БД недоступна!")
                 run_on_ui_thread(lambda: BulletinHelper.show_error("БД недоступна"))
                 return
 
@@ -386,6 +413,7 @@ class FormattedTxtExportPlugin(BasePlugin):
             if end_ts: query += f" AND date <= {end_ts}"
             query += " ORDER BY date ASC"
 
+            self._add_log("Выполнение SQL-запроса...")
             cursor = db.queryFinalized(query)
             
             export_dir = File(ApplicationLoader.applicationContext.getFilesDir(), "FastExports")
@@ -401,6 +429,7 @@ class FormattedTxtExportPlugin(BasePlugin):
             cur_author = None
             msg_count = 0
 
+            self._add_log("Чтение данных и запись в файл...")
             with open(file_path, "w", encoding="utf-8") as f:
                 while cursor.next():
                     buffer = cursor.byteBufferValue(0)
@@ -448,20 +477,26 @@ class FormattedTxtExportPlugin(BasePlugin):
                             line += text
                             f.write(line + "\n")
                             msg_count += 1
+
+                            # Уведомляем пользователя каждые 5000 сообщений
+                            if msg_count > 0 and msg_count % 5000 == 0:
+                                self._add_log(f"Прочитано {msg_count} сообщений...")
+                                run_on_ui_thread(lambda c=msg_count: BulletinHelper.show_info(f"⏳ Обработано: {c}..."))
                             
                     except Exception as e:
-                        log(f"Export Parse Error: {e}")
+                        self._add_log(f"Ошибка парсинга сообщения: {e}")
 
             cursor.dispose()
+            self._add_log(f"Чтение завершено. Итого сообщений: {msg_count}")
             
             if msg_count > 0:
-                # Отправляем в сохраненки
                 self._send_to_saved_messages(file_path, account_id)
             else:
+                self._add_log("Нет сообщений за выбранный период.")
                 run_on_ui_thread(lambda: BulletinHelper.show_error("Сообщений не найдено"))
 
         except Exception as e:
-            log(f"Export DB Error: {e}")
-            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка: {e}"))
+            self._add_log(f"Критическая ошибка БД: {e}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка БД: {e}"))
 
 plugin = FormattedTxtExportPlugin()

@@ -1,0 +1,432 @@
+"""
+Плагин для быстрого экспорта чата в TXT с сохранением форматирования, 
+метаданных (медиа, опросы, контакты) и реплаев.
+Читает напрямую из локальной БД для максимальной скорости.
+"""
+
+import os
+import time
+from datetime import datetime, timedelta
+import threading
+
+from java.io import File
+from android.content import Intent
+from androidx.core.content import FileProvider
+
+from org.telegram.messenger import ApplicationLoader, MessagesStorage, UserConfig
+from org.telegram.tgnet import TLRPC
+from android_utils import run_on_ui_thread, log
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from client_utils import get_last_fragment
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Switch, Divider
+from android.text import InputType
+from org.telegram.ui.Components import EditTextBoldCursor
+from android.widget import LinearLayout, TextView
+from android.util import TypedValue
+from android.graphics import Color
+
+# --- метаданные ---
+__id__ = "formatted_txt_export"
+__name__ = "formatted .txt export"
+__description__ = "хз"
+__author__ = "@insonniiia"
+__version__ = "1.0.0"
+__icon__ = "hsrgustinex/49"
+__min_version__ = "11.12.0"
+
+
+class FormattedTxtExportPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self.menu_item_id = self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                item_id="fmt_txt_export_btn",
+                text="Форматированный TXT Экспорт",
+                icon="msg_download",
+                on_click=self._handle_export_click,
+            )
+        )
+        self.settings_item_id = self.add_menu_item(
+            MenuItemData(
+                menu_type=MenuItemType.CHAT_ACTION_MENU,
+                item_id="fmt_txt_settings_btn",
+                text="Настройки Экспорта",
+                icon="msg_settings",
+                on_click=self._open_settings,
+            )
+        )
+
+    def on_plugin_unload(self):
+        if hasattr(self, 'menu_item_id') and self.menu_item_id:
+            self.remove_menu_item(self.menu_item_id)
+        if hasattr(self, 'settings_item_id') and self.settings_item_id:
+            self.remove_menu_item(self.settings_item_id)
+
+    def create_settings(self):
+        return [
+            Header(text="Стиль экспорта"),
+            Switch(
+                key="format_replies",
+                text="Форматировать реплаи",
+                default=True,
+                subtext="Добавлять '> Имя: текст...' для ответов",
+                icon="msg_reply"
+            ),
+            Switch(
+                key="timestamps",
+                text="Таймштампы [hh:mm]",
+                default=True,
+                subtext="Добавлять время перед каждым сообщением",
+                icon="msg_calendar"
+            ),
+            Switch(
+                key="dates",
+                text="Разделители дат",
+                default=True,
+                subtext="Вставлять --- dd.mm.yyyy --- при смене дня",
+                icon="msg_calendar2"
+            ),
+            Switch(
+                key="with_label",
+                text="Префикс 'Forwarded from'",
+                default=False,
+                subtext="Писать 'Forwarded from' перед именем автора пересланного сообщения",
+                icon="msg_forward"
+            ),
+            Switch(
+                key="replace_me_with_i",
+                text="Заменять свое имя на 'Я'",
+                default=False,
+                subtext="Использовать 'Я' вместо имени профиля для своих сообщений",
+                icon="msg_edit"
+            ),
+            Divider()
+        ]
+
+    def _open_settings(self, context=None):
+        try:
+            from com.exteragram.messenger.plugins import PluginsController
+            from com.exteragram.messenger.plugins.ui import PluginSettingsActivity
+            java_plugin = PluginsController.getInstance().plugins.get(self.id)
+            last_fragment = get_last_fragment()
+            if last_fragment and java_plugin:
+                last_fragment.presentFragment(PluginSettingsActivity(java_plugin))
+        except Exception as e:
+            log(f"Settings error: {e}")
+
+    def _handle_export_click(self, context):
+        dialog_id = self._resolve_dialog_id(context)
+        if not dialog_id:
+            BulletinHelper.show_error("Не удалось определить ID чата")
+            return
+            
+        account_id = getattr(UserConfig, "selectedAccount", 0)
+        run_on_ui_thread(lambda: self._show_date_input_dialog(dialog_id, account_id))
+
+    def _resolve_dialog_id(self, context):
+        dialog_id = context.get("dialog_id")
+        if dialog_id: return int(dialog_id)
+        chat = context.get("chat")
+        if chat and getattr(chat, "id", None): return -int(chat.id)
+        user = context.get("user")
+        if user and getattr(user, "id", None): return int(user.id)
+        return None
+
+    def _show_date_input_dialog(self, dialog_id, account_id):
+        fragment = get_last_fragment()
+        if not fragment: return
+        context = fragment.getParentActivity()
+        if not context: return
+
+        container = LinearLayout(context)
+        container.setOrientation(LinearLayout.VERTICAL)
+        container.setPadding(50, 20, 50, 20)
+
+        hint = TextView(context)
+        hint.setText("Форматы: '7' (дни), '1m' (месяцы), '01.05.2025' (с даты), '01.05.25-10.05.25' (период). Пусто = весь чат.")
+        hint.setTextSize(TypedValue.COMPLEX_UNIT_DIP, 13)
+        hint.setTextColor(Color.GRAY)
+        container.addView(hint)
+
+        input_field = EditTextBoldCursor(context)
+        input_field.setSingleLine(True)
+        input_field.setHint("Введите период...")
+        container.addView(input_field)
+
+        def on_ok(builder, which):
+            user_input = str(input_field.getText())
+            builder.dismiss()
+            start_ts, end_ts = self._parse_time_input(user_input)
+            BulletinHelper.show_info("Экспорт начат (в фоне)...")
+            threading.Thread(target=self._run_export, args=(dialog_id, account_id, start_ts, end_ts), daemon=True).start()
+
+        builder = AlertDialogBuilder(context, AlertDialogBuilder.ALERT_TYPE_MESSAGE)
+        builder.set_title("Экспорт: Выбор времени")
+        builder.set_view(container)
+        builder.set_positive_button("Старт", on_ok)
+        builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        builder.show()
+
+    def _parse_time_input(self, user_input):
+        ui = user_input.strip()
+        if not ui: return None, None 
+        now = int(time.time())
+        if ui.isdigit(): return now - (int(ui) * 86400), now
+        if len(ui) > 1 and ui[:-1].isdigit() and ui[-1] in 'dDwWmMyY':
+            val, unit = int(ui[:-1]), ui[-1].lower()
+            delta = val * {'d': 86400, 'w': 7*86400, 'm': 30*86400, 'y': 365*86400}.get(unit, 0)
+            return now - delta, now
+        if '-' in ui:
+            parts = ui.split('-')
+            if len(parts) == 2:
+                try:
+                    start = int(datetime.strptime(parts[0].strip(), "%d.%m.%Y").timestamp())
+                    end_dt = datetime.strptime(parts[1].strip(), "%d.%m.%Y") + timedelta(days=1)
+                    return start, int(end_dt.timestamp())
+                except Exception: pass
+        try: return int(datetime.strptime(ui, "%d.%m.%Y").timestamp()), now
+        except Exception: pass
+        return None, None
+
+    # --- RAW EXTRACTORS (No UI dependencies) ---
+    def _resolve_author(self, account_id, msg):
+        try:
+            my_id = UserConfig.getInstance(account_id).getClientUserId()
+            
+            from_id_obj = None
+            fwd_name = ""
+            
+            if hasattr(msg, "fwd_from") and msg.fwd_from:
+                from_id_obj = getattr(msg.fwd_from, "from_id", None)
+                fwd_name = str(getattr(msg.fwd_from, "from_name", "") or "")
+                if fwd_name: return fwd_name
+            elif hasattr(msg, "from_id"):
+                from_id_obj = msg.from_id
+                
+            if from_id_obj:
+                uid = getattr(from_id_obj, "user_id", 0)
+                if uid != 0:
+                    if uid == my_id and self.get_setting("replace_me_with_i", False):
+                        return "Я"
+                    # Читаем из кэша (быстро)
+                    from org.telegram.messenger import MessagesController
+                    user = MessagesController.getInstance(account_id).getUser(uid)
+                    if user: return f"{user.first_name or ''} {user.last_name or ''}".strip()
+                    return f"User_{uid}"
+                    
+                cid = getattr(from_id_obj, "channel_id", 0)
+                if cid != 0:
+                    from org.telegram.messenger import MessagesController
+                    chat = MessagesController.getInstance(account_id).getChat(cid)
+                    if chat: return str(chat.title)
+                    return f"Channel_{cid}"
+        except Exception as e:
+            log(f"resolve_author error: {e}")
+        return "Unknown"
+
+    def _get_reply_info(self, db, dialog_id, account_id, reply_id):
+        try:
+            cur = db.queryFinalized(f"SELECT data FROM messages WHERE uid = {dialog_id} AND mid = {reply_id}")
+            if cur.next():
+                buffer = cur.byteBufferValue(0)
+                if buffer:
+                    constructor = buffer.readInt32(False)
+                    rep_msg = TLRPC.Message.TLdeserialize(buffer, constructor, False)
+                    buffer.reuse()
+                    cur.dispose()
+                    if rep_msg:
+                        author = self._resolve_author(account_id, rep_msg)
+                        text = self._extract_raw_text(rep_msg)
+                        return author, text
+            cur.dispose()
+        except Exception as e:
+            log(f"reply_info error: {e}")
+        return "Unknown", "[Message]"
+
+    def _get_media_label(self, msg):
+        if not hasattr(msg, "media") or not msg.media:
+            return "[Message]"
+            
+        media = msg.media
+        m_type = media.getClass().getSimpleName()
+        
+        try:
+            if "MessageMediaPoll" in m_type:
+                poll = getattr(media, "poll", None)
+                if poll:
+                    q = str(getattr(poll, "question", "Poll"))
+                    return f"[📊 Poll: {q}]"
+            elif "MessageMediaContact" in m_type:
+                first = str(getattr(media, "first_name", "") or "")
+                last = str(getattr(media, "last_name", "") or "")
+                return f"[👤 Contact: {first} {last}]".strip()
+            elif "MessageMediaGeo" in m_type or "MessageMediaVenue" in m_type:
+                title = str(getattr(media, "title", "") or "")
+                return f"[📍 Venue: {title}]" if title else "[📍 Location]"
+            elif "MessageMediaPhoto" in m_type:
+                return "[🖼 Photo]"
+            elif "MessageMediaDocument" in m_type:
+                doc = getattr(media, "document", None)
+                if doc and hasattr(doc, "attributes"):
+                    is_voice = is_video = is_round = is_sticker = is_music = False
+                    fname = emoji = title = performer = ""
+                    
+                    for i in range(doc.attributes.size()):
+                        attr = doc.attributes.get(i)
+                        a_type = attr.getClass().getSimpleName()
+                        if "Filename" in a_type: 
+                            fname = str(getattr(attr, "file_name", ""))
+                        elif "Audio" in a_type:
+                            if getattr(attr, "voice", False): is_voice = True
+                            else:
+                                is_music = True
+                                title = str(getattr(attr, "title", ""))
+                                performer = str(getattr(attr, "performer", ""))
+                        elif "Video" in a_type:
+                            if getattr(attr, "round_message", False): is_round = True
+                            else: is_video = True
+                        elif "Sticker" in a_type:
+                            is_sticker = True
+                            emoji = str(getattr(attr, "alt", ""))
+                    
+                    if is_voice: return "[🎤 Voice Message]"
+                    if is_round: return "[📹 Video Message]"
+                    if is_video: return f"[🎬 Video: {fname}]" if fname else "[🎬 Video]"
+                    if is_music:
+                        if title and performer: return f"[🎵 Music: {performer} - {title}]"
+                        return f"[🎵 Music: {fname}]" if fname else "[🎵 Music]"
+                    if is_sticker: return f"[{emoji} Sticker]" if emoji else "[👾 Sticker]"
+                    if fname: return f"[📎 File: {fname}]"
+        except Exception as e:
+            log(f"media_label error: {e}")
+            
+        return f"[📎 Media: {m_type}]"
+
+    def _extract_raw_text(self, msg):
+        try:
+            text = str(getattr(msg, "message", "") or "")
+            if text: return text.replace('\n', ' ')
+        except Exception: pass
+        return self._get_media_label(msg)
+
+    # --- CORE EXPORT LOOP ---
+    def _run_export(self, dialog_id, account_id, start_ts, end_ts):
+        try:
+            storage = MessagesStorage.getInstance(account_id)
+            db = storage.getDatabase()
+            if not db:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("БД недоступна"))
+                return
+
+            query = f"SELECT data, date FROM messages WHERE uid = {dialog_id}"
+            if start_ts: query += f" AND date >= {start_ts}"
+            if end_ts: query += f" AND date <= {end_ts}"
+            query += " ORDER BY date ASC"
+
+            cursor = db.queryFinalized(query)
+            
+            export_dir = File(ApplicationLoader.applicationContext.getFilesDir(), "FastExports")
+            if not export_dir.exists(): export_dir.mkdirs()
+            file_path = os.path.join(export_dir.getAbsolutePath(), f"formatted_export_{dialog_id}_{int(time.time())}.txt")
+
+            # Загружаем настройки
+            ts_on = self.get_setting("timestamps", True)
+            dates_on = self.get_setting("dates", True)
+            prefix_on = self.get_setting("with_label", False)
+            replies_on = self.get_setting("format_replies", True)
+
+            cur_date = None
+            cur_author = None
+            msg_count = 0
+
+            with open(file_path, "w", encoding="utf-8") as f:
+                while cursor.next():
+                    buffer = cursor.byteBufferValue(0)
+                    date_val = cursor.intValue(1)
+                    if not buffer: continue
+
+                    try:
+                        constructor = buffer.readInt32(False)
+                        msg = TLRPC.Message.TLdeserialize(buffer, constructor, False)
+                        buffer.reuse()
+
+                        if msg:
+                            # 1. Даты
+                            dt = datetime.fromtimestamp(date_val)
+                            d_str = dt.strftime("%d.%m.%Y")
+                            t_str = dt.strftime("%H:%M")
+
+                            if dates_on and d_str != cur_date:
+                                f.write(f"\n--- {d_str} ---\n\n")
+                                cur_date = d_str
+                                cur_author = None
+
+                            author = self._resolve_author(account_id, msg)
+
+                            # 2. Имена авторов
+                            if author != cur_author:
+                                prefix = "Forwarded from " if prefix_on and getattr(msg, "fwd_from", None) else ""
+                                if msg_count > 0: f.write("\n")
+                                f.write(f"{prefix}{author}:\n")
+                                cur_author = author
+
+                            # 3. Реплаи (быстрый запрос в ту же БД)
+                            if replies_on and hasattr(msg, "reply_to") and msg.reply_to:
+                                rep_id = getattr(msg.reply_to, "reply_to_msg_id", 0)
+                                if rep_id != 0:
+                                    rep_author, rep_text = self._get_reply_info(db, dialog_id, account_id, rep_id)
+                                    words = rep_text.split()
+                                    short_quote = " ".join(words[:5]) + ("..." if len(words) > 5 else "")
+                                    f.write(f"> {rep_author}: {short_quote}\n")
+
+                            # 4. Само сообщение (текст или медиа)
+                            line = ""
+                            if ts_on: line += f"[{t_str}] "
+                            
+                            text = str(getattr(msg, "message", "") or "")
+                            if not text: text = self._get_media_label(msg)
+                            else: text = text.replace('\n', ' ')
+                            
+                            line += text
+                            f.write(line + "\n")
+                            msg_count += 1
+                            
+                    except Exception as e:
+                        log(f"Export Parse Error: {e}")
+
+            cursor.dispose()
+            
+            if msg_count > 0:
+                run_on_ui_thread(lambda: self._share_file(file_path))
+            else:
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Сообщений не найдено"))
+
+        except Exception as e:
+            log(f"Export DB Error: {e}")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка: {e}"))
+
+    def _share_file(self, file_path):
+        try:
+            fragment = get_last_fragment()
+            if not fragment: return
+            context = fragment.getParentActivity()
+            if not context: return
+
+            file_obj = File(file_path)
+            authority = ApplicationLoader.getApplicationId() + ".provider"
+            uri = FileProvider.getUriForFile(context, authority, file_obj)
+
+            intent = Intent(Intent.ACTION_SEND)
+            intent.setType("text/plain")
+            intent.putExtra(Intent.EXTRA_STREAM, uri)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+
+            chooser = Intent.createChooser(intent, "Сохранить форматированный экспорт")
+            context.startActivity(chooser)
+            BulletinHelper.show_success("Экспорт готов!")
+        except Exception as e:
+            BulletinHelper.show_error(f"Ошибка шаринга: {e}")
+
+plugin = FormattedTxtExportPlugin()

@@ -35,7 +35,7 @@ __id__ = "formatted_txt_export"
 __name__ = "Formatted TXT Export"
 __description__ = "Быстрый экспорт в TXT с системными сообщениями, блоками <переслано> и логами."
 __author__ = "Personal Use"
-__version__ = "1.8.1"
+__version__ = "1.9.1"
 __icon__ = "hsrgustinex/49"
 __min_version__ = "11.12.0"
 
@@ -324,6 +324,10 @@ class FormattedTxtExportPlugin(BasePlugin):
         m_type = str(media.getClass().getSimpleName()).lower()
         
         try:
+            # Игнорируем пустые медиа и превью ссылок
+            if "empty" in m_type or "webpage" in m_type:
+                return "[Message]"
+
             if "poll" in m_type:
                 poll = getattr(media, "poll", None)
                 if poll:
@@ -394,7 +398,6 @@ class FormattedTxtExportPlugin(BasePlugin):
 
     def _extract_raw_text(self, msg):
         try:
-            # 1. Проверяем системные (service) сообщения
             m_class = str(msg.getClass().getSimpleName()).lower()
             if "service" in m_class:
                 action = getattr(msg, "action", None)
@@ -420,7 +423,6 @@ class FormattedTxtExportPlugin(BasePlugin):
                     return f"⚙️ [Системное: {a_type.replace('tl_messageaction', '')}]"
                 return "⚙️ [Системное сообщение]"
 
-            # 2. Обычные сообщения (текст + медиа)
             text = str(getattr(msg, "message", "") or "")
             if text: text = text.replace('\n', ' ')
             

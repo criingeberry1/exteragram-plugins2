@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import threading
 
 from java.io import File
+from java.lang import Integer, Long, Boolean
 from android.os import Environment
 from android.content import Intent
 from androidx.core.content import FileProvider
@@ -32,9 +33,9 @@ from android.graphics import Color
 # --- метаданные ---
 __id__ = "formatted_txt_export"
 __name__ = "Formatted TXT Export"
-__description__ = "Быстрый экспорт в TXT с логами и автоотправкой в Избранное (поддержка v2 баз)."
+__description__ = "Быстрый экспорт в TXT с логами и автоотправкой в Избранное."
 __author__ = "Personal Use"
-__version__ = "1.4.1"
+__version__ = "1.5.1"
 __icon__ = "hsrgustinex/49"
 __min_version__ = "11.12.0"
 
@@ -230,10 +231,8 @@ class FormattedTxtExportPlugin(BasePlugin):
             cur = db.queryFinalized("SELECT 1 FROM messages_v2 LIMIT 1")
             cur.dispose()
             self._messages_table = "messages_v2"
-            self._add_log("База данных: используется таблица messages_v2")
         except Exception:
             self._messages_table = "messages"
-            self._add_log("База данных: используется таблица messages")
         return self._messages_table
 
     # --- RAW EXTRACTORS ---
@@ -294,24 +293,24 @@ class FormattedTxtExportPlugin(BasePlugin):
             return "[Message]"
             
         media = msg.media
-        m_type = media.getClass().getSimpleName()
+        m_type = str(media.getClass().getSimpleName()).lower()
         
         try:
-            if "MessageMediaPoll" in m_type:
+            if "poll" in m_type:
                 poll = getattr(media, "poll", None)
                 if poll:
-                    q = str(getattr(poll, "question", "Poll"))
+                    q = str(getattr(poll, "question", "") or "Poll")
                     return f"[📊 Poll: {q}]"
-            elif "MessageMediaContact" in m_type:
+            elif "contact" in m_type:
                 first = str(getattr(media, "first_name", "") or "")
                 last = str(getattr(media, "last_name", "") or "")
                 return f"[👤 Contact: {first} {last}]".strip()
-            elif "MessageMediaGeo" in m_type or "MessageMediaVenue" in m_type:
+            elif "geo" in m_type or "venue" in m_type:
                 title = str(getattr(media, "title", "") or "")
                 return f"[📍 Venue: {title}]" if title else "[📍 Location]"
-            elif "MessageMediaPhoto" in m_type:
+            elif "photo" in m_type:
                 return "[🖼 Photo]"
-            elif "MessageMediaDocument" in m_type:
+            elif "document" in m_type:
                 doc = getattr(media, "document", None)
                 if doc and hasattr(doc, "attributes"):
                     is_voice = is_video = is_round = is_sticker = is_music = False
@@ -319,20 +318,21 @@ class FormattedTxtExportPlugin(BasePlugin):
                     
                     for i in range(doc.attributes.size()):
                         attr = doc.attributes.get(i)
-                        a_type = attr.getClass().getSimpleName()
-                        if "Filename" in a_type: fname = str(getattr(attr, "file_name", ""))
-                        elif "Audio" in a_type:
+                        a_type = str(attr.getClass().getSimpleName()).lower()
+                        if "filename" in a_type: 
+                            fname = str(getattr(attr, "file_name", "") or "")
+                        elif "audio" in a_type:
                             if getattr(attr, "voice", False): is_voice = True
                             else:
                                 is_music = True
-                                title = str(getattr(attr, "title", ""))
-                                performer = str(getattr(attr, "performer", ""))
-                        elif "Video" in a_type:
+                                title = str(getattr(attr, "title", "") or "")
+                                performer = str(getattr(attr, "performer", "") or "")
+                        elif "video" in a_type:
                             if getattr(attr, "round_message", False): is_round = True
                             else: is_video = True
-                        elif "Sticker" in a_type:
+                        elif "sticker" in a_type:
                             is_sticker = True
-                            emoji = str(getattr(attr, "alt", ""))
+                            emoji = str(getattr(attr, "alt", "") or "")
                     
                     if is_voice: return "[🎤 Voice Message]"
                     if is_round: return "[📹 Video Message]"
@@ -342,9 +342,10 @@ class FormattedTxtExportPlugin(BasePlugin):
                         return f"[🎵 Music: {fname}]" if fname else "[🎵 Music]"
                     if is_sticker: return f"[{emoji} Sticker]" if emoji else "[👾 Sticker]"
                     if fname: return f"[📎 File: {fname}]"
-        except Exception:
-            pass
-        return f"[📎 Media: {m_type}]"
+        except Exception as e:
+            self._add_log(f"Ошибка медиа: {e}")
+            
+        return f"[📎 Media: {media.getClass().getSimpleName()}]"
 
     def _extract_raw_text(self, msg):
         try:
@@ -365,32 +366,45 @@ class FormattedTxtExportPlugin(BasePlugin):
             for m in helper.getClass().getMethods():
                 if m.getName() == "prepareSendingDocument":
                     types = m.getParameterTypes()
-                    args = []
-                    str_idx = 0
-                    for t in types:
-                        t_name = t.getName()
-                        if t_name == "java.lang.String":
-                            if str_idx < 2: args.append(file_path)
-                            elif str_idx == 2: args.append("text/plain")
-                            else: args.append(None)
-                            str_idx += 1
-                        elif t_name == "long": args.append(my_id)
-                        elif t_name == "int": args.append(0)
-                        elif t_name == "boolean": args.append(False)
-                        else: args.append(None)
-                    
-                    try:
-                        m.invoke(helper, args)
-                        sent = True
-                        self._add_log(f"Успешный вызов функции отправки!")
-                        break
-                    except Exception as invoke_err:
-                        self._add_log(f"Сбой метода: {invoke_err}")
+                    # Ищем перегрузку метода, где первые параметры — строки (пути)
+                    if len(types) >= 2 and types[0].getName() == "java.lang.String":
+                        args = []
+                        str_idx = 0
+                        long_idx = 0
+                        for t in types:
+                            t_name = t.getName()
+                            if t_name == "java.lang.String":
+                                if str_idx == 0: args.append(file_path)
+                                elif str_idx == 1: args.append(file_path)
+                                elif str_idx == 2: args.append("text/plain")
+                                else: args.append(None)
+                                str_idx += 1
+                            elif t_name == "long":
+                                # Строго оборачиваем в java.lang.Long
+                                if long_idx == 0: args.append(Long(my_id)) # dialog_id (отправляем себе)
+                                else: args.append(Long(0))
+                                long_idx += 1
+                            elif t_name == "int":
+                                # Строго оборачиваем в java.lang.Integer
+                                args.append(Integer(0))
+                            elif t_name == "boolean":
+                                # Строго оборачиваем в java.lang.Boolean
+                                args.append(Boolean(False))
+                            else:
+                                args.append(None)
                         
+                        try:
+                            m.invoke(helper, args)
+                            sent = True
+                            self._add_log(f"Успешный вызов функции отправки!")
+                            break
+                        except Exception as invoke_err:
+                            self._add_log(f"Сбой метода: {invoke_err}")
+                            
             if sent:
                 run_on_ui_thread(lambda: BulletinHelper.show_success("TXT отправлен в Избранное!"))
             else:
-                self._add_log("Метод отправки не подошел. Вызываю системное меню Share...")
+                self._add_log("Ни один метод отправки не подошел. Вызываю системное меню Share...")
                 run_on_ui_thread(lambda: BulletinHelper.show_error("Открываю системное меню..."))
                 run_on_ui_thread(lambda: self._share_file_fallback(file_path))
                 
@@ -440,7 +454,7 @@ class FormattedTxtExportPlugin(BasePlugin):
             self._add_log("Выполнение SQL-запроса...")
             cursor = db.queryFinalized(query)
             
-            # --- ИСПРАВЛЕНИЕ ТУТ: Сохраняем в публичную папку Загрузок ---
+            # Сохраняем в публичную папку Загрузок (чтобы меню Share не падало, если Избранное сломается)
             download_dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             export_dir = File(download_dir, "FastExports")
             if not export_dir.exists(): export_dir.mkdirs()

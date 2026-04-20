@@ -33,9 +33,9 @@ from android.graphics import Color
 # --- метаданные ---
 __id__ = "formatted_txt_export"
 __name__ = "Formatted TXT Export"
-__description__ = "Быстрый экспорт в TXT с логами и автоотправкой в Избранное."
+__description__ = "Экспорт в TXT с улучшенным парсером медиа (стикеры, гиф, подписи, опросы)."
 __author__ = "Personal Use"
-__version__ = "1.5.1"
+__version__ = "1.6.1"
 __icon__ = "hsrgustinex/49"
 __min_version__ = "11.12.0"
 
@@ -299,21 +299,35 @@ class FormattedTxtExportPlugin(BasePlugin):
             if "poll" in m_type:
                 poll = getattr(media, "poll", None)
                 if poll:
-                    q = str(getattr(poll, "question", "") or "Poll")
+                    q_obj = getattr(poll, "question", None)
+                    q = str(getattr(q_obj, "text", q_obj) or "")
+                    if not q: q = "Poll"
                     return f"[📊 Poll: {q}]"
             elif "contact" in m_type:
                 first = str(getattr(media, "first_name", "") or "")
                 last = str(getattr(media, "last_name", "") or "")
-                return f"[👤 Contact: {first} {last}]".strip()
+                phone = str(getattr(media, "phone_number", "") or "")
+                name = f"{first} {last}".strip()
+                if name and phone: return f"[👤 Contact: {name}, {phone}]"
+                elif name: return f"[👤 Contact: {name}]"
+                elif phone: return f"[👤 Contact: {phone}]"
+                return "[👤 Contact]"
             elif "geo" in m_type or "venue" in m_type:
                 title = str(getattr(media, "title", "") or "")
                 return f"[📍 Venue: {title}]" if title else "[📍 Location]"
+            elif "todo" in m_type:
+                todo = getattr(media, "todo", None)
+                if todo:
+                    t_obj = getattr(todo, "title", None)
+                    t = str(getattr(t_obj, "text", t_obj) or "")
+                    if t: return f"[📋 Task List: {t}]"
+                return "[📋 Task List]"
             elif "photo" in m_type:
                 return "[🖼 Photo]"
             elif "document" in m_type:
                 doc = getattr(media, "document", None)
                 if doc and hasattr(doc, "attributes"):
-                    is_voice = is_video = is_round = is_sticker = is_music = False
+                    is_voice = is_video = is_round = is_sticker = is_music = is_gif = False
                     fname = emoji = title = performer = ""
                     
                     for i in range(doc.attributes.size()):
@@ -333,14 +347,17 @@ class FormattedTxtExportPlugin(BasePlugin):
                         elif "sticker" in a_type:
                             is_sticker = True
                             emoji = str(getattr(attr, "alt", "") or "")
+                        elif "animated" in a_type:
+                            is_gif = True
                     
                     if is_voice: return "[🎤 Voice Message]"
                     if is_round: return "[📹 Video Message]"
+                    if is_sticker: return f"[{emoji} Sticker]" if emoji else "[👾 Sticker]"
+                    if is_gif: return f"[🎞 GIF: {fname}]" if fname else "[🎞 GIF]"
                     if is_video: return f"[🎬 Video: {fname}]" if fname else "[🎬 Video]"
                     if is_music:
                         if title and performer: return f"[🎵 Music: {performer} - {title}]"
                         return f"[🎵 Music: {fname}]" if fname else "[🎵 Music]"
-                    if is_sticker: return f"[{emoji} Sticker]" if emoji else "[👾 Sticker]"
                     if fname: return f"[📎 File: {fname}]"
         except Exception as e:
             self._add_log(f"Ошибка медиа: {e}")
@@ -350,9 +367,19 @@ class FormattedTxtExportPlugin(BasePlugin):
     def _extract_raw_text(self, msg):
         try:
             text = str(getattr(msg, "message", "") or "")
-            if text: return text.replace('\n', ' ')
+            if text: text = text.replace('\n', ' ')
+            
+            media_label = self._get_media_label(msg)
+            
+            # Если есть и текст(подпись), и медиа (но не просто сообщение)
+            if text and media_label != "[Message]":
+                return f"{media_label} {text}"
+            elif text:
+                return text
+            elif media_label != "[Message]":
+                return media_label
         except Exception: pass
-        return self._get_media_label(msg)
+        return "[Message]"
 
     # --- EXPORT TO SAVED MESSAGES ---
     def _send_to_saved_messages(self, file_path, account_id):
@@ -366,7 +393,6 @@ class FormattedTxtExportPlugin(BasePlugin):
             for m in helper.getClass().getMethods():
                 if m.getName() == "prepareSendingDocument":
                     types = m.getParameterTypes()
-                    # Ищем перегрузку метода, где первые параметры — строки (пути)
                     if len(types) >= 2 and types[0].getName() == "java.lang.String":
                         args = []
                         str_idx = 0
@@ -380,15 +406,12 @@ class FormattedTxtExportPlugin(BasePlugin):
                                 else: args.append(None)
                                 str_idx += 1
                             elif t_name == "long":
-                                # Строго оборачиваем в java.lang.Long
-                                if long_idx == 0: args.append(Long(my_id)) # dialog_id (отправляем себе)
+                                if long_idx == 0: args.append(Long(my_id))
                                 else: args.append(Long(0))
                                 long_idx += 1
                             elif t_name == "int":
-                                # Строго оборачиваем в java.lang.Integer
                                 args.append(Integer(0))
                             elif t_name == "boolean":
-                                # Строго оборачиваем в java.lang.Boolean
                                 args.append(Boolean(False))
                             else:
                                 args.append(None)
@@ -454,7 +477,6 @@ class FormattedTxtExportPlugin(BasePlugin):
             self._add_log("Выполнение SQL-запроса...")
             cursor = db.queryFinalized(query)
             
-            # Сохраняем в публичную папку Загрузок (чтобы меню Share не падало, если Избранное сломается)
             download_dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             export_dir = File(download_dir, "FastExports")
             if not export_dir.exists(): export_dir.mkdirs()
@@ -510,9 +532,7 @@ class FormattedTxtExportPlugin(BasePlugin):
                             line = ""
                             if ts_on: line += f"[{t_str}] "
                             
-                            text = str(getattr(msg, "message", "") or "")
-                            if not text: text = self._get_media_label(msg)
-                            else: text = text.replace('\n', ' ')
+                            text = self._extract_raw_text(msg)
                             
                             line += text
                             f.write(line + "\n")

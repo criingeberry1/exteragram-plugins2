@@ -2,7 +2,7 @@
 Плагин для быстрого экспорта чата в TXT с сохранением форматирования, 
 метаданных (медиа, опросы, контакты) и реплаев.
 Автоматически отправляет результат в Избранное (Saved Messages).
-С блочным форматированием пересланных сообщений (<переслано>).
+Поддерживает блоки <переслано> и перехват системных сообщений (звонки, пины и т.д.).
 """
 
 import os
@@ -33,9 +33,9 @@ from android.graphics import Color
 # --- метаданные ---
 __id__ = "formatted_txt_export"
 __name__ = "Formatted TXT Export"
-__description__ = "Быстрый экспорт в TXT с блоками <переслано> и логами."
+__description__ = "Быстрый экспорт в TXT с системными сообщениями, блоками <переслано> и логами."
 __author__ = "Personal Use"
-__version__ = "1.7.1"
+__version__ = "1.8.1"
 __icon__ = "hsrgustinex/49"
 __min_version__ = "11.12.0"
 
@@ -237,7 +237,6 @@ class FormattedTxtExportPlugin(BasePlugin):
 
     # --- SENDER & AUTHOR EXTRACTORS ---
     def _get_real_sender(self, account_id, msg, dialog_id):
-        """Определяет того, кто физически отправил сообщение в этот чат"""
         try:
             my_id = UserConfig.getInstance(account_id).getClientUserId()
             uid = None
@@ -272,7 +271,6 @@ class FormattedTxtExportPlugin(BasePlugin):
         return "Unknown"
 
     def _get_fwd_author(self, account_id, msg):
-        """Определяет оригинального автора, если сообщение переслано"""
         try:
             if hasattr(msg, "fwd_from") and msg.fwd_from:
                 fwd = msg.fwd_from
@@ -396,6 +394,33 @@ class FormattedTxtExportPlugin(BasePlugin):
 
     def _extract_raw_text(self, msg):
         try:
+            # 1. Проверяем системные (service) сообщения
+            m_class = str(msg.getClass().getSimpleName()).lower()
+            if "service" in m_class:
+                action = getattr(msg, "action", None)
+                if action:
+                    a_type = str(action.getClass().getSimpleName()).lower()
+                    if "pin" in a_type: return "📌 [Закрепил сообщение]"
+                    if "call" in a_type:
+                        reason = getattr(action, "reason", None)
+                        duration = getattr(action, "duration", 0)
+                        dur_str = f" ({duration} сек)" if duration else ""
+                        if reason and "missed" in str(reason.getClass().getSimpleName()).lower():
+                            return "📞 [Пропущенный звонок]"
+                        return f"📞 [Звонок{dur_str}]"
+                    if "add" in a_type or "joined" in a_type: return "➕ [Присоединился к чату]"
+                    if "deleteuser" in a_type or "leave" in a_type: return "➖ [Покинул чат]"
+                    if "title" in a_type: 
+                        title = str(getattr(action, "title", "") or "")
+                        return f"✏️ [Название чата изменено на: {title}]" if title else "✏️ [Название чата изменено]"
+                    if "photo" in a_type: return "🖼 [Фото чата изменено/удалено]"
+                    if "screenshot" in a_type: return "📸 [Сделал скриншот]"
+                    if "contactsignup" in a_type: return "👋 [Теперь в Telegram]"
+                    
+                    return f"⚙️ [Системное: {a_type.replace('tl_messageaction', '')}]"
+                return "⚙️ [Системное сообщение]"
+
+            # 2. Обычные сообщения (текст + медиа)
             text = str(getattr(msg, "message", "") or "")
             if text: text = text.replace('\n', ' ')
             
@@ -542,7 +567,6 @@ class FormattedTxtExportPlugin(BasePlugin):
                             sender = self._get_real_sender(account_id, msg, dialog_id)
                             fwd_author = self._get_fwd_author(account_id, msg)
 
-                            # 1. Смена даты
                             if dates_on and d_str != cur_date:
                                 if in_fwd_block:
                                     f.write("</переслано>\n")
@@ -553,7 +577,6 @@ class FormattedTxtExportPlugin(BasePlugin):
                                 cur_sender = None
                                 cur_fwd_author = None
 
-                            # 2. Смена текущего говорящего
                             if sender != cur_sender:
                                 if in_fwd_block:
                                     f.write("</переслано>\n")
@@ -566,7 +589,6 @@ class FormattedTxtExportPlugin(BasePlugin):
                                 cur_sender = sender
                                 cur_fwd_author = None
 
-                            # 3. Блоки пересылки
                             if fwd_blocks_on and fwd_author:
                                 if not in_fwd_block:
                                     f.write("<переслано>\n")
@@ -574,7 +596,7 @@ class FormattedTxtExportPlugin(BasePlugin):
                                     
                                 if fwd_author != cur_fwd_author:
                                     if cur_fwd_author is not None:
-                                        f.write("\n") # Отступ между разными пересланными авторами
+                                        f.write("\n")
                                     f.write(f"{fwd_author}:\n")
                                     cur_fwd_author = fwd_author
                             else:
@@ -582,9 +604,8 @@ class FormattedTxtExportPlugin(BasePlugin):
                                     f.write("</переслано>\n\n")
                                     in_fwd_block = False
                                     cur_fwd_author = None
-                                    f.write(f"{sender}:\n") # Возвращаем имя говорящего
+                                    f.write(f"{sender}:\n")
 
-                            # 4. Реплаи
                             if replies_on and hasattr(msg, "reply_to") and msg.reply_to:
                                 rep_id = getattr(msg.reply_to, "reply_to_msg_id", 0)
                                 if rep_id != 0:
@@ -593,7 +614,6 @@ class FormattedTxtExportPlugin(BasePlugin):
                                     short_quote = " ".join(words[:5]) + ("..." if len(words) > 5 else "")
                                     f.write(f"> {rep_author}: {short_quote}\n")
 
-                            # 5. Текст
                             line = ""
                             if ts_on: line += f"[{t_str}] "
                             line += self._extract_raw_text(msg)
@@ -608,7 +628,6 @@ class FormattedTxtExportPlugin(BasePlugin):
                     except Exception as e:
                         self._add_log(f"Ошибка парсинга сообщения: {e}")
 
-                # Закрываем блок в самом конце файла, если он остался открыт
                 if in_fwd_block:
                     f.write("</переслано>\n")
 

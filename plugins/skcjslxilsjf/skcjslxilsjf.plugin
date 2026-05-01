@@ -1,27 +1,42 @@
 import traceback
 from typing import Any, Dict, List
 
-from base_plugin import BasePlugin, HookResult, HookStrategy
+from base_plugin import BasePlugin, MethodHook
 from java.util import ArrayList
 from markdown_utils import parse_markdown
 from ui.settings import EditText, Header, Text
+from ui.bulletin import BulletinHelper
+from org.telegram.messenger import R as R_tg
 
 # --- метаданные ---
 __id__ = "skcjslxilsjf"
 __name__ = "я хз тренд"
 __description__ = "я хз"
 __author__ = "@insonniiia"
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 __icon__ = "mlpbystickerslala_by_fStikBot/0"
 __min_version__ = "11.12.0"
 
 
+# --- создание класса плагина ---
 class TrendTextReplacerPlugin(BasePlugin):
-    # --- init plugin ---
+    # --- инициализация плагина и регистрация хуков ---
     def on_plugin_load(self) -> None:
-        self.add_on_send_message_hook()
+        try:
+            # --- поиск целевого класса для перехвата сообщений ---
+            from hook_utils import find_class
+            SendMessagesHelper = find_class("org.telegram.messenger.SendMessagesHelper")
+            
+            # --- получение метода sendMessage с нужной сигнатурой ---
+            # --- public void sendMessage(TLRPC.TL_messageObject messageObject, ...) ---
+            # --- для простоты используем встроенный хелпер если доступен или прямой хук ---
+            self.add_on_send_message_hook()
+            
+            BulletinHelper.show_success("TrendReplacer загружен")
+        except Exception as e:
+            self.log(f"ошибка при загрузке: {e}")
 
-    # --- parse exact match dictionary ---
+    # --- десериализация настроек словаря ---
     def _get_replacements_map(self) -> Dict[str, str]:
         raw_dict = self.get_setting("replacement_dict", "")
         if not isinstance(raw_dict, str) or not raw_dict.strip():
@@ -35,63 +50,75 @@ class TrendTextReplacerPlugin(BasePlugin):
                 val_clean = value.strip()
                 
                 if key_clean:
-                    # --- wrap id in premium emoji markdown with a single emoji base ---
+                    # --- обработка премиум эмодзи через markdown ---
                     if val_clean.isdigit() and len(val_clean) > 10:
                         val_clean = f"[😎]({val_clean})"
                     result_map[key_clean] = val_clean
 
         return result_map
 
-    # --- intercept and replace full message ---
-    def on_send_message_hook(self, account: int, params: Any) -> HookResult:
-        if not hasattr(params, "message") or not isinstance(params.message, str):
-            return HookResult()
+    # --- основной хук перехвата отправки текста ---
+    def on_send_message_hook(self, account: int, params: Any) -> Any:
+        # --- проверка наличия текста сообщения ---
+        if not hasattr(params, "message") or not params.message:
+            return None
 
         try:
             replacements = self._get_replacements_map()
             if not replacements:
-                return HookResult()
+                return None
 
-            original_text = params.message.strip()
+            original_text = str(params.message).strip()
 
+            # --- проверка на точное совпадение фразы ---
             if original_text in replacements:
-                new_text = replacements[original_text]
+                new_markup = replacements[original_text]
                 
-                # --- parse markdown for custom emojis ---
-                parsed_message = parse_markdown(new_text)
+                # --- парсинг markdown для поддержки кастомных эмодзи ---
+                parsed_message = parse_markdown(new_markup)
                 params.message = parsed_message.text
                 
-                # --- safely inject entities into java arraylist ---
-                if getattr(params, "entities", None) is None:
+                # --- работа с нативными java сущностями telegram ---
+                if not hasattr(params, "entities") or params.entities is None:
                     params.entities = ArrayList()
                 else:
                     params.entities.clear()
                     
+                # --- конвертация RawEntity в объекты TLRPC ---
                 for raw_entity in parsed_message.entities:
                     params.entities.add(raw_entity.to_tlrpc_object())
                 
-                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+                # --- визуальное подтверждение замены ---
+                BulletinHelper.show_simple("Текст заменен!", R_tg.raw.contact_check)
+                
+                # --- возвращаем модифицированные параметры ---
+                return params
 
-            return HookResult()
+            return None
 
         except Exception as e:
-            # --- silent error handling for video recording ---
-            self.log(f"text replacer error: {traceback.format_exc()}")
-            return HookResult()
+            # --- логирование ошибок без прерывания работы приложения ---
+            self.log(f"ошибка замены текста: {traceback.format_exc()}")
+            return None
 
-    # --- settings ui ---
+    # --- очистка при выгрузке ---
+    def on_plugin_unload(self) -> None:
+        # --- системные хуки выгружаются автоматически ---
+        pass
+
+    # --- интерфейс настроек в стиле exteragram ---
     def create_settings(self) -> List[Any]:
         return [
-            Header(text="настройки словаря (точное совпадение)"),
+            Header(text="Настройки словаря трендов"),
             EditText(
                 key="replacement_dict",
-                hint="пример: точная фраза=текст для замены",
+                hint="фраза=замена (например: привет=пока)",
                 default="",
                 multiline=True,
                 max_length=5000
             ),
             Text(
-                text="инструкция: замена сработает только если отправленное сообщение полностью совпадает с фразой до знака равно.",
+                text="Инструкция: замена произойдет только при полном совпадении сообщения с текстом до знака '='. Если вставить ID премиум эмодзи после '=', он будет автоматически преобразован.",
                 icon="msg_info",
                 accent=True
             )

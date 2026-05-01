@@ -13,54 +13,38 @@ __id__ = "skcjslxilsjf"
 __name__ = "я хз тренд"
 __description__ = "я хз"
 __author__ = "@insonniiia"
-__version__ = "2.1.1"
+__version__ = "2.1.2"
 __icon__ = "mlpbystickerslala_by_fStikBot/0"
 __min_version__ = "11.12.0"
 
 
-# --- создание класса плагина ---
+# --- основной класс плагина ---
 class TrendTextReplacerPlugin(BasePlugin):
-    # --- инициализация плагина и регистрация хуков ---
+    # --- запуск плагина ---
     def on_plugin_load(self) -> None:
-        try:
-            # --- поиск целевого класса для перехвата сообщений ---
-            from hook_utils import find_class
-            SendMessagesHelper = find_class("org.telegram.messenger.SendMessagesHelper")
-            
-            # --- получение метода sendMessage с нужной сигнатурой ---
-            # --- public void sendMessage(TLRPC.TL_messageObject messageObject, ...) ---
-            # --- для простоты используем встроенный хелпер если доступен или прямой хук ---
-            self.add_on_send_message_hook()
-            
-            BulletinHelper.show_success("TrendReplacer загружен")
-        except Exception as e:
-            self.log(f"ошибка при загрузке: {e}")
+        # --- используем встроенный обработчик отправки сообщений ---
+        self.add_on_send_message_hook()
 
-    # --- десериализация настроек словаря ---
+    # --- получение и очистка словаря замен ---
     def _get_replacements_map(self) -> Dict[str, str]:
         raw_dict = self.get_setting("replacement_dict", "")
         if not isinstance(raw_dict, str) or not raw_dict.strip():
             return {}
 
         result_map: Dict[str, str] = {}
+        # --- разделяем по двойному переносу, если ключи многострочные ---
+        # --- но для простоты используем стандартное разделение по строкам ---
         for line in raw_dict.split("\n"):
             if "=" in line:
                 key, value = line.split("=", 1)
-                key_clean = key.strip()
-                val_clean = value.strip()
-                
-                if key_clean:
-                    # --- обработка премиум эмодзи через markdown ---
-                    if val_clean.isdigit() and len(val_clean) > 10:
-                        val_clean = f"[😎]({val_clean})"
-                    result_map[key_clean] = val_clean
-
+                # --- важно: убираем пробелы только по краям ключа ---
+                result_map[key.strip()] = value.strip()
         return result_map
 
-    # --- основной хук перехвата отправки текста ---
+    # --- хук на отправку сообщения ---
     def on_send_message_hook(self, account: int, params: Any) -> Any:
-        # --- проверка наличия текста сообщения ---
-        if not hasattr(params, "message") or not params.message:
+        # --- проверка объекта параметров ---
+        if not params or not hasattr(params, "message"):
             return None
 
         try:
@@ -68,57 +52,55 @@ class TrendTextReplacerPlugin(BasePlugin):
             if not replacements:
                 return None
 
-            original_text = str(params.message).strip()
+            # --- нормализуем входящий текст: убираем пробелы по краям ---
+            incoming_text = str(params.message).strip()
 
-            # --- проверка на точное совпадение фразы ---
-            if original_text in replacements:
-                new_markup = replacements[original_text]
+            if incoming_text in replacements:
+                target_value = replacements[incoming_text]
                 
-                # --- парсинг markdown для поддержки кастомных эмодзи ---
-                parsed_message = parse_markdown(new_markup)
+                # --- если значение — это id премиум эмодзи (число > 10 знаков) ---
+                if target_value.isdigit() and len(target_value) > 10:
+                    new_text_markup = f"[😎]({target_value})"
+                else:
+                    new_text_markup = target_value
+
+                # --- парсим markdown для генерации сущностей (entities) ---
+                parsed_message = parse_markdown(new_text_markup)
                 params.message = parsed_message.text
                 
-                # --- работа с нативными java сущностями telegram ---
+                # --- инициализация или очистка списка сущностей java ---
                 if not hasattr(params, "entities") or params.entities is None:
                     params.entities = ArrayList()
                 else:
                     params.entities.clear()
                     
-                # --- конвертация RawEntity в объекты TLRPC ---
+                # --- конвертация и добавление сущностей в нативный список ---
                 for raw_entity in parsed_message.entities:
                     params.entities.add(raw_entity.to_tlrpc_object())
                 
-                # --- визуальное подтверждение замены ---
-                BulletinHelper.show_simple("Текст заменен!", R_tg.raw.contact_check)
-                
-                # --- возвращаем модифицированные параметры ---
+                # --- уведомление об успехе ---
+                BulletinHelper.show_simple("Текст заменен", R_tg.raw.contact_check)
                 return params
 
             return None
 
-        except Exception as e:
-            # --- логирование ошибок без прерывания работы приложения ---
-            self.log(f"ошибка замены текста: {traceback.format_exc()}")
+        except Exception:
+            self.log(f"ошибка замены: {traceback.format_exc()}")
             return None
 
-    # --- очистка при выгрузке ---
-    def on_plugin_unload(self) -> None:
-        # --- системные хуки выгружаются автоматически ---
-        pass
-
-    # --- интерфейс настроек в стиле exteragram ---
+    # --- настройки плагина ---
     def create_settings(self) -> List[Any]:
         return [
-            Header(text="Настройки словаря трендов"),
+            Header(text="Словарь замен"),
             EditText(
                 key="replacement_dict",
-                hint="фраза=замена (например: привет=пока)",
+                hint="триггер=результат",
                 default="",
                 multiline=True,
-                max_length=5000
+                max_length=10000
             ),
             Text(
-                text="Инструкция: замена произойдет только при полном совпадении сообщения с текстом до знака '='. Если вставить ID премиум эмодзи после '=', он будет автоматически преобразован.",
+                text="Чтобы заменить твое расписание, вставь его целиком слева от знака '=', а результат (например, ID эмодзи) справа.",
                 icon="msg_info",
                 accent=True
             )

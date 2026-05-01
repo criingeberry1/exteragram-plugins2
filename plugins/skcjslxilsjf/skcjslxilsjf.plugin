@@ -1,7 +1,7 @@
 import traceback
-from typing import Any, Dict, List
+from typing import Any, List
 
-from base_plugin import BasePlugin, MethodHook
+from base_plugin import BasePlugin
 from java.util import ArrayList
 from markdown_utils import parse_markdown
 from ui.settings import EditText, Header, Text
@@ -13,94 +13,80 @@ __id__ = "skcjslxilsjf"
 __name__ = "я хз тренд"
 __description__ = "я хз"
 __author__ = "@insonniiia"
-__version__ = "2.1.2"
+__version__ = "2.1.3"
 __icon__ = "mlpbystickerslala_by_fStikBot/0"
 __min_version__ = "11.12.0"
 
 
 # --- основной класс плагина ---
-class TrendTextReplacerPlugin(BasePlugin):
-    # --- запуск плагина ---
+class CustomEmojiReplacerPlugin(BasePlugin):
+    # --- инициализация ---
     def on_plugin_load(self) -> None:
-        # --- используем встроенный обработчик отправки сообщений ---
         self.add_on_send_message_hook()
 
-    # --- получение и очистка словаря замен ---
-    def _get_replacements_map(self) -> Dict[str, str]:
-        raw_dict = self.get_setting("replacement_dict", "")
-        if not isinstance(raw_dict, str) or not raw_dict.strip():
-            return {}
-
-        result_map: Dict[str, str] = {}
-        # --- разделяем по двойному переносу, если ключи многострочные ---
-        # --- но для простоты используем стандартное разделение по строкам ---
-        for line in raw_dict.split("\n"):
-            if "=" in line:
-                key, value = line.split("=", 1)
-                # --- важно: убираем пробелы только по краям ключа ---
-                result_map[key.strip()] = value.strip()
-        return result_map
-
-    # --- хук на отправку сообщения ---
+    # --- перехват отправки сообщения ---
     def on_send_message_hook(self, account: int, params: Any) -> Any:
-        # --- проверка объекта параметров ---
-        if not params or not hasattr(params, "message"):
+        # --- проверка наличия текста ---
+        if not params or not hasattr(params, "message") or not params.message:
             return None
 
         try:
-            replacements = self._get_replacements_map()
-            if not replacements:
+            original_text = str(params.message)
+            
+            # --- получаем настройки: что и на какой id заменяем ---
+            target_trigger = self.get_setting("trigger_char", "❄️")
+            emoji_id = self.get_setting("premium_id", "5344075571297022657")
+
+            # --- если триггера нет в тексте, ничего не делаем ---
+            if target_trigger not in original_text:
                 return None
 
-            # --- нормализуем входящий текст: убираем пробелы по краям ---
-            incoming_text = str(params.message).strip()
+            # --- заменяем символ на markdown-конструкцию премиум эмодзи ---
+            # --- формат: [текст_заглушка](id_эмодзи) ---
+            replacement_markup = f"[{target_trigger}]({emoji_id})"
+            new_text_with_markup = original_text.replace(target_trigger, replacement_markup)
 
-            if incoming_text in replacements:
-                target_value = replacements[incoming_text]
-                
-                # --- если значение — это id премиум эмодзи (число > 10 знаков) ---
-                if target_value.isdigit() and len(target_value) > 10:
-                    new_text_markup = f"[😎]({target_value})"
-                else:
-                    new_text_markup = target_value
+            # --- парсим текст в объект с entities ---
+            parsed = parse_markdown(new_text_with_markup)
+            
+            # --- подменяем исходный текст на чистый текст без markdown-разметки ---
+            params.message = parsed.text
+            
+            # --- работа с нативным списком сущностей telegram ---
+            if not hasattr(params, "entities") or params.entities is None:
+                params.entities = ArrayList()
+            else:
+                params.entities.clear()
 
-                # --- парсим markdown для генерации сущностей (entities) ---
-                parsed_message = parse_markdown(new_text_markup)
-                params.message = parsed_message.text
-                
-                # --- инициализация или очистка списка сущностей java ---
-                if not hasattr(params, "entities") or params.entities is None:
-                    params.entities = ArrayList()
-                else:
-                    params.entities.clear()
-                    
-                # --- конвертация и добавление сущностей в нативный список ---
-                for raw_entity in parsed_message.entities:
-                    params.entities.add(raw_entity.to_tlrpc_object())
-                
-                # --- уведомление об успехе ---
-                BulletinHelper.show_simple("Текст заменен", R_tg.raw.contact_check)
-                return params
+            # --- добавляем сгенерированные сущности кастомных эмодзи ---
+            for entity in parsed.entities:
+                params.entities.add(entity.to_tlrpc_object())
 
-            return None
+            # --- легкая вибрация или уведомление для фидбека ---
+            BulletinHelper.show_simple("Эмодзи заменены!", R_tg.raw.contact_check)
+            
+            return params
 
         except Exception:
-            self.log(f"ошибка замены: {traceback.format_exc()}")
+            self.log(f"ошибка замены эмодзи: {traceback.format_exc()}")
             return None
 
     # --- настройки плагина ---
     def create_settings(self) -> List[Any]:
         return [
-            Header(text="Словарь замен"),
+            Header(text="Настройка замены на Premium Emoji"),
             EditText(
-                key="replacement_dict",
-                hint="триггер=результат",
-                default="",
-                multiline=True,
-                max_length=10000
+                key="trigger_char",
+                hint="Символ для замены (например ❄️)",
+                default="❄️"
+            ),
+            EditText(
+                key="premium_id",
+                hint="ID премиум эмодзи",
+                default="5344075571297022657"
             ),
             Text(
-                text="Чтобы заменить твое расписание, вставь его целиком слева от знака '=', а результат (например, ID эмодзи) справа.",
+                text="Плагин найдет все указанные символы в твоем расписании и заменит их на Premium-эмодзи с сохранением текста.",
                 icon="msg_info",
                 accent=True
             )

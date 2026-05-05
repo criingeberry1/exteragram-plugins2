@@ -1,5 +1,5 @@
-import re
 import traceback
+import re
 from typing import Any, List
 
 from base_plugin import BasePlugin, HookResult, HookStrategy
@@ -11,90 +11,93 @@ __id__ = "song_texter"
 __name__ = "жеска поем хуйню"
 __description__ = "хуйня"
 __author__ = "@insonniiia"
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 __icon__ = "q_427/72"
 __min_version__ = "11.12.0"
 
 
-# --- основной класс плагина для цикличной отправки строк ---
+# --- финальная и исправленная версия плагина ---
 
-class LineByLinePlugin(BasePlugin):
+class ScriptReplacerPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
-        # --- список строк для отправки ---
-        self.lines: List[str] = []
-        # --- текущий номер строки ---
-        self.index: int = 0
-        # --- включена ли замена ---
-        self.active: bool = False
+        # --- список строк ---
+        self.script_lines: List[str] = []
+        # --- индекс текущей строки ---
+        self.pointer: int = 0
+        # --- состояние ---
+        self.is_enabled: bool = False
 
-    def on_plugin_load(self) -> None:
-        # --- логируем запуск для отладки ---
-        self.log("line-by-line plugin loaded")
-
-    def _prepare_text(self, text: str) -> str:
-        # --- очистка текста: только маленькие буквы и знак вопроса ---
+    def _clean_line(self, text: str) -> str:
+        # --- жесткая очистка по твоему ТЗ ---
         if not text:
             return ""
-        # --- удаляем всё кроме букв, цифр, пробелов и ? ---
-        cleaned = re.sub(r'[^a-zA-Zа-яА-Я0-9\s\?]', '', text)
-        return cleaned.lower().strip()
+        # --- убираем всё кроме букв и знака вопроса ---
+        res = re.sub(r'[^a-zA-Zа-яА-Я0-9\s\?]', '', text)
+        # --- в нижний регистр ---
+        return res.lower().strip()
 
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
-        # --- перехват всех исходящих сообщений ---
-        if not hasattr(params, "message") or not isinstance(params.message, str):
+        # --- защита от пустых параметров ---
+        if params is None:
             return HookResult()
 
-        text = params.message.strip()
+        # --- получаем текст сообщения ---
+        # --- пробуем достать текст напрямую из атрибута ---
+        try:
+            original_text = str(params.message) if hasattr(params, "message") else ""
+        except Exception:
+            return HookResult()
 
-        # --- команда загрузки сценария (set:) ---
-        if text.startswith("set:"):
-            raw_data = text[4:].strip()
-            # --- разбиваем на строки и чистим каждую ---
-            new_lines = [self._prepare_text(l) for l in raw_data.splitlines() if l.strip()]
+        # --- КОМАНДА: загрузка текста (set:) ---
+        if original_text.startswith("set:"):
+            content = original_text[4:].strip()
+            lines = content.splitlines()
+            # --- фильтруем и чистим ---
+            self.script_lines = [self._clean_line(l) for l in lines if l.strip()]
             
-            if new_lines:
-                self.lines = new_lines
-                self.index = 0
-                self.active = True
-                BulletinHelper.show_success(f"загружено строк: {len(self.lines)}")
+            if self.script_lines:
+                self.pointer = 0
+                self.is_enabled = True
+                BulletinHelper.show_success(f"загружено: {len(self.script_lines)} строк")
             else:
-                BulletinHelper.show_error("текст не найден")
-            
-            # --- удаляем само сообщение с текстом сценария ---
+                BulletinHelper.show_error("ошибка: пустой текст")
+                
             return HookResult(strategy=HookStrategy.STOP)
 
-        # --- команда вкл/выкл (/replace) ---
-        if text.lower() == "/replace":
-            self.active = not self.active
-            status = "включен" if self.active else "выключен"
-            icon = R_tg.raw.contact_check if self.active else R_tg.raw.info
-            BulletinHelper.show_simple(f"режим замены {status}", icon)
+        # --- КОМАНДА: переключение (/replace) ---
+        if original_text.lower() == "/replace":
+            self.is_enabled = not self.is_enabled
+            status = "активен" if self.is_enabled else "выключен"
+            BulletinHelper.show_info(f"режим замены {status}")
             return HookResult(strategy=HookStrategy.STOP)
 
-        # --- логика подмены если режим активен и есть строки ---
-        if self.active and self.lines:
+        # --- ЛОГИКА ЗАМЕНЫ ---
+        if self.is_enabled and self.script_lines:
             try:
-                # --- подменяем текст на текущую строку из списка ---
-                params.message = self.lines[self.index]
+                # --- берем текущую строку ---
+                new_text = self.script_lines[self.pointer]
                 
-                # --- инкрементируем индекс (зацикливаем) ---
-                self.index = (self.index + 1) % len(self.lines)
+                # --- ВАЖНО: принудительно меняем атрибут message в объекте params ---
+                setattr(params, "message", new_text)
                 
-                # --- визуальный фидбек о прогрессе ---
-                BulletinHelper.show_simple(
-                    f"строка {self.index} из {len(self.lines)}", 
-                    R_tg.raw.forward
-                )
-                
-                # --- сообщаем движку что мы изменили параметры ---
-                return HookResult(strategy=HookStrategy.MODIFY, params=params)
-            except Exception:
-                self.log(f"error during replacement: {traceback.format_exc()}")
+                # --- если есть entities (ссылки, жирный текст), очищаем их, чтобы не было багов ---
+                if hasattr(params, "entities"):
+                    setattr(params, "entities", None)
 
+                # --- обновляем индекс ---
+                self.pointer = (self.pointer + 1) % len(self.script_lines)
+                
+                # --- визуальный лог ---
+                BulletinHelper.show_simple(f"строка {self.pointer} отправлена", R_tg.raw.contact_check)
+                
+                # --- возвращаем стратегию MODIFY и ОБЯЗАТЕЛЬНО сами параметры ---
+                return HookResult(strategy=HookStrategy.MODIFY, params=params)
+            except Exception as e:
+                self.log(f"ошибка замены: {e}\n{traceback.format_exc()}")
+        
         return HookResult()
 
     def on_plugin_unload(self) -> None:
-        # --- очистка при выгрузке ---
-        self.lines.clear()
-        self.active = False
+        self.script_lines = []
+        self.is_enabled = False

@@ -11,93 +11,94 @@ __id__ = "song_texter"
 __name__ = "жеска поем хуйню"
 __description__ = "хуйня"
 __author__ = "@insonniiia"
-__version__ = "1.0.3"
+__version__ = "1.0.4"
 __icon__ = "q_427/72"
 __min_version__ = "11.12.0"
 
 
-# --- финальная и исправленная версия плагина ---
+# --- финальный исправленный плагин с регистрацией хука ---
 
 class ScriptReplacerPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
-        # --- список строк ---
-        self.script_lines: List[str] = []
-        # --- индекс текущей строки ---
-        self.pointer: int = 0
-        # --- состояние ---
-        self.is_enabled: bool = False
+        # --- список очищенных строк ---
+        self.lines: List[str] = []
+        # --- текущий индекс ---
+        self.index: int = 0
+        # --- статус работы ---
+        self.is_active: bool = False
 
-    def _clean_line(self, text: str) -> str:
-        # --- жесткая очистка по твоему ТЗ ---
+    def on_plugin_load(self) -> None:
+        # --- критически важная регистрация хука ---
+        self.add_on_send_message_hook()
+        self.log("script replacer: hook registered")
+
+    def _prepare_text(self, text: str) -> str:
+        # --- очистка по твоему стандарту: lowercase и только знак ? ---
         if not text:
             return ""
-        # --- убираем всё кроме букв и знака вопроса ---
-        res = re.sub(r'[^a-zA-Zа-яА-Я0-9\s\?]', '', text)
-        # --- в нижний регистр ---
-        return res.lower().strip()
+        # --- удаляем все спецсимволы кроме букв, цифр и ? ---
+        cleaned = re.sub(r'[^a-zA-Zа-яА-Я0-9\s\?]', '', text)
+        return cleaned.lower().strip()
 
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
-        # --- защита от пустых параметров ---
-        if params is None:
+        # --- проверка параметров на существование ---
+        if params is None or not hasattr(params, "message"):
             return HookResult()
 
-        # --- получаем текст сообщения ---
-        # --- пробуем достать текст напрямую из атрибута ---
         try:
-            original_text = str(params.message) if hasattr(params, "message") else ""
+            msg_text = str(params.message).strip()
         except Exception:
             return HookResult()
 
-        # --- КОМАНДА: загрузка текста (set:) ---
-        if original_text.startswith("set:"):
-            content = original_text[4:].strip()
-            lines = content.splitlines()
-            # --- фильтруем и чистим ---
-            self.script_lines = [self._clean_line(l) for l in lines if l.strip()]
+        # --- команда загрузки текста через set: ---
+        if msg_text.startswith("set:"):
+            raw_script = msg_text[4:].strip()
+            self.lines = [self._prepare_text(line) for line in raw_script.splitlines() if line.strip()]
             
-            if self.script_lines:
-                self.pointer = 0
-                self.is_enabled = True
-                BulletinHelper.show_success(f"загружено: {len(self.script_lines)} строк")
+            if self.lines:
+                self.index = 0
+                self.is_active = True
+                BulletinHelper.show_success(f"загружено строк: {len(self.lines)}")
             else:
-                BulletinHelper.show_error("ошибка: пустой текст")
-                
+                BulletinHelper.show_error("текст не распознан")
+            
             return HookResult(strategy=HookStrategy.STOP)
 
-        # --- КОМАНДА: переключение (/replace) ---
-        if original_text.lower() == "/replace":
-            self.is_enabled = not self.is_enabled
-            status = "активен" if self.is_enabled else "выключен"
+        # --- команда переключения режима /replace ---
+        if msg_text.lower() == "/replace":
+            self.is_active = not self.is_active
+            status = "включен" if self.is_active else "выключен"
             BulletinHelper.show_info(f"режим замены {status}")
             return HookResult(strategy=HookStrategy.STOP)
 
-        # --- ЛОГИКА ЗАМЕНЫ ---
-        if self.is_enabled and self.script_lines:
+        # --- логика подмены текста ---
+        if self.is_active and self.lines:
             try:
-                # --- берем текущую строку ---
-                new_text = self.script_lines[self.pointer]
+                # --- берем следующую строку по кругу ---
+                target_text = self.lines[self.index]
                 
-                # --- ВАЖНО: принудительно меняем атрибут message в объекте params ---
-                setattr(params, "message", new_text)
+                # --- принудительная подмена текста ---
+                setattr(params, "message", target_text)
                 
-                # --- если есть entities (ссылки, жирный текст), очищаем их, чтобы не было багов ---
+                # --- очистка entities чтобы избежать багов разметки ---
                 if hasattr(params, "entities"):
                     setattr(params, "entities", None)
 
-                # --- обновляем индекс ---
-                self.pointer = (self.pointer + 1) % len(self.script_lines)
+                # --- инкремент индекса ---
+                self.index = (self.index + 1) % len(self.lines)
                 
-                # --- визуальный лог ---
-                BulletinHelper.show_simple(f"строка {self.pointer} отправлена", R_tg.raw.contact_check)
+                # --- фидбек в интерфейсе ---
+                BulletinHelper.show_simple(f"отправлено: {self.index}/{len(self.lines)}", R_tg.raw.account_check)
                 
-                # --- возвращаем стратегию MODIFY и ОБЯЗАТЕЛЬНО сами параметры ---
                 return HookResult(strategy=HookStrategy.MODIFY, params=params)
             except Exception as e:
-                self.log(f"ошибка замены: {e}\n{traceback.format_exc()}")
-        
+                self.log(f"replacement error: {e}\n{traceback.format_exc()}")
+
         return HookResult()
 
     def on_plugin_unload(self) -> None:
-        self.script_lines = []
-        self.is_enabled = False
+        # --- очистка при выгрузке плагина ---
+        self.lines.clear()
+        self.is_active = False
+        self.log("script replacer unloaded")

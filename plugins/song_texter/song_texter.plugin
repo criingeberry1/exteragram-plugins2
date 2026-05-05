@@ -11,38 +11,37 @@ __id__ = "song_texter"
 __name__ = "жеска поем хуйню"
 __description__ = "хуйня"
 __author__ = "@insonniiia"
-__version__ = "1.0.4"
+__version__ = "1.0.5"
 __icon__ = "q_427/72"
 __min_version__ = "11.12.0"
 
 
-# --- финальный исправленный плагин с регистрацией хука ---
+# --- финальный билд с фиксами букв, запятых и стратегии отмены ---
 
 class ScriptReplacerPlugin(BasePlugin):
     def __init__(self):
         super().__init__()
-        # --- список очищенных строк ---
+        # --- хранилище сценария ---
         self.lines: List[str] = []
-        # --- текущий индекс ---
+        # --- курсор текущей строки ---
         self.index: int = 0
-        # --- статус работы ---
+        # --- флаг работы ---
         self.is_active: bool = False
 
     def on_plugin_load(self) -> None:
-        # --- критически важная регистрация хука ---
+        # --- регистрация слушателя сообщений ---
         self.add_on_send_message_hook()
-        self.log("script replacer: hook registered")
+        self.log("script replacer initialized")
 
-    def _prepare_text(self, text: str) -> str:
-        # --- очистка по твоему стандарту: lowercase и только знак ? ---
+    def _clean_line(self, text: str) -> str:
+        # --- очистка текста: нижний регистр, сохранение ё, цифр и запятых ---
         if not text:
             return ""
-        # --- удаляем все спецсимволы кроме букв, цифр и ? ---
-        cleaned = re.sub(r'[^a-zA-Zа-яА-Я0-9\s\?]', '', text)
-        return cleaned.lower().strip()
+        # --- фикс: добавлен диапазон а-яёЁ и запятая в белый список ---
+        res = re.sub(r'[^a-zA-Zа-яёА-ЯЁ0-9\s\?,]', '', text)
+        return res.lower().strip()
 
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
-        # --- проверка параметров на существование ---
         if params is None or not hasattr(params, "message"):
             return HookResult()
 
@@ -51,54 +50,55 @@ class ScriptReplacerPlugin(BasePlugin):
         except Exception:
             return HookResult()
 
-        # --- команда загрузки текста через set: ---
+        # --- обработка команды загрузки (set:) ---
         if msg_text.startswith("set:"):
             raw_script = msg_text[4:].strip()
-            self.lines = [self._prepare_text(line) for line in raw_script.splitlines() if line.strip()]
+            self.lines = [self._clean_line(line) for line in raw_script.splitlines() if line.strip()]
             
             if self.lines:
                 self.index = 0
                 self.is_active = True
-                BulletinHelper.show_success(f"загружено строк: {len(self.lines)}")
+                BulletinHelper.show_success(f"загружено: {len(self.lines)} строк")
             else:
-                BulletinHelper.show_error("текст не распознан")
+                BulletinHelper.show_error("текст пуст")
             
-            return HookResult(strategy=HookStrategy.STOP)
+            # --- фикс: использование CANCEL для удаления команды из чата ---
+            return HookResult(strategy=HookStrategy.CANCEL)
 
-        # --- команда переключения режима /replace ---
+        # --- обработка команды управления (/replace) ---
         if msg_text.lower() == "/replace":
             self.is_active = not self.is_active
             status = "включен" if self.is_active else "выключен"
             BulletinHelper.show_info(f"режим замены {status}")
-            return HookResult(strategy=HookStrategy.STOP)
+            
+            # --- фикс: использование CANCEL для удаления команды из чата ---
+            return HookResult(strategy=HookStrategy.CANCEL)
 
-        # --- логика подмены текста ---
+        # --- выполнение подмены сообщения ---
         if self.is_active and self.lines:
             try:
-                # --- берем следующую строку по кругу ---
                 target_text = self.lines[self.index]
                 
-                # --- принудительная подмена текста ---
+                # --- принудительная установка текста через атрибут ---
                 setattr(params, "message", target_text)
                 
-                # --- очистка entities чтобы избежать багов разметки ---
+                # --- сброс сущностей для предотвращения ошибок рендеринга ---
                 if hasattr(params, "entities"):
                     setattr(params, "entities", None)
 
-                # --- инкремент индекса ---
+                # --- цикл по списку строк ---
                 self.index = (self.index + 1) % len(self.lines)
                 
-                # --- фидбек в интерфейсе ---
-                BulletinHelper.show_simple(f"отправлено: {self.index}/{len(self.lines)}", R_tg.raw.account_check)
+                # --- уведомление о прогрессе ---
+                BulletinHelper.show_simple(f"отправка: {self.index}/{len(self.lines)}", R_tg.raw.forward)
                 
                 return HookResult(strategy=HookStrategy.MODIFY, params=params)
-            except Exception as e:
-                self.log(f"replacement error: {e}\n{traceback.format_exc()}")
+            except Exception:
+                self.log(f"exec error: {traceback.format_exc()}")
 
         return HookResult()
 
     def on_plugin_unload(self) -> None:
-        # --- очистка при выгрузке плагина ---
         self.lines.clear()
         self.is_active = False
         self.log("script replacer unloaded")

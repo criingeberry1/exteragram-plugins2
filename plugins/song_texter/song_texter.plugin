@@ -1,5 +1,6 @@
 import traceback
 import re
+import random
 from typing import Any, List
 
 from base_plugin import BasePlugin, HookResult, HookStrategy
@@ -11,35 +12,72 @@ __id__ = "song_texter"
 __name__ = "жеска поем хуйню"
 __description__ = "хуйня"
 __author__ = "@insonniiia"
-__version__ = "1.0.6"
+__version__ = "1.0.7"
 __icon__ = "q_427/72"
 __min_version__ = "11.12.0"
 
 
-# --- финальная версия с командами .son и .soff ---
+# --- плагин для текстовых сценариев с ё-заменой и опечатками ---
 
-class SongScriptPlugin(BasePlugin):
+class SongPluginWithTypos(BasePlugin):
     def __init__(self):
         super().__init__()
-        # --- список строк сценария ---
         self.lines: List[str] = []
-        # --- индекс текущей строки ---
         self.index: int = 0
-        # --- состояние активности ---
         self.is_active: bool = False
+        # --- карта соседних клавиш для имитации опечаток ---
+        self.keyboard_neighbors = {
+            'й': 'цуф', 'ц': 'йувфы', 'у': 'цкева', 'к': 'уенсв', 'е': 'кнгрс', 'н': 'егшор',
+            'г': 'ншлдо', 'ш': 'гщлдз', 'щ': 'шзжхл', 'з': 'щхэжд', 'ф': 'ыяцу', 'ы': 'фвчся',
+            'в': 'ыачсм', 'а': 'впсмите', 'п': 'аренмит', 'р': 'пеготиь', 'о': 'рлшдьбн',
+            'л': 'одщжюб', 'д': 'лзшюэх', 'ж': 'дэз', 'я': 'чфы', 'ч': 'ясыв', 'с': 'чмав',
+            'м': 'саип', 'и': 'мтрн', 'т': 'иьро', 'ь': 'тбор', 'б': 'ьюл', 'ю': 'бдл'
+        }
 
     def on_plugin_load(self) -> None:
-        # --- регистрация хука отправки ---
         self.add_on_send_message_hook()
-        self.log("song script replacer: hook registered")
+        self.log("song typos plugin loaded")
 
     def _clean_line(self, text: str) -> str:
-        # --- очистка: маленькие буквы, ё, цифры, пробелы и запятые ---
         if not text:
             return ""
-        # --- регулярка с поддержкой ёЁ и пунктуации ---
-        res = re.sub(r'[^a-zA-Zа-яёА-ЯЁ0-9\s\?,]', '', text)
+        # --- заменяем ё на е ---
+        text = text.replace('ё', 'е').replace('Ё', 'Е')
+        # --- убираем всё кроме букв, цифр, пробелов, запятых и ? ---
+        res = re.sub(r'[^a-zA-Zа-яА-Я0-9\s\?,]', '', text)
         return res.lower().strip()
+
+    def _add_typos(self, text: str) -> str:
+        # --- логика шансов: 0 опечаток (60%), 1 (30%), 2 (7%), 3 (3%) ---
+        chance = random.random()
+        if chance < 0.6:
+            count = 0
+        elif chance < 0.9:
+            count = 1
+        elif chance < 0.97:
+            count = 2
+        else:
+            count = 3
+        
+        if count == 0 or len(text) < 4:
+            return text
+
+        chars = list(text)
+        indices = [i for i, c in enumerate(chars) if c in self.keyboard_neighbors]
+        
+        if not indices:
+            return text
+
+        # --- выбираем случайные места для опечаток ---
+        to_change = random.sample(indices, min(count, len(indices)))
+        
+        for idx in to_change:
+            orig_char = chars[idx]
+            neighbors = self.keyboard_neighbors.get(orig_char, "")
+            if neighbors:
+                chars[idx] = random.choice(neighbors)
+        
+        return "".join(chars)
 
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
         if params is None or not hasattr(params, "message"):
@@ -50,53 +88,41 @@ class SongScriptPlugin(BasePlugin):
         except Exception:
             return HookResult()
 
-        # --- команда загрузки текста (set:) ---
+        # --- загрузка ---
         if msg_text.startswith("set:"):
             raw_data = msg_text[4:].strip()
             self.lines = [self._clean_line(l) for l in raw_data.splitlines() if l.strip()]
-            
             if self.lines:
                 self.index = 0
                 self.is_active = True
-                BulletinHelper.show_success(f"загружено строк: {len(self.lines)}")
-            else:
-                BulletinHelper.show_error("текст не распознан")
-            
+                BulletinHelper.show_success(f"загружено {len(self.lines)} строк (ё -> е)")
             return HookResult(strategy=HookStrategy.CANCEL)
 
-        # --- команда включения (.son) ---
+        # --- управление ---
         if msg_text.lower() == ".son":
             self.is_active = True
-            BulletinHelper.show_info("режим замены включен")
+            BulletinHelper.show_info("режим замены + опечатки вкл")
             return HookResult(strategy=HookStrategy.CANCEL)
 
-        # --- команда выключения (.soff) ---
         if msg_text.lower() == ".soff":
             self.is_active = False
-            BulletinHelper.show_info("режим замены выключен")
+            BulletinHelper.show_info("выключено")
             return HookResult(strategy=HookStrategy.CANCEL)
 
-        # --- логика цикличной подмены ---
+        # --- замена ---
         if self.is_active and self.lines:
             try:
-                # --- подмена текста ---
-                target_text = self.lines[self.index]
-                setattr(params, "message", target_text)
+                raw_line = self.lines[self.index]
+                # --- добавляем опечатки прямо перед отправкой ---
+                final_text = self._add_typos(raw_line)
                 
-                # --- сброс сущностей форматирования ---
+                setattr(params, "message", final_text)
                 if hasattr(params, "entities"):
                     setattr(params, "entities", None)
 
-                # --- переход к следующей строке ---
                 self.index = (self.index + 1) % len(self.lines)
-                
                 return HookResult(strategy=HookStrategy.MODIFY, params=params)
             except Exception:
-                self.log(f"error: {traceback.format_exc()}")
+                self.log(traceback.format_exc())
 
         return HookResult()
-
-    def on_plugin_unload(self) -> None:
-        # --- очистка при выгрузке ---
-        self.lines.clear()
-        self.is_active = False

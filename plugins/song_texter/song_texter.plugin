@@ -1,6 +1,6 @@
-import traceback
 import re
-from typing import Any, List, Optional
+import traceback
+from typing import Any, List
 
 from base_plugin import BasePlugin, HookResult, HookStrategy
 from ui.bulletin import BulletinHelper
@@ -11,82 +11,90 @@ __id__ = "song_texter"
 __name__ = "жеска поем хуйню"
 __description__ = "хуйня"
 __author__ = "@insonniiia"
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 __icon__ = "q_427/72"
 __min_version__ = "11.12.0"
 
 
-# --- плагин для цикличной замены сообщений по сценарию ---
+# --- основной класс плагина для цикличной отправки строк ---
 
-class ScriptReplacerPlugin(BasePlugin):
+class LineByLinePlugin(BasePlugin):
     def __init__(self):
         super().__init__()
-        # --- список очищенных строк ---
-        self.script_lines: List[str] = []
-        # --- указатель на текущую строку ---
-        self.pointer: int = 0
-        # --- состояние активности ---
-        self.is_enabled: bool = False
+        # --- список строк для отправки ---
+        self.lines: List[str] = []
+        # --- текущий номер строки ---
+        self.index: int = 0
+        # --- включена ли замена ---
+        self.active: bool = False
 
     def on_plugin_load(self) -> None:
-        # --- инициализация без хуков так как используем встроенный метод ---
-        pass
+        # --- логируем запуск для отладки ---
+        self.log("line-by-line plugin loaded")
 
-    def _clean_text(self, text: str) -> str:
-        # --- очистка: только маленькие буквы и знак вопроса ---
+    def _prepare_text(self, text: str) -> str:
+        # --- очистка текста: только маленькие буквы и знак вопроса ---
         if not text:
             return ""
-        # --- оставляем только буквы разных алфавитов, цифры и знак вопроса ---
-        res = re.sub(r'[^a-zA-Zа-яА-Я0-9\s\?]', '', text)
-        return res.lower().strip()
+        # --- удаляем всё кроме букв, цифр, пробелов и ? ---
+        cleaned = re.sub(r'[^a-zA-Zа-яА-Я0-9\s\?]', '', text)
+        return cleaned.lower().strip()
 
     def on_send_message_hook(self, account: int, params: Any) -> HookResult:
-        # --- основной перехватчик сообщений ---
+        # --- перехват всех исходящих сообщений ---
         if not hasattr(params, "message") or not isinstance(params.message, str):
             return HookResult()
 
-        original_text = params.message.strip()
+        text = params.message.strip()
 
-        # --- команда загрузки сценария через set: ---
-        if original_text.startswith("set:"):
-            raw_content = original_text[4:].strip()
-            lines = raw_content.splitlines()
-            self.script_lines = [self._clean_text(l) for l in lines if l.strip()]
-            self.pointer = 0
-            self.is_enabled = True
-            BulletinHelper.show_success(f"загружено строк: {len(self.script_lines)}")
+        # --- команда загрузки сценария (set:) ---
+        if text.startswith("set:"):
+            raw_data = text[4:].strip()
+            # --- разбиваем на строки и чистим каждую ---
+            new_lines = [self._prepare_text(l) for l in raw_data.splitlines() if l.strip()]
+            
+            if new_lines:
+                self.lines = new_lines
+                self.index = 0
+                self.active = True
+                BulletinHelper.show_success(f"загружено строк: {len(self.lines)}")
+            else:
+                BulletinHelper.show_error("текст не найден")
+            
+            # --- удаляем само сообщение с текстом сценария ---
             return HookResult(strategy=HookStrategy.STOP)
 
-        # --- команда переключения режима ---
-        if original_text.lower() == "/replace":
-            self.is_enabled = not self.is_enabled
-            status = "включен" if self.is_enabled else "выключен"
-            BulletinHelper.show_info(f"режим замены {status}")
+        # --- команда вкл/выкл (/replace) ---
+        if text.lower() == "/replace":
+            self.active = not self.active
+            status = "включен" if self.active else "выключен"
+            icon = R_tg.raw.contact_check if self.active else R_tg.raw.info
+            BulletinHelper.show_simple(f"режим замены {status}", icon)
             return HookResult(strategy=HookStrategy.STOP)
 
-        # --- логика подмены если режим активен ---
-        if self.is_enabled and self.script_lines:
+        # --- логика подмены если режим активен и есть строки ---
+        if self.active and self.lines:
             try:
-                # --- берем строку из списка по индексу ---
-                target_text = self.script_lines[self.pointer]
+                # --- подменяем текст на текущую строку из списка ---
+                params.message = self.lines[self.index]
                 
-                # --- меняем текст в параметрах отправки ---
-                params.message = target_text
+                # --- инкрементируем индекс (зацикливаем) ---
+                self.index = (self.index + 1) % len(self.lines)
                 
-                # --- двигаем указатель или сбрасываем в начало ---
-                self.pointer = (self.pointer + 1) % len(self.script_lines)
+                # --- визуальный фидбек о прогрессе ---
+                BulletinHelper.show_simple(
+                    f"строка {self.index} из {len(self.lines)}", 
+                    R_tg.raw.forward
+                )
                 
-                # --- уведомление о текущем прогрессе ---
-                progress = f"{self.pointer}/{len(self.script_lines)}"
-                BulletinHelper.show_simple(f"отправка: {progress}", R_tg.raw.contact_check)
-                
+                # --- сообщаем движку что мы изменили параметры ---
                 return HookResult(strategy=HookStrategy.MODIFY, params=params)
             except Exception:
-                self.log(traceback.format_exc())
-        
+                self.log(f"error during replacement: {traceback.format_exc()}")
+
         return HookResult()
 
     def on_plugin_unload(self) -> None:
-        # --- очистка при удалении плагина ---
-        self.script_lines.clear()
-        self.is_enabled = False
+        # --- очистка при выгрузке ---
+        self.lines.clear()
+        self.active = False

@@ -1,0 +1,118 @@
+from base_plugin import BasePlugin, MethodHook
+from ui.bulletin import BulletinHelper
+from org.telegram.messenger import R as R_tg
+from typing import List, Optional
+import re
+
+# --- метаданные ---
+__id__ = "song_texter"
+__name__ = "жеска поем хуйню"
+__description__ = "хуйня"
+__author__ = "@insonniiia"
+__version__ = "1.0.0"
+__icon__ = "q_427/72"
+__min_version__ = "11.12.0"
+
+
+# --- класс плагина для построчной замены текста в сообщениях ---
+
+class LineByLineReplacementPlugin(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        # --- хранилище строк для замены ---
+        self.lines: List[str] = []
+        # --- текущий индекс строки ---
+        self.current_index: int = 0
+        # --- статус активности плагина ---
+        self.is_active: bool = False
+
+    def on_plugin_load(self) -> None:
+        # --- хук на метод отправки сообщений ---
+        try:
+            send_helper_class = "org.telegram.messenger.SendMessagesHelper"
+            # --- находим метод отправки текстового сообщения ---
+            # --- public void sendMessage(SendMessageParams params) ---
+            self.hook_all_methods(send_helper_class, "sendMessage", MessageInterceptor(self))
+            self.log("plugin loaded: hook registered on sendmessage")
+        except Exception as e:
+            self.log(f"failed to load hook: {e}")
+
+    def on_plugin_unload(self) -> None:
+        # --- очистка ресурсов при выгрузке ---
+        self.lines.clear()
+        self.is_active = False
+        self.log("plugin unloaded")
+
+    def process_text(self, text: str) -> str:
+        # --- очистка текста: нижний регистр и удаление пунктуации кроме знака вопроса ---
+        if not text:
+            return ""
+        # --- оставляем только буквы, цифры, пробелы и знак вопроса ---
+        cleaned = re.sub(r'[^a-zA-Zа-яА-Я0-9\s\?]', '', text)
+        return cleaned.lower().strip()
+
+    def set_new_script(self, raw_text: str) -> None:
+        # --- разбивка входящего текста на строки и подготовка ---
+        raw_lines = raw_text.splitlines()
+        self.lines = [self.process_text(line) for line in raw_lines if line.strip()]
+        self.current_index = 0
+        self.is_active = True
+        BulletinHelper.show_success(f"скрипт загружен: {len(self.lines)} строк")
+
+    def toggle_active(self) -> None:
+        # --- переключение режима замены ---
+        self.is_active = not self.is_active
+        status = "включен" if self.is_active else "выключен"
+        BulletinHelper.show_info(f"режим замены {status}")
+
+# --- перехватчик метода отправки сообщения ---
+
+class MessageInterceptor(MethodHook):
+    def __init__(self, plugin: LineByLineReplacementPlugin):
+        super().__init__()
+        self.plugin = plugin
+
+    def before_hooked_method(self, param) -> None:
+        # --- логика перехвата перед выполнением оригинального метода ---
+        if not param.args or len(param.args) == 0:
+            return
+
+        # --- получаем объект параметров сообщения (SendMessageParams) ---
+        # --- в разных версиях telegram структура может отличаться, но обычно текст в поле 'text' ---
+        params_obj = param.args[0]
+        
+        try:
+            original_text = str(params_obj.text)
+        except AttributeError:
+            # --- если это не текстовое сообщение или поле называется иначе ---
+            return
+
+        # --- команда для загрузки текста (начинается с 'set:') ---
+        if original_text.startswith("set:"):
+            script_content = original_text[4:].strip()
+            self.plugin.set_new_script(script_content)
+            # --- отменяем отправку технического сообщения ---
+            param.setResult(None)
+            return
+
+        # --- команда для переключения режима ---
+        if original_text == "/replace":
+            self.plugin.toggle_active()
+            param.setResult(None)
+            return
+
+        # --- если режим активен и есть строки в очереди ---
+        if self.plugin.is_active and self.plugin.lines:
+            # --- берем текущую строку по индексу ---
+            new_text = self.plugin.lines[self.plugin.current_index]
+            
+            # --- подменяем текст в объекте параметров ---
+            params_obj.text = new_text
+            
+            # --- обновляем индекс (циклично) ---
+            self.plugin.current_index = (self.plugin.current_index + 1) % len(self.plugin.lines)
+            
+            # --- уведомление в UI о замене ---
+            BulletinHelper.show_simple(f"заменено на строку {self.plugin.current_index}", R_tg.raw.info)
+
+# --- конец кода плагина ---

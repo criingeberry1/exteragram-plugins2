@@ -1,15 +1,15 @@
 from base_plugin import BasePlugin, MethodHook
-from android_utils import log
-from client_utils import run_on_queue
+from android_utils import log, run_on_ui_thread
+from client_utils import run_on_queue, get_last_fragment
 from hook_utils import find_class, get_private_field, set_private_field
 from ui.bulletin import BulletinHelper
-from ui.settings import Header, Switch, Divider
+from ui.settings import Header, Switch, Divider, Text
+from ui.alert import AlertDialogBuilder
 from typing import Any, List, Optional
 import os
 import traceback
 
 from java.io import File, FileInputStream
-from java.lang import Boolean
 from android.os import FileUtils, Build, Environment
 from android.content import ContentValues
 from android.provider import MediaStore
@@ -19,14 +19,12 @@ __id__ = "music_tools"
 __name__ = "music tools (for me)"
 __description__ = "просто багофиксы для меня"
 __author__ = "@insonniiia"
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __icon__ = "hsrgustinex/55"
 __min_version__ = "11.12.0"
 
 
-# --- repeat mode constants mirrored from mediacontroller ---
-REPEAT_MODE_OFF: int = 0
-REPEAT_MODE_ALL: int = 1
+# --- repeat mode constant for repeat-one ---
 REPEAT_MODE_ONE: int = 2
 
 # --- public destination folder for saved music ---
@@ -41,6 +39,40 @@ AUDIO_MIME_PREFIX: str = "audio/"
 # --- chunk size for the legacy file copy fallback ---
 LEGACY_COPY_CHUNK: int = 65536
 
+# --- diagnostic keyword filters used for class introspection ---
+METHOD_KEYWORDS: List[str] = ["save", "file", "playnext", "playprev", "playmessage", "setplaylist", "buildshuffl", "shuffl", "repeat"]
+FIELD_KEYWORDS: List[str] = ["playlist", "shuffl", "repeat", "current"]
+
+def is_debug_enabled(plugin: "MusicSaviorPlugin") -> bool:
+    return bool(plugin.get_setting("debug_verbose", True))
+
+def debug_log(plugin: "MusicSaviorPlugin", message: str) -> None:
+    if is_debug_enabled(plugin):
+        log(f"[music_savior] {message}")
+
+def describe_args(args_array: Any) -> str:
+    if args_array is None:
+        return "<null>"
+    try:
+        descriptions: List[str] = []
+        for index in range(len(args_array)):
+            value = args_array[index]
+            if value is None:
+                descriptions.append(f"[{index}] None")
+            else:
+                java_type: str = "?"
+                try:
+                    java_type = value.getClass().getName()
+                except Exception:
+                    java_type = type(value).__name__
+                preview: str = str(value)
+                if len(preview) > 80:
+                    preview = preview[:80] + "..."
+                descriptions.append(f"[{index}] {java_type} = {preview}")
+        return " | ".join(descriptions)
+    except Exception as describe_error:
+        return f"<describe_failed: {describe_error}>"
+
 def copy_audio_into_public_downloads(source_path: str, android_context: Any, display_name: str, mime_type: str) -> Optional[str]:
     safe_mime: str = mime_type if mime_type else "audio/mpeg"
     try:
@@ -54,6 +86,7 @@ def copy_audio_into_public_downloads(source_path: str, android_context: Any, dis
             content_resolver = android_context.getContentResolver()
             destination_uri = content_resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, content_values)
             if destination_uri is None:
+                log("[music_savior] mediastore insert returned null")
                 return None
 
             output_stream = content_resolver.openOutputStream(destination_uri)
@@ -64,11 +97,11 @@ def copy_audio_into_public_downloads(source_path: str, android_context: Any, dis
                 try:
                     input_stream.close()
                 except Exception as close_in_error:
-                    log(f"music savior: input stream close failed: {close_in_error}")
+                    log(f"[music_savior] input stream close failed: {close_in_error}")
                 try:
                     output_stream.close()
                 except Exception as close_out_error:
-                    log(f"music savior: output stream close failed: {close_out_error}")
+                    log(f"[music_savior] output stream close failed: {close_out_error}")
             return destination_uri.toString()
 
         # --- legacy direct-path fallback for android 9 and below ---
@@ -84,7 +117,7 @@ def copy_audio_into_public_downloads(source_path: str, android_context: Any, dis
                 destination_file.write(chunk)
         return legacy_target
     except Exception as copy_error:
-        log(f"music savior: copy_audio_into_public_downloads failed: {copy_error}\n{traceback.format_exc()}")
+        log(f"[music_savior] copy_audio_into_public_downloads failed: {copy_error}\n{traceback.format_exc()}")
         return None
 
 class AudioSaveRedirectHook(MethodHook):
@@ -92,47 +125,118 @@ class AudioSaveRedirectHook(MethodHook):
         self.owner = owner
 
     def before_hooked_method(self, param: Any) -> None:
-        if not self.owner.get_setting("redirect_audio_to_downloads", True):
-            return
         try:
+            method_name: str = "?"
+            try:
+                method_name = param.method.getName()
+            except Exception:
+                pass
+
+            args_description: str = describe_args(param.args)
+            debug_log(self.owner, f"saveFile-candidate fired: name={method_name}, args=[{args_description}]")
+
+            if not self.owner.get_setting("redirect_audio_to_downloads", True):
+                return
+
             method_args = param.args
             if method_args is None or len(method_args) < 5:
+                debug_log(self.owner, "saveFile-candidate skipped: too few args")
                 return
 
-            # --- detect audio by mime prefix to stay independent of versioned constants ---
-            mime_argument = method_args[4]
-            mime_string: str = str(mime_argument) if mime_argument is not None else ""
-            if not mime_string.startswith(AUDIO_MIME_PREFIX):
+            # --- locate the mime argument by scanning for an audio/ string ---
+            mime_string: Optional[str] = None
+            mime_index: int = -1
+            for index in range(len(method_args)):
+                value = method_args[index]
+                if value is None:
+                    continue
+                try:
+                    candidate_string: str = str(value)
+                except Exception:
+                    continue
+                if candidate_string.startswith(AUDIO_MIME_PREFIX):
+                    mime_string = candidate_string
+                    mime_index = index
+                    break
+
+            if mime_string is None:
+                debug_log(self.owner, "saveFile-candidate skipped: no audio mime in args")
                 return
 
-            source_path_argument = method_args[0]
-            context_argument = method_args[1]
-            name_argument = method_args[3]
-            if source_path_argument is None or context_argument is None:
+            # --- first string-typed argument is conventionally the source path ---
+            source_path: Optional[str] = None
+            display_name: Optional[str] = None
+            for index in range(len(method_args)):
+                value = method_args[index]
+                if value is None or index == mime_index:
+                    continue
+                try:
+                    candidate_string = str(value)
+                except Exception:
+                    continue
+                if "/" in candidate_string and source_path is None:
+                    source_path = candidate_string
+                elif source_path is not None and display_name is None and not candidate_string.startswith(AUDIO_MIME_PREFIX):
+                    display_name = candidate_string
+
+            if source_path is None:
+                debug_log(self.owner, "saveFile-candidate skipped: source path not detected")
                 return
 
-            source_path: str = str(source_path_argument)
-            display_name: str = str(name_argument) if name_argument is not None else os.path.basename(source_path)
-            on_saved_callback = method_args[5] if len(method_args) >= 6 else None
+            if display_name is None or display_name == "":
+                display_name = os.path.basename(source_path)
+
+            # --- locate android context argument by class name ---
+            android_context = None
+            for index in range(len(method_args)):
+                value = method_args[index]
+                if value is None:
+                    continue
+                try:
+                    class_name: str = value.getClass().getName()
+                    if "Context" in class_name or "Activity" in class_name or "Application" in class_name:
+                        android_context = value
+                        break
+                except Exception:
+                    continue
+
+            if android_context is None:
+                debug_log(self.owner, "saveFile-candidate skipped: context not detected")
+                return
+
+            # --- locate runnable callback if present ---
+            on_saved_callback = None
+            for index in range(len(method_args)):
+                value = method_args[index]
+                if value is None:
+                    continue
+                try:
+                    class_name = value.getClass().getName()
+                    if "Runnable" in class_name or hasattr(value, "run"):
+                        on_saved_callback = value
+                        break
+                except Exception:
+                    continue
+
+            debug_log(self.owner, f"saveFile redirect: src={source_path}, name={display_name}, mime={mime_string}")
 
             # --- short-circuit telegram's default music directory write ---
             param.setResult(None)
 
-            # --- run filesystem io off the ui thread to keep playback smooth ---
-            run_on_queue(lambda: self._perform_copy_and_notify(source_path, context_argument, display_name, mime_string, on_saved_callback))
+            run_on_queue(lambda: self._perform_copy_and_notify(source_path, android_context, display_name, mime_string, on_saved_callback))
         except Exception as redirect_error:
-            log(f"music savior: AudioSaveRedirectHook before failed: {redirect_error}")
+            log(f"[music_savior] AudioSaveRedirectHook before failed: {redirect_error}\n{traceback.format_exc()}")
 
     def _perform_copy_and_notify(self, source_path: str, android_context: Any, display_name: str, mime_string: str, on_saved_callback: Any) -> None:
         result_location = copy_audio_into_public_downloads(source_path, android_context, display_name, mime_string)
         if result_location is not None:
             BulletinHelper.show_success(f"Сохранено в Downloads/{DOWNLOADS_SUBFOLDER}: {display_name}")
             if on_saved_callback is not None:
-                # --- notify telegram so the ui can finalize its progress state ---
+                # --- runnable.run takes no arguments in java ---
                 try:
-                    on_saved_callback.run(None)
+                    on_saved_callback.run()
                 except Exception as callback_error:
-                    log(f"music savior: on_saved callback invocation failed: {callback_error}")
+                    log(f"[music_savior] on_saved callback invocation failed: {callback_error}")
         else:
             BulletinHelper.show_error("Не удалось сохранить трек в Downloads")
 
@@ -141,74 +245,139 @@ class RepeatOnePriorityHook(MethodHook):
         self.owner = owner
 
     def before_hooked_method(self, param: Any) -> None:
-        if not self.owner.get_setting("repeat_one_priority", True):
-            return
         try:
+            method_name: str = "?"
+            try:
+                method_name = param.method.getName()
+            except Exception:
+                pass
+
+            args_description: str = describe_args(param.args)
+            debug_log(self.owner, f"play-step fired: name={method_name}, args=[{args_description}]")
+
+            if not self.owner.get_setting("repeat_one_priority", True):
+                return
+
             method_args = param.args
             if method_args is None or len(method_args) < 1:
                 return
 
             # --- only intercept natural track end, never user-driven skip ---
             by_stop_argument = method_args[0]
-            if by_stop_argument is None or not bool(by_stop_argument):
+            try:
+                by_stop_value: bool = bool(by_stop_argument)
+            except Exception:
+                debug_log(self.owner, "play-step: cannot coerce first arg to bool, skipping")
+                return
+
+            if not by_stop_value:
+                debug_log(self.owner, "play-step: byStop=false, leaving shuffle behavior intact")
                 return
 
             media_controller = param.thisObject
             if media_controller is None:
+                debug_log(self.owner, "play-step: thisObject is null, static method?")
                 return
 
             repeat_mode_value = get_private_field(media_controller, "repeatMode")
+            debug_log(self.owner, f"play-step: repeatMode={repeat_mode_value}")
             if repeat_mode_value is None or int(repeat_mode_value) != REPEAT_MODE_ONE:
                 return
 
-            current_message = media_controller.getPlayingMessageObject()
+            current_message = None
+            try:
+                current_message = media_controller.getPlayingMessageObject()
+            except Exception as get_error:
+                debug_log(self.owner, f"play-step: getPlayingMessageObject failed: {get_error}")
+
             if current_message is None:
+                debug_log(self.owner, "play-step: no current message, skipping")
                 return
 
-            # --- restart the same track instead of letting shuffle pick the next one ---
             try:
                 media_controller.playMessage(current_message)
+                debug_log(self.owner, "play-step: replayed current message via playMessage")
             except Exception as replay_error:
-                log(f"music savior: playMessage replay failed: {replay_error}")
+                log(f"[music_savior] playMessage replay failed: {replay_error}")
                 return
 
             param.setResult(True)
         except Exception as priority_error:
-            log(f"music savior: RepeatOnePriorityHook before failed: {priority_error}")
+            log(f"[music_savior] RepeatOnePriorityHook before failed: {priority_error}\n{traceback.format_exc()}")
 
 class ShuffleAnchorHook(MethodHook):
     def __init__(self, owner: "MusicSaviorPlugin") -> None:
         self.owner = owner
 
     def after_hooked_method(self, param: Any) -> None:
-        if not self.owner.get_setting("anchor_shuffle_to_current", True):
-            return
         try:
-            method_args = param.args
-            if method_args is None or len(method_args) < 2:
+            method_name: str = "?"
+            try:
+                method_name = param.method.getName()
+            except Exception:
+                pass
+
+            args_description: str = describe_args(param.args)
+            debug_log(self.owner, f"setPlaylist fired: name={method_name}, args=[{args_description}]")
+
+            if not self.owner.get_setting("anchor_shuffle_to_current", True):
                 return
 
-            # --- second argument across setplaylist overloads is the user-selected message ---
-            anchor_message = method_args[1]
-            if anchor_message is None:
+            method_args = param.args
+            if method_args is None or len(method_args) < 2:
                 return
 
             media_controller = param.thisObject
             if media_controller is None:
                 return
 
-            shuffled_list = get_private_field(media_controller, "shuffledPlaylist")
-            if shuffled_list is None:
+            # --- find the message object argument that represents the anchor ---
+            anchor_message = None
+            for index in range(len(method_args)):
+                value = method_args[index]
+                if value is None:
+                    continue
+                try:
+                    class_name: str = value.getClass().getName()
+                    if "MessageObject" in class_name and "$" not in class_name:
+                        anchor_message = value
+                        break
+                except Exception:
+                    continue
+
+            if anchor_message is None:
+                debug_log(self.owner, "setPlaylist: no MessageObject argument detected")
                 return
 
-            list_size: int = shuffled_list.size()
+            # --- try multiple known field names for the shuffled list ---
+            shuffled_list = None
+            for field_candidate in ("shuffledPlaylist", "shuffledPlayList", "playlist"):
+                try:
+                    candidate_value = get_private_field(media_controller, field_candidate)
+                    if candidate_value is not None:
+                        shuffled_list = candidate_value
+                        debug_log(self.owner, f"setPlaylist: using field {field_candidate}")
+                        break
+                except Exception:
+                    continue
+
+            if shuffled_list is None:
+                debug_log(self.owner, "setPlaylist: no shuffled list field found")
+                return
+
+            try:
+                list_size: int = shuffled_list.size()
+            except Exception as size_error:
+                debug_log(self.owner, f"setPlaylist: size() failed: {size_error}")
+                return
+
             if list_size <= 1:
                 return
 
             try:
                 anchor_id = anchor_message.getId()
             except Exception as identifier_error:
-                log(f"music savior: anchor message id resolution failed: {identifier_error}")
+                debug_log(self.owner, f"setPlaylist: anchor id resolution failed: {identifier_error}")
                 return
 
             target_index: int = -1
@@ -224,55 +393,207 @@ class ShuffleAnchorHook(MethodHook):
                     continue
 
             if target_index <= 0:
+                debug_log(self.owner, f"setPlaylist: anchor already at index {target_index}, no change")
                 return
 
-            # --- promote the anchor to index 0 so previous always returns to it ---
             shuffled_list.remove(target_index)
             shuffled_list.add(0, anchor_message)
-            set_private_field(media_controller, "currentPlaylistNum", 0)
+            try:
+                set_private_field(media_controller, "currentPlaylistNum", 0)
+            except Exception as field_error:
+                debug_log(self.owner, f"setPlaylist: failed to reset currentPlaylistNum: {field_error}")
+
+            debug_log(self.owner, f"setPlaylist: anchor moved from {target_index} to 0")
         except Exception as anchor_error:
-            log(f"music savior: ShuffleAnchorHook after failed: {anchor_error}")
+            log(f"[music_savior] ShuffleAnchorHook after failed: {anchor_error}\n{traceback.format_exc()}")
+
+def collect_class_diagnostics(target_class: Any) -> str:
+    if target_class is None:
+        return "Класс MediaController не найден."
+
+    try:
+        java_class = target_class.getClass() if hasattr(target_class, "getClass") else target_class
+    except Exception:
+        java_class = target_class
+
+    method_lines: List[str] = []
+    field_lines: List[str] = []
+
+    try:
+        declared_methods = java_class.getDeclaredMethods()
+        for method_entry in declared_methods:
+            method_name: str = method_entry.getName()
+            lower_name: str = method_name.lower()
+            if any(keyword in lower_name for keyword in METHOD_KEYWORDS):
+                parameter_types = method_entry.getParameterTypes()
+                parameter_names: List[str] = []
+                for parameter_type in parameter_types:
+                    try:
+                        parameter_names.append(parameter_type.getSimpleName())
+                    except Exception:
+                        parameter_names.append("?")
+                method_lines.append(f"  {method_name}({', '.join(parameter_names)})")
+    except Exception as method_scan_error:
+        method_lines.append(f"  <ошибка сканирования методов: {method_scan_error}>")
+
+    try:
+        declared_fields = java_class.getDeclaredFields()
+        for field_entry in declared_fields:
+            field_name: str = field_entry.getName()
+            lower_name = field_name.lower()
+            if any(keyword in lower_name for keyword in FIELD_KEYWORDS):
+                try:
+                    field_type_name: str = field_entry.getType().getSimpleName()
+                except Exception:
+                    field_type_name = "?"
+                field_lines.append(f"  {field_type_name} {field_name}")
+    except Exception as field_scan_error:
+        field_lines.append(f"  <ошибка сканирования полей: {field_scan_error}>")
+
+    report_parts: List[str] = []
+    report_parts.append("=== MediaController методы ===")
+    report_parts.extend(method_lines if method_lines else ["  (ничего не найдено по ключевым словам)"])
+    report_parts.append("=== MediaController поля ===")
+    report_parts.extend(field_lines if field_lines else ["  (ничего не найдено по ключевым словам)"])
+
+    return "\n".join(report_parts)
 
 class MusicSaviorPlugin(BasePlugin):
+    def __init__(self) -> None:
+        super().__init__()
+        self.media_controller_class: Any = None
+        self.feature_status: dict = {
+            "save_redirect": "не инициализировано",
+            "repeat_priority": "не инициализировано",
+            "shuffle_anchor": "не инициализировано"
+        }
+
     def on_plugin_load(self) -> None:
+        log("[music_savior] on_plugin_load: starting")
         try:
-            media_controller_class = find_class("org.telegram.messenger.MediaController")
-            if media_controller_class is None:
-                log("music savior: MediaController class not found, plugin disabled")
+            self.media_controller_class = find_class("org.telegram.messenger.MediaController")
+            if self.media_controller_class is None:
+                log("[music_savior] FATAL: MediaController class not found")
                 BulletinHelper.show_error("Music Savior: класс MediaController не найден")
                 return
 
-            # --- redirect every savefile overload that handles audio mime types ---
-            try:
-                save_file_unhooks = self.hook_all_methods(media_controller_class, "saveFile", AudioSaveRedirectHook(self))
-                if save_file_unhooks:
-                    log(f"music savior: hooked {len(save_file_unhooks)} saveFile overloads")
-            except Exception as save_hook_error:
-                log(f"music savior: failed to hook saveFile: {save_hook_error}")
+            log("[music_savior] MediaController class located")
 
-            # --- enforce repeat-one priority over shuffle on natural track end ---
+            # --- preliminary diagnostic dump on every load ---
             try:
-                play_next_method = media_controller_class.getClass().getDeclaredMethod("playNextMessage", Boolean.TYPE)
-                play_next_method.setAccessible(True)
-                self.hook_method(play_next_method, RepeatOnePriorityHook(self), priority=10)
-            except Exception as next_hook_error:
-                log(f"music savior: failed to hook playNextMessage(boolean): {next_hook_error}")
+                diagnostic_dump: str = collect_class_diagnostics(self.media_controller_class)
+                log("[music_savior] startup diagnostics:\n" + diagnostic_dump)
+            except Exception as diag_error:
+                log(f"[music_savior] startup diagnostic dump failed: {diag_error}")
 
-            # --- anchor user-selected song at index 0 of the shuffle list ---
-            try:
-                set_playlist_unhooks = self.hook_all_methods(media_controller_class, "setPlaylist", ShuffleAnchorHook(self))
-                if set_playlist_unhooks:
-                    log(f"music savior: hooked {len(set_playlist_unhooks)} setPlaylist overloads")
-            except Exception as playlist_hook_error:
-                log(f"music savior: failed to hook setPlaylist: {playlist_hook_error}")
+            self._install_save_redirect()
+            self._install_repeat_priority()
+            self._install_shuffle_anchor()
 
-            log("music savior: plugin loaded successfully")
+            status_summary: str = (
+                f"Save→Downloads: {self.feature_status['save_redirect']}\n"
+                f"Repeat-one priority: {self.feature_status['repeat_priority']}\n"
+                f"Shuffle anchor: {self.feature_status['shuffle_anchor']}"
+            )
+            log(f"[music_savior] feature status:\n{status_summary}")
+
+            log("[music_savior] plugin loaded")
         except Exception as load_error:
-            log(f"music savior: on_plugin_load failed: {load_error}\n{traceback.format_exc()}")
-            BulletinHelper.show_error("Music Savior: ошибка инициализации")
+            log(f"[music_savior] on_plugin_load failed: {load_error}\n{traceback.format_exc()}")
+            BulletinHelper.show_error("Music Savior: ошибка инициализации, см. logcat")
+
+    def _install_save_redirect(self) -> None:
+        try:
+            unhook_list = self.hook_all_methods(self.media_controller_class, "saveFile", AudioSaveRedirectHook(self))
+            if unhook_list:
+                self.feature_status["save_redirect"] = f"ok ({len(unhook_list)} перегрузок)"
+                log(f"[music_savior] hooked {len(unhook_list)} saveFile overloads")
+            else:
+                self.feature_status["save_redirect"] = "saveFile не найден"
+                log("[music_savior] WARNING: saveFile not found, save redirect disabled")
+        except Exception as save_hook_error:
+            self.feature_status["save_redirect"] = f"ошибка: {save_hook_error}"
+            log(f"[music_savior] failed to hook saveFile: {save_hook_error}\n{traceback.format_exc()}")
+
+    def _install_repeat_priority(self) -> None:
+        # --- try multiple candidate method names since telegram refactors them ---
+        candidate_names: List[str] = ["playNextMessage", "playNextMessageWithoutOrder", "playNext"]
+        installed_count: int = 0
+        last_error: Optional[str] = None
+
+        for candidate_name in candidate_names:
+            try:
+                unhook_list = self.hook_all_methods(self.media_controller_class, candidate_name, RepeatOnePriorityHook(self))
+                if unhook_list:
+                    installed_count += len(unhook_list)
+                    log(f"[music_savior] hooked {len(unhook_list)} overloads of {candidate_name}")
+            except Exception as candidate_error:
+                last_error = str(candidate_error)
+                log(f"[music_savior] candidate {candidate_name} hook failed: {candidate_error}")
+
+        if installed_count > 0:
+            self.feature_status["repeat_priority"] = f"ok ({installed_count} перегрузок)"
+        else:
+            self.feature_status["repeat_priority"] = f"методы playNext* не найдены ({last_error or 'нет совпадений'})"
+
+    def _install_shuffle_anchor(self) -> None:
+        try:
+            unhook_list = self.hook_all_methods(self.media_controller_class, "setPlaylist", ShuffleAnchorHook(self))
+            if unhook_list:
+                self.feature_status["shuffle_anchor"] = f"ok ({len(unhook_list)} перегрузок)"
+                log(f"[music_savior] hooked {len(unhook_list)} setPlaylist overloads")
+            else:
+                self.feature_status["shuffle_anchor"] = "setPlaylist не найден"
+                log("[music_savior] WARNING: setPlaylist not found, shuffle anchor disabled")
+        except Exception as playlist_hook_error:
+            self.feature_status["shuffle_anchor"] = f"ошибка: {playlist_hook_error}"
+            log(f"[music_savior] failed to hook setPlaylist: {playlist_hook_error}\n{traceback.format_exc()}")
 
     def on_plugin_unload(self) -> None:
-        log("music savior: plugin unloaded")
+        log("[music_savior] on_plugin_unload")
+
+    def _on_run_diagnostics_clicked(self, view: Any) -> None:
+        try:
+            target_class = self.media_controller_class
+            if target_class is None:
+                target_class = find_class("org.telegram.messenger.MediaController")
+
+            diagnostic_text: str = collect_class_diagnostics(target_class)
+            status_block: str = (
+                "=== Статус хуков ===\n"
+                f"  Save→Downloads: {self.feature_status['save_redirect']}\n"
+                f"  Repeat-one: {self.feature_status['repeat_priority']}\n"
+                f"  Shuffle anchor: {self.feature_status['shuffle_anchor']}\n\n"
+            )
+
+            full_report: str = status_block + diagnostic_text
+            log("[music_savior] manual diagnostics:\n" + full_report)
+
+            run_on_ui_thread(lambda: self._show_diagnostic_dialog(full_report))
+        except Exception as diagnostic_error:
+            log(f"[music_savior] diagnostics handler failed: {diagnostic_error}\n{traceback.format_exc()}")
+            BulletinHelper.show_error("Не удалось собрать диагностику, см. logcat")
+
+    def _show_diagnostic_dialog(self, report_text: str) -> None:
+        try:
+            current_fragment = get_last_fragment()
+            if current_fragment is None:
+                BulletinHelper.show_info("Диагностика записана в logcat")
+                return
+
+            parent_activity = current_fragment.getParentActivity()
+            if parent_activity is None:
+                BulletinHelper.show_info("Диагностика записана в logcat")
+                return
+
+            builder = AlertDialogBuilder(parent_activity)
+            builder.set_title("Music Savior — диагностика")
+            builder.set_message(report_text)
+            builder.set_positive_button("OK", lambda dialog, which: dialog.dismiss())
+            builder.show()
+        except Exception as dialog_error:
+            log(f"[music_savior] diagnostic dialog failed: {dialog_error}")
+            BulletinHelper.show_info("Диагностика записана в logcat")
 
     def create_settings(self) -> List[Any]:
         return [
@@ -280,7 +601,7 @@ class MusicSaviorPlugin(BasePlugin):
             Switch(
                 key="redirect_audio_to_downloads",
                 text="Сохранять музыку в Downloads",
-                subtext=f"Аудио из чатов попадёт в Download/{DOWNLOADS_SUBFOLDER} вместо скрытой папки Telegram",
+                subtext=f"Аудио из чатов попадёт в Download/{DOWNLOADS_SUBFOLDER}",
                 default=True,
                 icon="msg_download_settings"
             ),
@@ -289,15 +610,31 @@ class MusicSaviorPlugin(BasePlugin):
             Switch(
                 key="repeat_one_priority",
                 text="«Повтор одного» важнее перемешивания",
-                subtext="При зацикливании трек повторяется бесконечно, даже если включён shuffle",
+                subtext="Зацикленный трек повторяется бесконечно даже при включённом shuffle",
                 default=True,
                 icon="player_new_repeatone"
             ),
             Switch(
                 key="anchor_shuffle_to_current",
                 text="Якорь shuffle на выбранном треке",
-                subtext="Перемешивание идёт после выбранной песни, кнопка «назад» возвращает к ней",
+                subtext="Перемешивание идёт после выбранной песни, «назад» возвращает к ней",
                 default=True,
                 icon="player_new_shuffle"
+            ),
+            Divider(text="Отладка"),
+            Header(text="Диагностика"),
+            Switch(
+                key="debug_verbose",
+                text="Подробное логирование",
+                subtext="Логировать каждое срабатывание хука с типами аргументов",
+                default=True,
+                icon="msg_log"
+            ),
+            Text(
+                text="Запустить диагностику",
+                subtext="Перечислит реальные методы и поля MediaController",
+                icon="msg_info",
+                accent=True,
+                on_click=self._on_run_diagnostics_clicked
             )
         ]

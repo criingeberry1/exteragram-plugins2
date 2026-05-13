@@ -2,32 +2,35 @@ from base_plugin import BasePlugin, MenuItemData, MenuItemType
 from android_utils import log, run_on_ui_thread
 from client_utils import run_on_queue
 from ui.bulletin import BulletinHelper
-from ui.settings import Header, Input, Divider, Text
-from typing import Any, List, Optional
+from ui.settings import Header, Input, Selector, Divider, Text
+from typing import Any, List, Optional, Tuple
 import os
+import re
 import traceback
 
 from java.io import File, FileInputStream
 from android.os import FileUtils, Build, Environment
 from android.content import ContentValues
 from android.provider import MediaStore
+from android.media import MediaScannerConnection
 from org.telegram.messenger import FileLoader, UserConfig, ApplicationLoader
+from org.telegram.tgnet import TLRPC
 
 # --- метаданные ---
 __id__ = "music_tools"
 __name__ = "music tools (for me)"
 __description__ = "просто багофиксы для меня"
 __author__ = "@insonniiia"
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 __icon__ = "hsrgustinex/55"
 __min_version__ = "11.12.0"
 
 
-# --- default subfolder under public downloads ---
+# --- default subfolder under public destination root ---
 DEFAULT_SUBFOLDER: str = "Telegram Music"
 
-# --- mediastore.downloads collection requires android 10 ---
-SDK_MEDIASTORE_DOWNLOADS: int = 29
+# --- mediastore.audio insert requires android 10 for relative_path ---
+SDK_MEDIASTORE_RELATIVE_PATH: int = 29
 
 # --- chunk size for the legacy file copy fallback ---
 LEGACY_COPY_CHUNK: int = 65536
@@ -38,59 +41,182 @@ MUSIC_CONDITION_EXPRESSION: str = "message != null && message.isMusic()"
 # --- unique id for the registered menu entry ---
 MENU_ITEM_ID: str = "music_to_downloads_action"
 
-# --- settings key for user-configurable destination folder name ---
-SETTING_KEY_SUBFOLDER: str = "downloads_subfolder_name"
+# --- settings keys ---
+SETTING_KEY_SUBFOLDER: str = "destination_subfolder_name"
+SETTING_KEY_DESTINATION: str = "destination_collection"
+
+# --- destination collection indices, must match selector items ---
+DESTINATION_MUSIC: int = 0
+DESTINATION_DOWNLOADS: int = 1
+
+# --- characters not allowed in android file names ---
+FORBIDDEN_FILENAME_CHARS_PATTERN = re.compile(r"[<>:\"/\\|?*\x00-\x1f]")
+
+def sanitize_filename_fragment(raw_text: str) -> str:
+    if raw_text is None:
+        return ""
+    # --- collapse forbidden characters and trim whitespace/dots at edges ---
+    cleaned: str = FORBIDDEN_FILENAME_CHARS_PATTERN.sub("", raw_text).strip()
+    cleaned = cleaned.strip(".")
+    # --- normalize internal whitespace runs to single spaces ---
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned
 
 def resolve_subfolder_name(plugin: "MusicToDownloadsPlugin") -> str:
     raw_value = plugin.get_setting(SETTING_KEY_SUBFOLDER, DEFAULT_SUBFOLDER)
     if raw_value is None:
         return DEFAULT_SUBFOLDER
     cleaned: str = str(raw_value).strip().strip("/").strip("\\")
-    if cleaned == "":
-        return DEFAULT_SUBFOLDER
-    # --- strip filesystem-unsafe characters ---
-    sanitized: str = "".join(character for character in cleaned if character not in "<>:\"|?*")
+    sanitized: str = sanitize_filename_fragment(cleaned)
     return sanitized if sanitized != "" else DEFAULT_SUBFOLDER
 
-def resolve_display_name(message_object: Any) -> str:
-    # --- prefer telegram's own resolver which honors performer/title metadata ---
+def resolve_destination_choice(plugin: "MusicToDownloadsPlugin") -> int:
+    raw_value = plugin.get_setting(SETTING_KEY_DESTINATION, DESTINATION_MUSIC)
     try:
-        document_name: Optional[str] = message_object.getDocumentName()
-        if document_name is not None and document_name != "":
-            return document_name
-    except Exception as name_error:
-        log(f"[music_to_downloads] getDocumentName failed: {name_error}")
+        return int(raw_value)
+    except Exception:
+        return DESTINATION_MUSIC
 
-    # --- fallback to the underlying document attributes ---
-    try:
-        document_object = message_object.getDocument()
-        if document_object is not None and document_object.file_name_fixed is not None:
-            return document_object.file_name_fixed
-    except Exception as fallback_error:
-        log(f"[music_to_downloads] file_name_fixed fallback failed: {fallback_error}")
+def extract_audio_metadata(message_object: Any) -> Tuple[Optional[str], Optional[str], int, str, str]:
+    """
+    Returns (title, performer, duration_ms, display_filename, mime_type).
+    Falls back gracefully when any field is missing.
+    """
+    title_value: Optional[str] = None
+    performer_value: Optional[str] = None
+    duration_ms: int = 0
+    mime_type: str = "audio/mpeg"
+    fallback_extension: str = ".mp3"
 
-    return "audio.mp3"
-
-def resolve_mime_type(message_object: Any) -> str:
     try:
         document_object = message_object.getDocument()
-        if document_object is not None and document_object.mime_type is not None:
-            return str(document_object.mime_type)
-    except Exception as mime_error:
-        log(f"[music_to_downloads] mime resolution failed: {mime_error}")
-    return "audio/mpeg"
+    except Exception as document_error:
+        log(f"[music_to_downloads] getDocument failed: {document_error}")
+        document_object = None
 
-def copy_audio_to_public_downloads(source_path: str, android_context: Any, display_name: str, mime_type: str, subfolder_name: str) -> Optional[str]:
+    if document_object is not None:
+        try:
+            mime_candidate = document_object.mime_type
+            if mime_candidate is not None and str(mime_candidate) != "":
+                mime_type = str(mime_candidate)
+                if "ogg" in mime_type:
+                    fallback_extension = ".ogg"
+                elif "flac" in mime_type:
+                    fallback_extension = ".flac"
+                elif "wav" in mime_type:
+                    fallback_extension = ".wav"
+                elif "aac" in mime_type or "mp4" in mime_type:
+                    fallback_extension = ".m4a"
+        except Exception as mime_error:
+            log(f"[music_to_downloads] mime read failed: {mime_error}")
+
+        # --- iterate attributes to find audio metadata ---
+        try:
+            attributes_list = document_object.attributes
+            attribute_count: int = attributes_list.size()
+            for attribute_index in range(attribute_count):
+                attribute_entry = attributes_list.get(attribute_index)
+                if isinstance(attribute_entry, TLRPC.TL_documentAttributeAudio):
+                    try:
+                        if bool(attribute_entry.voice):
+                            # --- voice notes carry no useful tags, treat as plain ---
+                            continue
+                    except Exception:
+                        pass
+
+                    try:
+                        if attribute_entry.title is not None and str(attribute_entry.title) != "":
+                            title_value = str(attribute_entry.title)
+                    except Exception:
+                        pass
+
+                    try:
+                        if attribute_entry.performer is not None and str(attribute_entry.performer) != "":
+                            performer_value = str(attribute_entry.performer)
+                    except Exception:
+                        pass
+
+                    try:
+                        duration_ms = int(attribute_entry.duration) * 1000
+                    except Exception:
+                        duration_ms = 0
+                    break
+        except Exception as attributes_error:
+            log(f"[music_to_downloads] attributes iteration failed: {attributes_error}")
+
+    # --- build a human-friendly filename ---
+    title_clean: str = sanitize_filename_fragment(title_value) if title_value else ""
+    performer_clean: str = sanitize_filename_fragment(performer_value) if performer_value else ""
+
+    if title_clean != "" and performer_clean != "":
+        display_filename: str = f"{performer_clean} - {title_clean}{fallback_extension}"
+    elif title_clean != "":
+        display_filename = f"{title_clean}{fallback_extension}"
+    else:
+        # --- last resort: use telegram's resolved name ---
+        try:
+            telegram_name = message_object.getDocumentName()
+        except Exception:
+            telegram_name = None
+
+        if telegram_name is not None and str(telegram_name) != "":
+            display_filename = sanitize_filename_fragment(str(telegram_name))
+            if display_filename == "" or "." not in display_filename:
+                display_filename = f"audio{fallback_extension}"
+        else:
+            display_filename = f"audio{fallback_extension}"
+
+    # --- android display_name must stay reasonably short ---
+    if len(display_filename) > 200:
+        name_part, dot, ext_part = display_filename.rpartition(".")
+        if dot:
+            display_filename = name_part[: 200 - len(ext_part) - 1] + "." + ext_part
+        else:
+            display_filename = display_filename[:200]
+
+    return title_value, performer_value, duration_ms, display_filename, mime_type
+
+def insert_into_audio_collection(
+    source_path: str,
+    android_context: Any,
+    display_name: str,
+    mime_type: str,
+    subfolder_name: str,
+    title_value: Optional[str],
+    performer_value: Optional[str],
+    duration_ms: int,
+    use_downloads_root: bool
+) -> Optional[str]:
     try:
-        if Build.VERSION.SDK_INT >= SDK_MEDIASTORE_DOWNLOADS:
-            # --- modern scoped-storage path via mediastore.downloads ---
+        content_resolver = android_context.getContentResolver()
+
+        if Build.VERSION.SDK_INT >= SDK_MEDIASTORE_RELATIVE_PATH:
+            # --- scoped storage: insert into audio collection with full metadata ---
+            target_root: str = Environment.DIRECTORY_DOWNLOADS if use_downloads_root else Environment.DIRECTORY_MUSIC
+            target_collection_uri = (
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI
+                if use_downloads_root
+                else MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
+            )
+
             content_values = ContentValues()
-            content_values.put("_display_name", display_name)
-            content_values.put("mime_type", mime_type)
-            content_values.put("relative_path", f"{Environment.DIRECTORY_DOWNLOADS}/{subfolder_name}/")
+            content_values.put(MediaStore.MediaColumns.DISPLAY_NAME, display_name)
+            content_values.put(MediaStore.MediaColumns.MIME_TYPE, mime_type)
+            content_values.put(MediaStore.MediaColumns.RELATIVE_PATH, f"{target_root}/{subfolder_name}/")
+            content_values.put(MediaStore.MediaColumns.IS_PENDING, 1)
 
-            content_resolver = android_context.getContentResolver()
-            destination_uri = content_resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, content_values)
+            if not use_downloads_root:
+                content_values.put(MediaStore.Audio.Media.IS_MUSIC, 1)
+                if title_value is not None and title_value != "":
+                    content_values.put(MediaStore.Audio.Media.TITLE, title_value)
+                if performer_value is not None and performer_value != "":
+                    content_values.put(MediaStore.Audio.Media.ARTIST, performer_value)
+                    # --- album_artist is referenced as raw string in some android versions ---
+                    content_values.put("album_artist", performer_value)
+                if duration_ms > 0:
+                    content_values.put(MediaStore.Audio.Media.DURATION, duration_ms)
+
+            destination_uri = content_resolver.insert(target_collection_uri, content_values)
             if destination_uri is None:
                 log("[music_to_downloads] mediastore insert returned null")
                 return None
@@ -108,22 +234,41 @@ def copy_audio_to_public_downloads(source_path: str, android_context: Any, displ
                     output_stream.close()
                 except Exception as close_out_error:
                     log(f"[music_to_downloads] output stream close failed: {close_out_error}")
+
+            # --- flip is_pending off so the file becomes visible to other apps ---
+            try:
+                finalize_values = ContentValues()
+                finalize_values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                content_resolver.update(destination_uri, finalize_values, None, None)
+            except Exception as finalize_error:
+                log(f"[music_to_downloads] is_pending finalize failed: {finalize_error}")
+
             return destination_uri.toString()
 
         # --- legacy direct-path fallback for android 9 and below ---
-        legacy_root: str = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS).getAbsolutePath()
-        legacy_dir: str = os.path.join(legacy_root, subfolder_name)
-        os.makedirs(legacy_dir, exist_ok=True)
-        legacy_target: str = os.path.join(legacy_dir, display_name)
+        legacy_root_dir = Environment.getExternalStoragePublicDirectory(
+            Environment.DIRECTORY_DOWNLOADS if use_downloads_root else Environment.DIRECTORY_MUSIC
+        )
+        legacy_root: str = legacy_root_dir.getAbsolutePath()
+        legacy_subdir: str = os.path.join(legacy_root, subfolder_name)
+        os.makedirs(legacy_subdir, exist_ok=True)
+        legacy_target: str = os.path.join(legacy_subdir, display_name)
         with open(source_path, "rb") as source_file, open(legacy_target, "wb") as destination_file:
             while True:
                 chunk = source_file.read(LEGACY_COPY_CHUNK)
                 if not chunk:
                     break
                 destination_file.write(chunk)
+
+        # --- trigger a media scan so the file appears in pre-q audio index ---
+        try:
+            MediaScannerConnection.scanFile(android_context, [legacy_target], [mime_type], None)
+        except Exception as scan_error:
+            log(f"[music_to_downloads] mediascanner trigger failed: {scan_error}")
+
         return legacy_target
-    except Exception as copy_error:
-        log(f"[music_to_downloads] copy_audio_to_public_downloads failed: {copy_error}\n{traceback.format_exc()}")
+    except Exception as insert_error:
+        log(f"[music_to_downloads] insert_into_audio_collection failed: {insert_error}\n{traceback.format_exc()}")
         return None
 
 class MusicToDownloadsPlugin(BasePlugin):
@@ -155,7 +300,6 @@ class MusicToDownloadsPlugin(BasePlugin):
                 BulletinHelper.show_error("Сообщение недоступно")
                 return
 
-            # --- safety net in case the mvel condition was bypassed ---
             try:
                 if not bool(message_object.isMusic()):
                     BulletinHelper.show_error("Это не аудиофайл")
@@ -181,9 +325,10 @@ class MusicToDownloadsPlugin(BasePlugin):
                 return
 
             source_path: str = local_file.getAbsolutePath()
-            display_name: str = resolve_display_name(message_object)
-            mime_type: str = resolve_mime_type(message_object)
+            title_value, performer_value, duration_ms, display_filename, mime_type = extract_audio_metadata(message_object)
             subfolder_name: str = resolve_subfolder_name(self)
+            destination_choice: int = resolve_destination_choice(self)
+            use_downloads_root: bool = destination_choice == DESTINATION_DOWNLOADS
 
             android_context = context.get("context")
             if android_context is None:
@@ -193,37 +338,80 @@ class MusicToDownloadsPlugin(BasePlugin):
                 BulletinHelper.show_error("Контекст Android недоступен")
                 return
 
-            BulletinHelper.show_info(f"Копируем «{display_name}»…")
+            BulletinHelper.show_info(f"Сохраняем «{display_filename}»…")
 
-            run_on_queue(lambda: self._perform_copy(source_path, android_context, display_name, mime_type, subfolder_name))
+            run_on_queue(
+                lambda: self._perform_copy(
+                    source_path,
+                    android_context,
+                    display_filename,
+                    mime_type,
+                    subfolder_name,
+                    title_value,
+                    performer_value,
+                    duration_ms,
+                    use_downloads_root
+                )
+            )
         except Exception as click_error:
             log(f"[music_to_downloads] _handle_download_click failed: {click_error}\n{traceback.format_exc()}")
             BulletinHelper.show_error("Не удалось скачать трек, см. logcat")
 
-    def _perform_copy(self, source_path: str, android_context: Any, display_name: str, mime_type: str, subfolder_name: str) -> None:
-        result_location: Optional[str] = copy_audio_to_public_downloads(source_path, android_context, display_name, mime_type, subfolder_name)
+    def _perform_copy(
+        self,
+        source_path: str,
+        android_context: Any,
+        display_filename: str,
+        mime_type: str,
+        subfolder_name: str,
+        title_value: Optional[str],
+        performer_value: Optional[str],
+        duration_ms: int,
+        use_downloads_root: bool
+    ) -> None:
+        result_location: Optional[str] = insert_into_audio_collection(
+            source_path,
+            android_context,
+            display_filename,
+            mime_type,
+            subfolder_name,
+            title_value,
+            performer_value,
+            duration_ms,
+            use_downloads_root
+        )
+
+        destination_label: str = "Download" if use_downloads_root else "Music"
 
         def notify_on_main_thread() -> None:
             if result_location is not None:
-                BulletinHelper.show_success(f"Сохранено в Download/{subfolder_name}/{display_name}")
+                BulletinHelper.show_success(f"Сохранено в {destination_label}/{subfolder_name}/{display_filename}")
             else:
-                BulletinHelper.show_error("Не удалось сохранить трек в Downloads")
+                BulletinHelper.show_error("Не удалось сохранить трек")
 
         run_on_ui_thread(notify_on_main_thread)
 
     def create_settings(self) -> List[Any]:
         return [
             Header(text="Папка назначения"),
+            Selector(
+                key=SETTING_KEY_DESTINATION,
+                text="Куда сохранять треки",
+                subtext="Music — теги читаются плеерами, Downloads — обычный файл-менеджер",
+                default=DESTINATION_MUSIC,
+                items=["Music (с тегами)", "Download (просто файл)"],
+                icon="msg_folder"
+            ),
             Input(
                 key=SETTING_KEY_SUBFOLDER,
-                text="Подпапка в Download",
-                subtext=f"Куда сохранять треки. По умолчанию: {DEFAULT_SUBFOLDER}",
+                text="Имя подпапки",
+                subtext=f"По умолчанию: {DEFAULT_SUBFOLDER}",
                 default=DEFAULT_SUBFOLDER,
-                icon="msg_folder"
+                icon="msg_edit"
             ),
             Divider(),
             Text(
-                text=f"Файлы попадают в Download/<подпапка>/имя_трека.mp3 и сразу видны в проводнике и галерее.",
+                text="Имя файла: «Исполнитель - Название.mp3». Теги ARTIST, TITLE, ALBUM_ARTIST и DURATION прописываются в медиатеку автоматически, поэтому в плеере трек выглядит как родная музыка.",
                 icon="msg_info"
             )
         ]

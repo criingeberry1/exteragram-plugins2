@@ -5,6 +5,7 @@ from org.telegram.tgnet import NativeByteBuffer, TLRPC
 from android_utils import log
 from client_utils import run_on_queue
 from datetime import datetime
+from java.lang import Class
 from typing import Any, Optional, Set
 
 # --- метаданные ---
@@ -12,7 +13,7 @@ __id__ = "when"
 __name__ = "Когда я вступил?"
 __description__ = "лалала"
 __author__ = "@insonniiia"
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __icon__ = "q_427/72"
 __min_version__ = "11.12.0"
 
@@ -42,8 +43,11 @@ class JoinDatePlugin(BasePlugin):
         # --- initialize runtime states ---
         self.notified_dialogs: Set[int] = set()
         
+        # --- load java class via reflection ---
+        chat_activity_cls = Class.forName("org.telegram.ui.ChatActivity")
+        
         # --- register hooks for chat activity ---
-        self.hook_method("org.telegram.ui.ChatActivity.onResume", ChatActivityResumeHook(self))
+        self.hook_method(chat_activity_cls, "onResume", ChatActivityResumeHook(self))
 
     def on_plugin_unload(self) -> None:
         # --- clear state cache ---

@@ -1,0 +1,121 @@
+from base_plugin import BasePlugin, MethodHook
+from ui.bulletin import BulletinHelper
+from org.telegram.messenger import MessagesStorage, UserConfig
+from org.telegram.tgnet import NativeByteBuffer, TLRPC
+from android_utils import log
+from client_utils import run_on_queue
+from datetime import datetime
+from typing import Any, Optional, Set
+
+# --- метаданные ---
+__id__ = "when"
+__name__ = "Когда я вступил?"
+__description__ = "лалала"
+__author__ = "@insonniiia"
+__version__ = "1.0.0"
+__icon__ = "q_427/72"
+__min_version__ = "11.12.0"
+
+
+class ChatActivityResumeHook(MethodHook):
+    def __init__(self, plugin: "JoinDatePlugin") -> None:
+        super().__init__()
+        self.plugin = plugin
+
+    def after_hooked_method(self, param: Any) -> None:
+        # --- execute post resumption logic ---
+        activity: Any = param.thisObject
+        if not activity:
+            return
+        
+        dialog_id: int = getattr(activity, "dialog_id", 0)
+        account: int = getattr(activity, "currentAccount", 0)
+        
+        if dialog_id == 0:
+            return
+
+        # --- dispatch database check to background queue ---
+        run_on_queue(lambda: self.plugin.process_join_date(account, dialog_id))
+
+class JoinDatePlugin(BasePlugin):
+    def on_plugin_load(self) -> None:
+        # --- initialize runtime states ---
+        self.notified_dialogs: Set[int] = set()
+        
+        # --- register hooks for chat activity ---
+        self.hook_method("org.telegram.ui.ChatActivity.onResume", ChatActivityResumeHook(self))
+
+    def on_plugin_unload(self) -> None:
+        # --- clear state cache ---
+        self.notified_dialogs.clear()
+
+    def on_app_event(self, event_type: int) -> None:
+        # --- pass application event ---
+        pass
+
+    def process_join_date(self, account: int, dialog_id: int) -> None:
+        # --- verify session notification state ---
+        if dialog_id in self.notified_dialogs:
+            return
+
+        join_date_str: Optional[str] = None
+        exact_found: bool = False
+        my_user_id: int = UserConfig.getInstance(account).getClientUserId()
+
+        try:
+            storage: Any = MessagesStorage.getInstance(account)
+            db: Any = storage.database
+            if db:
+                # --- query database for service messages in local cache ---
+                cursor: Any = db.executeSelect(f"SELECT data, date FROM messages WHERE uid = {dialog_id} ORDER BY date ASC LIMIT 100")
+                if cursor:
+                    while cursor.next():
+                        # --- extract wrapped binary buffer ---
+                        buffer: Any = NativeByteBuffer.wrap(cursor.byteBufferValue(0))
+                        if buffer:
+                            constructor: int = buffer.readInt32(False)
+                            message: Any = TLRPC.Message.TLdeserialize(buffer, constructor, False)
+                            if message and hasattr(message, "action") and message.action:
+                                action_class: str = message.action.__class__.__name__
+                                is_me: bool = False
+                                
+                                # --- scan for user join service actions ---
+                                if "TL_messageActionChatJoinedByLink" in action_class or "TL_messageActionChatJoinedByRequest" in action_class:
+                                    is_me = True
+                                elif "TL_messageActionChatAddUser" in action_class and hasattr(message.action, "users"):
+                                    for u_id in message.action.users:
+                                        if u_id == my_user_id:
+                                            is_me = True
+                                            break
+                                
+                                if is_me:
+                                    timestamp: int = cursor.intValue(1)
+                                    if timestamp > 0:
+                                        join_date_str = datetime.fromtimestamp(timestamp).strftime('%d.%m.%Y %H:%M')
+                                        exact_found = True
+                                        break
+                    cursor.dispose()
+
+            # --- execute fallback strategy if no system action found ---
+            if not exact_found and db:
+                cursor = db.executeSelect(f"SELECT date FROM messages WHERE uid = {dialog_id} ORDER BY date ASC LIMIT 1")
+                if cursor:
+                    if cursor.next():
+                        db_timestamp: int = cursor.intValue(0)
+                        if db_timestamp > 0:
+                            join_date_str = datetime.fromtimestamp(db_timestamp).strftime('%d.%m.%Y %H:%M')
+                    cursor.dispose()
+
+        except Exception as e:
+            # --- log operational database errors ---
+            log(f"joindateplugin database error: {str(e)}")
+
+        if join_date_str:
+            # --- prevent notification duplication in session ---
+            self.notified_dialogs.add(dialog_id)
+            
+            # --- render native top bulletin notice ---
+            if exact_found:
+                BulletinHelper.show_success(f"Точная дата вступления: {join_date_str}")
+            else:
+                BulletinHelper.show_info(f"Первая активность в чате: {join_date_str}")
